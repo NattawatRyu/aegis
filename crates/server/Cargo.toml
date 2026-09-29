@@ -1,0 +1,10 @@
+[package]
+name = "aegis-server"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Aegis authoritative game server: the sim owns the truth; guards reject client-trust cheats at the edge."
+
+[dependencies]
+aegis-protocol = { path = "../protocol" }

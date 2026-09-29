@@ -1,0 +1,11 @@
+[package]
+name = "aegis-telemetry"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Aegis telemetry: records guard verdicts as features for the anomaly detector (pillar C) and as metrics for the harness."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,10 @@
+[package]
+name = "aegis-client-sdk"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Aegis programmable bots — one honest driver plus one cheat per file — for exercising the server's defenses against yourself."
+
+[dependencies]
+aegis-protocol = { path = "../protocol" }

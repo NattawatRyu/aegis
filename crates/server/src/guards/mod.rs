@@ -5,10 +5,11 @@
 //! function, for guards that don't run per-input), and add one line to
 //! [`Pipeline::standard`]. Nothing else in the server needs to change.
 //!
-//! Two guards run at their own stage rather than in the per-input pipeline,
+//! Three guards run at their own stage rather than in the per-input pipeline,
 //! because they act on data the pipeline never sees:
-//!   - [`version`] — runs at `Join`, on the client's declared protocol version.
 //!   - [`packet`]  — runs at decode, on the raw datagram bytes.
+//!   - [`version`] — runs at `Join`, on the client's declared protocol version.
+//!   - [`joined`]  — runs before the pipeline, on the server's admitted set.
 //!
 //! Hit / movement authority is NOT a guard: the protocol gives a client no way
 //! to assert a position or a hit, so there is nothing to reject. That defense
@@ -18,6 +19,7 @@ use aegis_protocol::{PlayerId, Vec2};
 
 pub mod version;
 pub mod packet;
+pub mod joined;
 pub mod sanity;
 pub mod input_rate;
 pub mod replay;
@@ -48,18 +50,31 @@ pub struct ClientInput {
 pub enum RejectReason {
     BadVersion,
     MalformedPacket,
+    NotJoined,
     MalformedInput,
     RateExceeded,
     Replay,
 }
 
 impl RejectReason {
+    /// Every reason, for coverage checks ("does some bot trip each guard?").
+    /// A new variant goes here too.
+    pub const ALL: [RejectReason; 6] = [
+        RejectReason::BadVersion,
+        RejectReason::MalformedPacket,
+        RejectReason::NotJoined,
+        RejectReason::MalformedInput,
+        RejectReason::RateExceeded,
+        RejectReason::Replay,
+    ];
+
     /// Stable string label for telemetry / detector features. Kept in sync with
     /// the enum here so the telemetry crate stays decoupled from server types.
     pub fn label(self) -> &'static str {
         match self {
             RejectReason::BadVersion => "bad_version",
             RejectReason::MalformedPacket => "malformed_packet",
+            RejectReason::NotJoined => "not_joined",
             RejectReason::MalformedInput => "malformed_input",
             RejectReason::RateExceeded => "rate_exceeded",
             RejectReason::Replay => "replay",

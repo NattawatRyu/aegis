@@ -8,12 +8,14 @@
 //! ETHICS: every bot here is meant to be pointed at a server *you run*. That is
 //! the whole design of the lab — attack yourself, measure the defense.
 
-use aegis_protocol::{ClientMsg, PlayerId, PlayerState, Vec2};
+use aegis_protocol::{encode, ClientMsg, PlayerId, PlayerState, Vec2, PROTOCOL_VERSION};
 
 pub mod aimbot;
 pub mod badversion;
 pub mod flood;
+pub mod garbage;
 pub mod honest;
+pub mod nan;
 pub mod replay;
 pub mod speedhack;
 
@@ -28,8 +30,22 @@ pub struct BotCtx<'a> {
 
 pub trait Bot {
     fn name(&self) -> &'static str;
+
+    /// The handshake sent once, before tick 1. Default is a legal join; a bot
+    /// attacking the version guard overrides it.
+    fn join(&self) -> ClientMsg {
+        ClientMsg::Join { name: self.name().into(), protocol: PROTOCOL_VERSION }
+    }
+
     /// Messages to send this tick. Most bots send 0 or 1; a flooder sends many.
     fn act(&mut self, ctx: &BotCtx) -> Vec<ClientMsg>;
+
+    /// The raw datagrams that go on the wire this tick. Default: `act`,
+    /// encoded. Only a bot attacking the decoder itself (sending bytes that
+    /// are not a `ClientMsg` at all) needs to override this.
+    fn datagrams(&mut self, ctx: &BotCtx) -> Vec<Vec<u8>> {
+        self.act(ctx).iter().map(encode).collect()
+    }
 }
 
 /// This bot's own position from the last snapshot, if present.

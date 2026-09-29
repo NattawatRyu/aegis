@@ -10,6 +10,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "aegis-harness"
+version = "0.0.0"
+dependencies = [
+ "aegis-client-sdk",
+ "aegis-protocol",
+ "aegis-server",
+ "aegis-telemetry",
+]
+
+[[package]]
 name = "aegis-protocol"
 version = "0.0.0"
 dependencies = [

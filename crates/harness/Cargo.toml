@@ -11,3 +11,4 @@ aegis-protocol = { path = "../protocol" }
 aegis-server = { path = "../server" }
 aegis-telemetry = { path = "../telemetry" }
 aegis-client-sdk = { path = "../client-sdk" }
+aegis-detector = { path = "../detector" }

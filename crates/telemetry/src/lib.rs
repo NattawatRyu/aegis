@@ -15,21 +15,26 @@ use std::path::Path;
 
 use serde::Serialize;
 
-/// One recorded verdict for one player on one tick.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// One recorded event for one player on one tick.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Record {
     pub tick: u32,
     pub player: u8,
     pub outcome: Outcome,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum Outcome {
     /// Input reached the sim. `anomaly` = passed but suspicious (e.g. a move
     /// vector that had to be clamped) — a signal for the detector.
     Accepted { anomaly: bool },
     /// Input dropped by a guard.
     Rejected { reason: &'static str },
+    /// An accepted input fired a shot and the sim resolved it. `aim_err` is
+    /// the angle in radians between the aim and the bearing to the nearest
+    /// enemy, computed server-side from authoritative positions — the
+    /// detector's view of *how* the player aims, not just whether it hit.
+    Shot { hit: bool, aim_err: f32 },
 }
 
 /// Aggregate counts, for the harness and for a quick detector baseline.
@@ -37,6 +42,8 @@ pub enum Outcome {
 pub struct Totals {
     pub accepted: u32,
     pub anomalies: u32,
+    pub shots: u32,
+    pub hits: u32,
     /// reason label -> count
     pub rejected: BTreeMap<&'static str, u32>,
 }
@@ -63,6 +70,10 @@ impl Telemetry {
 
     pub fn reject(&mut self, tick: u32, player: u8, reason: &'static str) {
         self.records.push(Record { tick, player, outcome: Outcome::Rejected { reason } });
+    }
+
+    pub fn shot(&mut self, tick: u32, player: u8, hit: bool, aim_err: f32) {
+        self.records.push(Record { tick, player, outcome: Outcome::Shot { hit, aim_err } });
     }
 
     pub fn records(&self) -> &[Record] {
@@ -100,6 +111,10 @@ impl Telemetry {
                 Outcome::Rejected { reason } => {
                     *t.rejected.entry(reason).or_insert(0) += 1;
                 }
+                Outcome::Shot { hit, .. } => {
+                    t.shots += 1;
+                    t.hits += *hit as u32;
+                }
             }
         }
         t
@@ -132,6 +147,8 @@ mod tests {
         t.reject(1, 2, "rate_exceeded");
         t.reject(2, 2, "replay");
         t.reject(2, 3, "rate_exceeded");
+        t.shot(3, 1, false, 0.1);
+        t.shot(3, 2, true, 0.0);
         t
     }
 
@@ -144,6 +161,18 @@ mod tests {
         assert_eq!(tot.total_rejected(), 3);
         assert_eq!(tot.rejected.get("rate_exceeded"), Some(&2));
         assert_eq!(tot.rejected.get("replay"), Some(&1));
+        assert_eq!((tot.shots, tot.hits), (2, 1));
+    }
+
+    #[test]
+    fn a_shot_is_not_an_input() {
+        // Shot records ride alongside the input verdicts; they must not
+        // inflate the accepted count the rate/anomaly features divide by.
+        let mut t = Telemetry::new();
+        t.accept(1, 1, false);
+        t.shot(1, 1, true, 0.0);
+        let p = t.per_player(1);
+        assert_eq!((p.accepted, p.shots, p.hits), (1, 1, 1));
     }
 
     #[test]

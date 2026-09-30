@@ -18,8 +18,10 @@ use std::collections::BTreeSet;
 
 use aegis_client_sdk::{
     aimbot::AimbotBot, badversion::BadVersionBot, flood::FloodBot, garbage::GarbageBot,
-    honest::HonestBot, nan::NanBot, replay::ReplayBot, speedhack::SpeedhackBot, Bot, BotCtx,
+    honest::HonestBot, humanized::HumanizedAimbot, nan::NanBot, replay::ReplayBot,
+    speedhack::SpeedhackBot, Bot, BotCtx,
 };
+use aegis_detector::{Flag, Suite};
 use aegis_protocol::{encode, ClientMsg, PlayerId, Vec2};
 use aegis_server::guards::{joined, packet, version};
 use aegis_server::{ClientInput, GuardCtx, GuardVerdict, Pipeline, Sim};
@@ -50,10 +52,27 @@ impl Scenario {
                 Box::new(GarbageBot::new()),
                 Box::new(NanBot::new()),
                 Box::new(AimbotBot::new()),
+                Box::new(HumanizedAimbot::new()),
             ],
         }
     }
+
+    /// A lobby of `LOBBY_SIZE` honest players, each with its own aim seed
+    /// derived from `seed`. Nobody here cheats, so any flag the detector
+    /// raises in it is a false positive.
+    pub fn honest_lobby(seed: u32) -> Self {
+        Self {
+            name: "honest_lobby",
+            ticks: 300,
+            bots: (0..LOBBY_SIZE)
+                .map(|k| Box::new(HonestBot::with_seed(seed.wrapping_mul(LOBBY_SIZE).wrapping_add(k + 1))) as Box<dyn Bot>)
+                .collect(),
+        }
+    }
 }
+
+/// Players per [`Scenario::honest_lobby`].
+pub const LOBBY_SIZE: u32 = 4;
 
 #[derive(Debug)]
 pub struct BotReport {
@@ -62,13 +81,17 @@ pub struct BotReport {
     /// Join passed the version guard and the player was spawned.
     pub joined: bool,
     pub totals: Totals,
-    /// Shots fired while alive (accepted inputs with `shoot`).
+    /// Shots that count as aim evidence — the `Shot` records in telemetry, so
+    /// the detector and this report count the same thing. Point-blank shots
+    /// still resolve (and can kill) but are not in here.
     pub shots: u32,
     pub hits: u32,
     pub kills: u32,
     /// Largest distance moved in a single tick. The sim's movement authority
     /// holds iff this never exceeds `MOVE_SPEED` for any bot.
     pub max_step: f32,
+    /// What the detector suite raised on this player's telemetry.
+    pub flags: Vec<Flag>,
 }
 
 pub struct Report {
@@ -153,12 +176,20 @@ fn dist(a: Vec2, b: Vec2) -> f32 {
     Vec2::new(a.x - b.x, a.y - b.y).len()
 }
 
+/// Detector stats for every player across `lobbies` honest lobbies (seeds
+/// 0..lobbies) — the honest population the thresholds are measured against.
+pub fn honest_sweep(lobbies: u32) -> Vec<aegis_detector::PlayerStats> {
+    (0..lobbies)
+        .flat_map(|seed| aegis_detector::stats(run(Scenario::honest_lobby(seed)).telemetry.records()).into_values())
+        .collect()
+}
+
 pub fn run(mut sc: Scenario) -> Report {
     let n = sc.bots.len();
     let id = |i: usize| (i + 1) as PlayerId;
     let spawns: Vec<Vec2> = (0..n).map(|i| spawn_pos(i, n)).collect();
     let mut w = World { sim: Sim::new(), pipe: Pipeline::standard(), tel: Telemetry::new(), joined: BTreeSet::new() };
-    let (mut shots, mut hits, mut kills) = (vec![0u32; n], vec![0u32; n], vec![0u32; n]);
+    let mut kills = vec![0u32; n];
     let mut max_step = vec![0f32; n];
 
     // Tick 0: the handshake, over the wire like everything else.
@@ -167,6 +198,7 @@ pub fn run(mut sc: Scenario) -> Report {
     }
 
     for tick in 1..=sc.ticks {
+        w.sim.step_respawns();
         let snapshot = w.sim.snapshot();
         let mut accepted: Vec<(usize, ClientInput)> = Vec::new();
         for (i, bot) in sc.bots.iter_mut().enumerate() {
@@ -180,13 +212,18 @@ pub fn run(mut sc: Scenario) -> Report {
 
         // Shots resolve against the world the clients were shown (nobody has
         // moved yet this tick), then everyone moves.
+        // Every shot resolves; only shots that say something about aim are
+        // recorded. No enemy, or an enemy point-blank, leaves no evidence
+        // either way (see `Sim::aim_error`).
         for &(i, input) in &accepted {
-            if input.shoot && w.sim.player(id(i)).is_some_and(|p| p.alive) {
-                shots[i] += 1;
-                if let Some(r) = w.sim.apply_shot(id(i), input.aim) {
-                    hits[i] += 1;
-                    kills[i] += r.killed as u32;
-                }
+            if !input.shoot {
+                continue;
+            }
+            let err = w.sim.aim_error(id(i), input.aim);
+            let r = w.sim.apply_shot(id(i), input.aim);
+            kills[i] += r.is_some_and(|r| r.killed) as u32;
+            if let Some(err) = err {
+                w.tel.shot(tick, id(i), r.is_some(), err);
             }
         }
         for &(i, input) in &accepted {
@@ -198,19 +235,26 @@ pub fn run(mut sc: Scenario) -> Report {
         }
     }
 
+    let stats = aegis_detector::stats(w.tel.records());
+    let suite = Suite::standard();
     let bots = sc
         .bots
         .iter()
         .enumerate()
-        .map(|(i, bot)| BotReport {
-            id: id(i),
-            name: bot.name(),
-            joined: w.joined.contains(&id(i)),
-            totals: w.tel.per_player(id(i)),
-            shots: shots[i],
-            hits: hits[i],
-            kills: kills[i],
-            max_step: max_step[i],
+        .map(|(i, bot)| {
+            let totals = w.tel.per_player(id(i));
+            let flags = stats.get(&id(i)).map(|s| suite.check(s)).unwrap_or_default();
+            BotReport {
+                id: id(i),
+                name: bot.name(),
+                joined: w.joined.contains(&id(i)),
+                shots: totals.shots,
+                hits: totals.hits,
+                totals,
+                kills: kills[i],
+                max_step: max_step[i],
+                flags,
+            }
         })
         .collect();
     Report { scenario: sc.name, ticks: sc.ticks, bots, telemetry: w.tel }
@@ -221,6 +265,8 @@ mod tests {
     use super::*;
     use aegis_client_sdk::garbage;
     use aegis_server::sim::MOVE_SPEED;
+    use aegis_detector::detectors::{accuracy, aim_exact, anomaly_rate};
+    use aegis_detector::FlagReason;
     use aegis_server::RejectReason;
 
     fn standard() -> Report {
@@ -330,6 +376,76 @@ mod tests {
         assert!(a.hits > 0 && h.shots > 0);
         assert!(a.accuracy() > 0.9, "aimbot accuracy {}", a.accuracy());
         assert!(h.accuracy() < 0.6, "honest accuracy {}", h.accuracy());
+    }
+
+    fn flagged(b: &BotReport) -> Vec<FlagReason> {
+        b.flags.iter().map(|f| f.reason).collect()
+    }
+
+    /// Coverage, pillar C: every detector is tripped by some bot. A detector
+    /// no bot trips is a detector nobody has seen fire.
+    #[test]
+    fn every_flag_fires() {
+        let r = standard();
+        for reason in FlagReason::ALL {
+            assert!(r.bots.iter().any(|b| flagged(b).contains(&reason)), "{} never fired", reason.label());
+        }
+    }
+
+    #[test]
+    fn detector_names_each_cheat_and_nobody_else() {
+        let r = standard();
+        assert_eq!(flagged(r.bot("aimbot")), vec![FlagReason::Accuracy, FlagReason::AimExact]);
+        assert_eq!(flagged(r.bot("speedhack")), vec![FlagReason::AnomalyRate]);
+        for b in r.bots.iter().filter(|b| !["aimbot", "humanized", "speedhack"].contains(&b.name)) {
+            assert!(b.flags.is_empty(), "{} flagged {:?}", b.name, b.flags);
+        }
+    }
+
+    /// Why there are two aim detectors: jitter hides the humanized aimbot from
+    /// aim_exact, but not from accuracy. And no guard sees it at all.
+    #[test]
+    fn humanized_aimbot_evades_aim_exact_but_not_accuracy() {
+        let r = standard();
+        let b = r.bot("humanized");
+        assert_eq!(b.totals.total_rejected(), 0);
+        assert_eq!(b.totals.anomalies, 0);
+        assert_eq!(flagged(b), vec![FlagReason::Accuracy]);
+    }
+
+    /// The false-positive bound: 1000 honest players (250 lobbies of 4, each
+    /// with its own aim seed), zero flags. Every one of them must also have
+    /// enough shots to be judged, or "no flags" would only mean "no verdict".
+    #[test]
+    fn honest_population_is_never_flagged() {
+        let players = honest_sweep(250);
+        assert_eq!(players.len(), 1000);
+        let suite = Suite::standard();
+        for s in &players {
+            assert!(s.shots() >= accuracy::MIN_SHOTS, "player {} only {} shots: no verdict", s.player, s.shots());
+            assert!(s.accepted >= anomaly_rate::MIN_INPUTS);
+            let f = suite.check(s);
+            assert!(f.is_empty(), "honest player {} flagged {:?}", s.player, f);
+        }
+    }
+
+    #[test]
+    fn aim_evidence_is_in_the_telemetry_stream() {
+        // The detector reads telemetry, not the harness counters; the aimbot's
+        // snaps must be visible there as near-zero aim_err.
+        let r = standard();
+        let id = r.bot("aimbot").id;
+        let errs: Vec<f32> = r
+            .telemetry
+            .records()
+            .iter()
+            .filter_map(|rec| match rec.outcome {
+                aegis_telemetry::Outcome::Shot { aim_err, .. } if rec.player == id => Some(aim_err),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(errs.len() as u32, r.bot("aimbot").shots);
+        assert!(errs.iter().filter(|&&e| e < aim_exact::EXACT_RAD).count() * 10 > errs.len() * 9);
     }
 
     #[test]

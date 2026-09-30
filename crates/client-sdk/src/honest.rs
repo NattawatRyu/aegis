@@ -7,7 +7,7 @@
 //! with a different name, and the detector (pillar C) would have nothing to
 //! tell apart. The error is deterministic (seeded xorshift), so runs repeat.
 
-use super::{my_pos, nearest_enemy, unit_towards, Bot, BotCtx};
+use super::{jitter, my_pos, nearest_enemy, rotate, unit_towards, Bot, BotCtx};
 use aegis_protocol::{ClientMsg, Vec2};
 
 /// Largest aim error either side of the true bearing, in radians (~8.6°).
@@ -21,23 +21,21 @@ pub struct HonestBot {
 
 impl HonestBot {
     pub fn new() -> Self {
-        Self { seq: 0, walk: Vec2::new(1.0, 0.0), rng: 0x9E37_79B9 }
+        Self::with_seed(0x9E37_79B9)
     }
 
-    /// Next aim error in [-AIM_ERROR_RAD, AIM_ERROR_RAD] (xorshift32).
+    /// Same player, different hand: the seed only changes the aim error
+    /// sequence. How the detector's false-positive rate is measured — many
+    /// honest players, not one honest player many times. A zero seed would
+    /// stall xorshift at 0 (perfect aim forever), so it is remapped.
+    pub fn with_seed(seed: u32) -> Self {
+        Self { seq: 0, walk: Vec2::new(1.0, 0.0), rng: if seed == 0 { 0x9E37_79B9 } else { seed } }
+    }
+
+    /// Next aim error in [-AIM_ERROR_RAD, AIM_ERROR_RAD].
     fn aim_error(&mut self) -> f32 {
-        let mut x = self.rng;
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        self.rng = x;
-        (x as f32 / u32::MAX as f32 * 2.0 - 1.0) * AIM_ERROR_RAD
+        jitter(&mut self.rng) * AIM_ERROR_RAD
     }
-}
-
-fn rotate(v: Vec2, a: f32) -> Vec2 {
-    let (s, c) = a.sin_cos();
-    Vec2::new(v.x * c - v.y * s, v.x * s + v.y * c)
 }
 
 impl Default for HonestBot {
@@ -117,6 +115,29 @@ mod tests {
             })
             .count();
         assert!(exact < 5, "{exact} of 200 shots were dead-on");
+    }
+
+    #[test]
+    fn seed_zero_does_not_become_an_aimbot() {
+        let mut b = HonestBot::with_seed(0);
+        let snap = [state(1, Vec2::ZERO), state(2, Vec2::new(1.0, 0.0))];
+        let exact = (1..=100)
+            .filter(|&tick| match b.act(&BotCtx { tick, my_id: 1, snapshot: &snap })[0] {
+                ClientMsg::Input { aim, .. } => aim == Vec2::new(1.0, 0.0),
+                _ => panic!("expected Input"),
+            })
+            .count();
+        assert!(exact < 5, "{exact} of 100 shots were dead-on");
+    }
+
+    #[test]
+    fn different_seeds_aim_differently() {
+        let snap = [state(1, Vec2::ZERO), state(2, Vec2::new(1.0, 0.0))];
+        let aim = |seed| match HonestBot::with_seed(seed).act(&BotCtx { tick: 1, my_id: 1, snapshot: &snap })[0] {
+            ClientMsg::Input { aim, .. } => aim,
+            _ => panic!("expected Input"),
+        };
+        assert_ne!(aim(1), aim(2));
     }
 
     #[test]

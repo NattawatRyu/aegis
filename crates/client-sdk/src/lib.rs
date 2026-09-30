@@ -15,6 +15,7 @@ pub mod badversion;
 pub mod flood;
 pub mod garbage;
 pub mod honest;
+pub mod humanized;
 pub mod nan;
 pub mod replay;
 pub mod speedhack;
@@ -65,6 +66,23 @@ pub fn nearest_enemy<'a>(ctx: &'a BotCtx) -> Option<&'a PlayerState> {
         .iter()
         .filter(|p| p.id != ctx.my_id && p.alive)
         .min_by(|a, b| dist2(me, a.pos).total_cmp(&dist2(me, b.pos)))
+}
+
+/// Deterministic noise in [-1, 1] (xorshift32), so bots with "human" error
+/// still produce byte-identical runs. `state` must be non-zero.
+pub fn jitter(state: &mut u32) -> f32 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    x as f32 / u32::MAX as f32 * 2.0 - 1.0
+}
+
+/// `v` rotated by `a` radians.
+pub fn rotate(v: Vec2, a: f32) -> Vec2 {
+    let (s, c) = a.sin_cos();
+    Vec2::new(v.x * c - v.y * s, v.x * s + v.y * c)
 }
 
 /// Unit vector pointing from `from` to `to`. Falls back to +x if coincident.

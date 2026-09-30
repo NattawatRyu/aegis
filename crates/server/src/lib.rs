@@ -1,10 +1,10 @@
 //! Aegis authoritative game server.
 //!
 //! Two layers of defense, kept strictly separate:
-//!   - [`sim`]    — the world's truth. The server, not the client, owns every
-//!                  position and every hit (structural anti-teleport/instant-hit).
+//!   - [`sim`] — the world's truth. The server, not the client, owns every
+//!     position and every hit (structural anti-teleport/instant-hit).
 //!   - [`guards`] — the input-trust pipeline. Each cheat class is one module;
-//!                  see [`guards`] for the full list and how to add more.
+//!     see [`guards`] for the full list and how to add more.
 //!
 //! Networking (UDP tick loop) is the next sub-step; today everything here is
 //! pure and deterministic so every defense is unit-testable without a socket.

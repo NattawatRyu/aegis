@@ -4,8 +4,9 @@ Open-source toolkit that helps game developers build multiplayer games that
 resist **cheating** and **DDoS** from day one — by fixing the *architecture*,
 not by chasing individual cheats.
 
-> Status: **pre-alpha.** Step 1 (Lab / Testbed) done: in-process, no network
-> yet. Nothing here is production-ready.
+> Status: **pre-alpha.** Step 1 (Lab / Testbed) and Step 2 (detector v0,
+> offline rules) done: in-process, no network yet. Nothing here is
+> production-ready.
 
 ## Why
 
@@ -48,7 +49,8 @@ crates/
   protocol/     wire types — the intent-only contract every crate depends on
   server/       authoritative sim + guards (one defense per file in guards/)
   client-sdk/   programmable bots: honest + one cheat per file
-  telemetry/    guard verdicts as jsonl, for the detector
+  telemetry/    guard verdicts + shot evidence as jsonl, for the detector
+  detector/     pillar C: one detector per file, flags for human review
   harness/      runs every bot against the real guards + sim, reports per bot
 scenarios/out/  harness telemetry output (gitignored)
 ```
@@ -56,7 +58,8 @@ scenarios/out/  harness telemetry output (gitignored)
 Run the lab:
 
 ```
-cargo run -p aegis-harness
+cargo run -p aegis-harness            # every bot vs guards + detector
+cargo run -p aegis-harness -- sweep   # honest population per detector signal
 ```
 
 ## License

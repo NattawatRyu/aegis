@@ -58,6 +58,10 @@ pub fn stats(records: &[Record]) -> BTreeMap<u8, PlayerStats> {
                 s.hits += hit as u32;
                 s.aim_errs.push(aim_err);
             }
+            // Offline v0 judges a whole run per id. Ids are reused only after
+            // the server has cycled through all 255, which no scenario does;
+            // an online detector must split its window here.
+            Outcome::Left => {}
         }
     }
     m

@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use aegis_client_sdk::{
     aimbot::AimbotBot, badversion::BadVersionBot, flood::FloodBot, garbage::GarbageBot,
-    honest::HonestBot, humanized::HumanizedAimbot, nan::NanBot, replay::ReplayBot,
+    honest::HonestBot, humanized::HumanizedAimbot, joinflood::JoinFloodBot, nan::NanBot, replay::ReplayBot,
     speedhack::SpeedhackBot, spoof::SpoofBot, Bot, BotCtx,
 };
 use aegis_detector::{Flag, Suite};
@@ -64,6 +64,7 @@ impl Scenario {
                 Box::new(AimbotBot::new()),
                 Box::new(HumanizedAimbot::new()),
                 Box::new(SpoofBot::new()),
+                Box::new(JoinFloodBot::new()),
             ],
         }
     }
@@ -240,25 +241,29 @@ impl Lab {
 /// address. Deterministic.
 pub fn run(mut sc: Scenario) -> Report {
     let n = sc.bots.len();
-    let addr = |i: usize| SocketAddr::from((bot_ip(i), 40000));
+    // Bot slot `i`, source port index `k`.
+    let addr = |i: usize, k: u16| SocketAddr::from((bot_ip(i), 40000 + k));
     let route = sc.routes();
     let mut server = Server::new(spawns(n));
     let mut lab = Lab::new(n);
 
     // Tick 0: the handshake, over the wire like everything else.
     for (i, bot) in sc.bots.iter().enumerate() {
-        lab.sessions[i] = server.receive(0, addr(i), &frame(NO_TOKEN, &bot.join()));
+        lab.sessions[i] = server.receive(0, addr(i, 0), &frame(NO_TOKEN, &bot.join()));
     }
 
     for tick in 1..=sc.ticks {
-        let snapshot = server.begin_tick();
+        let snapshot = server.begin_tick(tick);
         for (i, bot) in sc.bots.iter_mut().enumerate() {
-            // The server sends snapshots to admitted players only.
-            let seen: &[PlayerState] = if lab.sessions[i].is_some() { &snapshot } else { &[] };
-            for d in bot.datagrams(&lab.ctx(i, tick, seen)) {
-                // A Joined answer goes to the address the datagram came from.
-                if let Some(s) = server.receive(tick, addr(route[i]), &d) {
-                    lab.sessions[route[i]] = Some(s);
+            // The server sends snapshots to admitted addresses only.
+            let seen: &[PlayerState] = if server.player_id(addr(i, 0)).is_some() { &snapshot } else { &[] };
+            for (k, d) in bot.routed(&lab.ctx(i, tick, seen)) {
+                // A Joined answer goes to the address the datagram came from;
+                // only port 0's is read back (the UDP run reads only that one).
+                if let Some(s) = server.receive(tick, addr(route[i], k), &d) {
+                    if k == 0 {
+                        lab.sessions[route[i]] = Some(s);
+                    }
                 }
             }
         }
@@ -277,18 +282,26 @@ pub fn run_udp(mut sc: Scenario) -> io::Result<Report> {
     let n = sc.bots.len();
     let mut net = NetServer::bind((Ipv4Addr::LOCALHOST, 0), Server::new(spawns(n)))?;
     let to = net.local_addr()?;
-    let socks = (0..n)
-        .map(|i| {
-            let s = UdpSocket::bind((bot_ip(i), 0))?;
-            s.set_read_timeout(Some(UDP_WAIT))?;
-            Ok(s)
+    // socks[i][k]: bot slot i, source port index k, all on the bot's IP.
+    let socks = sc
+        .bots
+        .iter()
+        .enumerate()
+        .map(|(i, bot)| {
+            (0..bot.sources())
+                .map(|_| {
+                    let s = UdpSocket::bind((bot_ip(i), 0))?;
+                    s.set_read_timeout(Some(UDP_WAIT))?;
+                    Ok(s)
+                })
+                .collect::<io::Result<Vec<_>>>()
         })
         .collect::<io::Result<Vec<_>>>()?;
     let route = sc.routes();
     let mut lab = Lab::new(n);
 
     for (i, bot) in sc.bots.iter().enumerate() {
-        socks[i].send_to(&frame(NO_TOKEN, &bot.join()), to)?;
+        socks[i][0].send_to(&frame(NO_TOKEN, &bot.join()), to)?;
     }
     pump(&mut net, n)?;
 
@@ -298,12 +311,12 @@ pub fn run_udp(mut sc: Scenario) -> io::Result<Report> {
         for (i, bot) in sc.bots.iter_mut().enumerate() {
             // The server's word on who is admitted decides only whether to
             // wait for a snapshot; what is in it is read off the socket.
-            let snapshot = match net.server().player_id(socks[i].local_addr()?) {
-                Some(_) => read_snapshot(&socks[i], tick, &mut lab.sessions[i])?,
+            let snapshot = match net.server().player_id(socks[i][0].local_addr()?) {
+                Some(_) => read_snapshot(&socks[i][0], tick, &mut lab.sessions[i])?,
                 None => Vec::new(),
             };
-            for d in bot.datagrams(&lab.ctx(i, tick, &snapshot)) {
-                socks[route[i]].send_to(&d, to)?;
+            for (k, d) in bot.routed(&lab.ctx(i, tick, &snapshot)) {
+                socks[route[i]][k as usize].send_to(&d, to)?;
                 sent += 1;
             }
         }
@@ -438,6 +451,15 @@ mod tests {
         // Up to the victim IP's unauthenticated budget, each forgery is
         // decoded and refused for its token; the rest never get that far.
         assert_eq!(r.net.get("bad_token"), u64::from(MAX_PER_TICK * r.ticks));
+    }
+
+    /// One IP, 255 ports, a legal Join from each: the server must never fill
+    /// up. Every join it refuses is refused for the per-IP session cap.
+    #[test]
+    fn join_flood_never_fills_the_server() {
+        let r = standard();
+        assert_eq!(r.net.get("server_full"), 0, "net: {:?}", r.net);
+        assert!(r.net.get("ip_sessions") > 0, "the cap never fired: {:?}", r.net);
     }
 
     /// No legal join, no id: badversion leaves no per-player record at all,

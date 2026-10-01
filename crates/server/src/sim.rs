@@ -68,6 +68,15 @@ impl Sim {
         self.lives.push(Life { spawn: pos, dead_ticks: 0 });
     }
 
+    /// Remove a player from the world entirely (its session ended). A later
+    /// `spawn` with the same id starts from scratch.
+    pub fn despawn(&mut self, id: PlayerId) {
+        if let Some(i) = self.players.iter().position(|p| p.id == id) {
+            self.players.remove(i);
+            self.lives.remove(i);
+        }
+    }
+
     /// Advance every dead player's respawn timer by one tick; a player dead
     /// for `RESPAWN_TICKS` calls comes back at its spawn point, full health.
     /// Call once at the start of each tick. Without it a match is over as soon

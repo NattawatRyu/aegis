@@ -35,6 +35,10 @@ pub enum Outcome {
     /// enemy, computed server-side from authoritative positions — the
     /// detector's view of *how* the player aims, not just whether it hit.
     Shot { hit: bool, aim_err: f32 },
+    /// The player's session ended (idle timeout). Its id may be issued to
+    /// someone else later, so records after this one are a different person:
+    /// anything that aggregates per id must start over here.
+    Left,
 }
 
 /// Aggregate counts, for the harness and for a quick detector baseline.
@@ -76,6 +80,10 @@ impl Telemetry {
         self.records.push(Record { tick, player, outcome: Outcome::Shot { hit, aim_err } });
     }
 
+    pub fn left(&mut self, tick: u32, player: u8) {
+        self.records.push(Record { tick, player, outcome: Outcome::Left });
+    }
+
     pub fn records(&self) -> &[Record] {
         &self.records
     }
@@ -115,6 +123,7 @@ impl Telemetry {
                     t.shots += 1;
                     t.hits += *hit as u32;
                 }
+                Outcome::Left => {}
             }
         }
         t

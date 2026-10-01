@@ -16,6 +16,7 @@ pub mod flood;
 pub mod garbage;
 pub mod honest;
 pub mod humanized;
+pub mod joinflood;
 pub mod nan;
 pub mod replay;
 pub mod speedhack;
@@ -57,6 +58,19 @@ pub trait Bot {
     /// join always goes out from the bot's own address.
     fn impersonates(&self) -> Option<&'static str> {
         None
+    }
+
+    /// How many source ports this bot sends from (all on its one IP). Index
+    /// 0 is its own address, where its join goes and its replies come back.
+    fn sources(&self) -> u16 {
+        1
+    }
+
+    /// This tick's datagrams, each with the source port index it leaves from.
+    /// Default: every `datagrams` entry from port 0. Only a bot that uses
+    /// more than one port overrides this.
+    fn routed(&mut self, ctx: &BotCtx) -> Vec<(u16, Vec<u8>)> {
+        self.datagrams(ctx).into_iter().map(|d| (0, d)).collect()
     }
 }
 

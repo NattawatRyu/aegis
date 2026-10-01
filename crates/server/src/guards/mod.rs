@@ -5,12 +5,13 @@
 //! function, for guards that don't run per-input), and add one line to
 //! [`Pipeline::standard`]. Nothing else in the server needs to change.
 //!
-//! Five guards run at their own stage rather than in the per-input pipeline,
+//! Six guards run at their own stage rather than in the per-input pipeline,
 //! because they act on data the pipeline never sees:
 //!   - [`session`] — runs first, on the source address + token header.
 //!   - [`source_rate`] — then, per player or per source IP, before any decode.
 //!   - [`packet`]  — runs at decode, on the raw datagram bytes.
 //!   - [`version`] — runs at `Join`, on the client's declared protocol version.
+//!   - [`ip_sessions`] — runs at admission, on the joining IP's live sessions.
 //!   - [`joined`]  — runs before the pipeline, on the admitted source addresses.
 //!
 //! Hit / movement authority is NOT a guard: the protocol gives a client no way
@@ -19,6 +20,7 @@
 
 use aegis_protocol::{PlayerId, Vec2};
 
+pub mod ip_sessions;
 pub mod session;
 pub mod source_rate;
 pub mod version;
@@ -52,6 +54,7 @@ pub struct ClientInput {
 /// anomaly signal the telemetry crate feeds to the detector (pillar C).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
+    IpSessions,
     BadToken,
     SourceRate,
     BadVersion,
@@ -65,7 +68,8 @@ pub enum RejectReason {
 impl RejectReason {
     /// Every reason, for coverage checks ("does some bot trip each guard?").
     /// A new variant goes here too.
-    pub const ALL: [RejectReason; 8] = [
+    pub const ALL: [RejectReason; 9] = [
+        RejectReason::IpSessions,
         RejectReason::BadToken,
         RejectReason::SourceRate,
         RejectReason::BadVersion,
@@ -80,6 +84,7 @@ impl RejectReason {
     /// the enum here so the telemetry crate stays decoupled from server types.
     pub fn label(self) -> &'static str {
         match self {
+            RejectReason::IpSessions => "ip_sessions",
             RejectReason::BadToken => "bad_token",
             RejectReason::SourceRate => "source_rate",
             RejectReason::BadVersion => "bad_version",
@@ -107,6 +112,11 @@ pub enum GuardVerdict {
 pub trait InputGuard: Send {
     fn name(&self) -> &'static str;
     fn check(&mut self, ctx: &GuardCtx, input: &mut ClientInput) -> GuardVerdict;
+
+    /// Drop everything held about `player`: its session ended and the id may
+    /// go to someone else, who must not inherit (say) its last seq. A guard
+    /// with per-player state must implement this.
+    fn forget(&mut self, _player: PlayerId) {}
 }
 
 /// The ordered per-input guard chain. First `Rejected` stops the chain; an
@@ -132,6 +142,13 @@ impl Pipeline {
     /// Names in run order — handy for tests and for a `/defenses` endpoint.
     pub fn names(&self) -> Vec<&'static str> {
         self.guards.iter().map(|g| g.name()).collect()
+    }
+
+    /// Every guard forgets `player` (see [`InputGuard::forget`]).
+    pub fn forget(&mut self, player: PlayerId) {
+        for g in self.guards.iter_mut() {
+            g.forget(player);
+        }
     }
 
     pub fn run(&mut self, ctx: &GuardCtx, input: &mut ClientInput) -> GuardVerdict {
@@ -178,6 +195,20 @@ mod tests {
         let mut i = input();
         let v = p.run(&GuardCtx { tick: 1, player: 1 }, &mut i);
         assert_eq!(v, GuardVerdict::Ok { anomaly: false });
+    }
+
+    /// A reused id starts clean: after `forget`, a fresh client's first input
+    /// (seq 1, same tick as the old player's last) is not a "replay" and not
+    /// "over rate".
+    #[test]
+    fn forgotten_player_starts_clean() {
+        let mut p = Pipeline::standard();
+        let ctx = GuardCtx { tick: 5, player: 1 };
+        let mut old = ClientInput { seq: 500, ..input() };
+        assert_eq!(p.run(&ctx, &mut old), GuardVerdict::Ok { anomaly: false });
+        p.forget(1);
+        let mut fresh = input(); // seq 1
+        assert_eq!(p.run(&ctx, &mut fresh), GuardVerdict::Ok { anomaly: false });
     }
 
     #[test]

@@ -8,7 +8,9 @@ not by chasing individual cheats.
 > offline rules) done; Step 3 (pillar D) in progress — the server runs over
 > real UDP; every client datagram carries a session token checked before
 > decode, so a forged source address can neither act as a player nor spend
-> its rate budget. No encryption: an on-path attacker can still read tokens.
+> its rate budget. Sessions are capped per IP and end after 5 s idle, so one
+> machine cannot fill the server. No encryption: an on-path attacker can
+> still read tokens.
 > Nothing here is production-ready.
 
 ## Why

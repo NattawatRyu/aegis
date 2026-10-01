@@ -25,6 +25,10 @@ impl InputGuard for ReplayGuard {
         "replay"
     }
 
+    fn forget(&mut self, player: u8) {
+        self.last_seq.remove(&player);
+    }
+
     fn check(&mut self, ctx: &GuardCtx, input: &mut ClientInput) -> GuardVerdict {
         match self.last_seq.get(&ctx.player) {
             Some(&s) if input.seq <= s => GuardVerdict::Rejected(RejectReason::Replay),

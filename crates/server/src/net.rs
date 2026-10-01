@@ -77,7 +77,7 @@ impl NetServer {
     /// address. A send that fails is that client's problem, not the tick's.
     pub fn begin_tick(&mut self) -> io::Result<()> {
         self.tick += 1;
-        let snap = encode(&ServerMsg::Snapshot { tick: self.tick, players: self.server.begin_tick() });
+        let snap = encode(&ServerMsg::Snapshot { tick: self.tick, players: self.server.begin_tick(self.tick) });
         for (to, _) in self.server.peers() {
             let _ = self.sock.send_to(&snap, to);
         }

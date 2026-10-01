@@ -26,6 +26,10 @@ impl InputGuard for InputRateGuard {
         "input_rate"
     }
 
+    fn forget(&mut self, player: u8) {
+        self.last_tick.remove(&player);
+    }
+
     fn check(&mut self, ctx: &GuardCtx, _input: &mut ClientInput) -> GuardVerdict {
         match self.last_tick.get(&ctx.player) {
             Some(&t) if t == ctx.tick => GuardVerdict::Rejected(RejectReason::RateExceeded),

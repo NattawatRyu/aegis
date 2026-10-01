@@ -24,16 +24,21 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 
-use aegis_protocol::{split_frame, ClientMsg, PlayerId, PlayerState, Vec2};
+use aegis_protocol::{split_frame, ClientMsg, PlayerId, PlayerState, Vec2, TICK_HZ};
 use aegis_telemetry::Telemetry;
 
 use crate::guards::session::{self, Session};
 use crate::guards::source_rate::SourceRate;
-use crate::guards::{joined, packet, version};
+use crate::guards::{ip_sessions, joined, packet, version};
 use crate::{ClientInput, GuardCtx, GuardVerdict, Pipeline, RejectReason, Sim};
 
 /// [`NetStats`] label for a legal join refused because all 255 ids are taken.
 pub const SERVER_FULL: &str = "server_full";
+
+/// A session with no authenticated datagram for longer than this (5 s) is
+/// ended: removed from the world, its id freed, a `Left` record written. A
+/// real client sends every tick; one that stops has gone, or never played.
+pub const IDLE_TICKS: u32 = 5 * TICK_HZ;
 
 /// What one tick did, for callers that measure the world (the lab's kill
 /// count and movement-authority check). The server itself keeps no metrics.
@@ -73,8 +78,13 @@ pub struct Server {
     player_rate: SourceRate<PlayerId>,
     /// Budget for everything else, per source IP.
     ip_rate: SourceRate<IpAddr>,
-    /// Admitted address -> its session. Ids are 1.. in join order, never reused.
+    /// Admitted address -> its session.
     sessions: BTreeMap<SocketAddr, Session>,
+    /// Admitted address -> tick of its last authenticated datagram (or join).
+    last_seen: BTreeMap<SocketAddr, u32>,
+    /// The id issued last. The next goes to the first free id after it,
+    /// wrapping — so a freed id is reused as late as possible.
+    last_id: PlayerId,
     /// Player `id` enters at `spawns[(id - 1) % len]`.
     spawns: Vec<Vec2>,
     /// Inputs accepted this tick, in arrival order, waiting for `end_tick`.
@@ -93,14 +103,32 @@ impl Server {
             player_rate: SourceRate::new(),
             ip_rate: SourceRate::new(),
             sessions: BTreeMap::new(),
+            last_seen: BTreeMap::new(),
+            last_id: 0,
             spawns,
             pending: Vec::new(),
         }
     }
 
-    /// Start a tick: advance respawn timers, then return the world as the
-    /// clients will see it while choosing this tick's input.
-    pub fn begin_tick(&mut self) -> Vec<PlayerState> {
+    /// Start tick `tick`: end idle sessions, advance respawn timers, then
+    /// return the world as the clients will see it while choosing this tick's
+    /// input.
+    pub fn begin_tick(&mut self, tick: u32) -> Vec<PlayerState> {
+        let idle: Vec<SocketAddr> = self
+            .last_seen
+            .iter()
+            .filter(|&(_, &seen)| tick.saturating_sub(seen) > IDLE_TICKS)
+            .map(|(&a, _)| a)
+            .collect();
+        for a in idle {
+            self.last_seen.remove(&a);
+            if let Some(s) = self.sessions.remove(&a) {
+                self.sim.despawn(s.player_id);
+                self.pipe.forget(s.player_id);
+                self.pending.retain(|&(p, _)| p != s.player_id);
+                self.tel.left(tick, s.player_id);
+            }
+        }
         self.sim.step_respawns();
         self.sim.snapshot()
     }
@@ -121,6 +149,7 @@ impl Server {
         // forgeries from the same IP cannot spend it.
         if let (Some((token, body)), Ok(s)) = (framed, known) {
             if session::verify(&s, token).is_ok() {
+                self.last_seen.insert(from, tick);
                 if let Err(r) = self.player_rate.check(tick, s.player_id) {
                     self.net.drop(r.label());
                     return None;
@@ -145,7 +174,7 @@ impl Server {
             (ClientMsg::Join { protocol, .. }, known) => match (version::check_join(protocol), known) {
                 (Err(r), _) => r,
                 (Ok(()), Ok(s)) => return Some(s), // lost Joined: answer again
-                (Ok(()), Err(_)) => return self.admit(from),
+                (Ok(()), Err(_)) => return self.admit(tick, from),
             },
             (ClientMsg::Input { .. }, Ok(_)) => RejectReason::BadToken,
             (ClientMsg::Input { .. }, Err(not_joined)) => not_joined,
@@ -155,15 +184,29 @@ impl Server {
     }
 
     /// A legal Join from an address with no session: create the player.
-    fn admit(&mut self, from: SocketAddr) -> Option<Session> {
-        let Ok(player_id) = PlayerId::try_from(self.sessions.len() + 1) else {
+    fn admit(&mut self, tick: u32, from: SocketAddr) -> Option<Session> {
+        if let Err(r) = ip_sessions::check_join(&self.sessions, from.ip()) {
+            self.net.drop(r.label());
+            return None;
+        }
+        let Some(player_id) = self.next_free_id() else {
             self.net.drop(SERVER_FULL);
             return None;
         };
+        self.last_id = player_id;
         let s = Session { player_id, token: session::new_token() };
         self.sessions.insert(from, s);
+        self.last_seen.insert(from, tick);
         self.sim.spawn(player_id, self.spawns[(player_id as usize - 1) % self.spawns.len()]);
         Some(s)
+    }
+
+    /// The first id in 1..=255 after `last_id` (wrapping) that nobody holds.
+    fn next_free_id(&self) -> Option<PlayerId> {
+        let taken: std::collections::BTreeSet<PlayerId> = self.sessions.values().map(|s| s.player_id).collect();
+        (1..=PlayerId::MAX)
+            .map(|k| ((self.last_id as u16 + k as u16 - 1) % PlayerId::MAX as u16 + 1) as PlayerId)
+            .find(|id| !taken.contains(id))
     }
 
     /// An authenticated datagram: everything is on the player's record.
@@ -406,6 +449,85 @@ mod tests {
         assert_eq!(other.player_id, 3);
     }
 
+    /// The timeout edge: idle for exactly IDLE_TICKS is still in; one more and
+    /// the session ends — gone from the world, `Left` on the record, its
+    /// token worthless.
+    #[test]
+    fn idle_session_ends_one_tick_past_the_timeout() {
+        let mut s = server();
+        let t1 = admit(&mut s, addr(1)); // last seen: tick 0
+        assert_eq!(s.begin_tick(IDLE_TICKS).len(), 1);
+        assert_eq!(s.player_id(addr(1)), Some(1));
+        assert!(s.begin_tick(IDLE_TICKS + 1).is_empty());
+        assert_eq!(s.player_id(addr(1)), None);
+        let last = s.telemetry().records().last().unwrap();
+        assert_eq!((last.tick, last.player, &last.outcome), (IDLE_TICKS + 1, 1, &Outcome::Left));
+        s.receive(IDLE_TICKS + 1, addr(1), &walk(t1, 1));
+        assert_eq!(s.net_stats().get("not_joined"), 1);
+    }
+
+    #[test]
+    fn authenticated_traffic_keeps_a_session_alive_forgeries_do_not() {
+        let (mut s, t1, _) = joined_pair();
+        s.receive(100, addr(1), &walk(t1, 1)); // player 1: real input at 100
+        for t in 1..=IDLE_TICKS + 1 {
+            s.receive(t, addr(2), &walk(NO_TOKEN, t)); // player 2: only forgeries
+        }
+        s.begin_tick(IDLE_TICKS + 1);
+        assert_eq!(s.player_id(addr(1)), Some(1));
+        assert_eq!(s.player_id(addr(2)), None);
+    }
+
+    /// One IP, many ports: MAX_PER_IP sessions, then refusals; another IP is
+    /// unaffected; when one of the IP's sessions ends, it may join again.
+    #[test]
+    fn sessions_per_ip_are_capped_and_freed_by_the_timeout() {
+        use crate::guards::ip_sessions::MAX_PER_IP;
+        let mut s = server();
+        let port = |p: u16| SocketAddr::from(([10, 0, 0, 1], 5000 + p));
+        for p in 0..MAX_PER_IP as u16 {
+            assert!(s.receive(0, port(p), &join(PROTOCOL_VERSION)).is_some(), "port {p}");
+        }
+        assert_eq!(s.receive(0, port(99), &join(PROTOCOL_VERSION)), None);
+        assert_eq!(s.net_stats().get("ip_sessions"), 1);
+        assert!(s.receive(0, addr(2), &join(PROTOCOL_VERSION)).is_some());
+
+        s.begin_tick(IDLE_TICKS + 1); // all idle since tick 0
+        assert!(s.receive(IDLE_TICKS + 1, port(99), &join(PROTOCOL_VERSION)).is_some());
+    }
+
+    /// Ids are handed out round-robin, so a freed id is the last one reused.
+    #[test]
+    fn a_freed_id_is_not_the_next_one_issued() {
+        let mut s = server();
+        admit(&mut s, addr(1));
+        s.begin_tick(IDLE_TICKS + 1); // id 1 ends
+        let ids: Vec<_> = (2..=3).map(|n| s.receive(IDLE_TICKS + 1, addr(n), &join(PROTOCOL_VERSION)).unwrap().player_id).collect();
+        assert_eq!(ids, vec![2, 3]);
+    }
+
+    /// When an id does come round again, its new owner starts clean: the old
+    /// owner's seq 500 does not make the newcomer's seq 1 a "replay", and it
+    /// enters at its spawn, alive.
+    #[test]
+    fn a_reused_id_inherits_nothing() {
+        let mut s = server();
+        let old = admit(&mut s, SocketAddr::from(([10, 2, 0, 1], 4000)));
+        s.receive(1, SocketAddr::from(([10, 2, 0, 1], 4000)), &walk(old, 500));
+        for n in 2..=255u8 {
+            let from = SocketAddr::from(([10, 3, 0, n], 4000));
+            assert_eq!(s.receive(100, from, &join(PROTOCOL_VERSION)).map(|x| x.player_id), Some(n));
+        }
+        s.begin_tick(IDLE_TICKS + 2); // only id 1 is idle long enough
+        let newcomer = SocketAddr::from(([10, 4, 0, 1], 4000));
+        let fresh = s.receive(IDLE_TICKS + 2, newcomer, &join(PROTOCOL_VERSION)).unwrap();
+        assert_eq!(fresh.player_id, 1);
+        assert_eq!(s.sim().player(1).unwrap().pos, Vec2::ZERO);
+        s.receive(IDLE_TICKS + 3, newcomer, &walk(fresh.token, 1));
+        let out = s.end_tick(IDLE_TICKS + 3);
+        assert_eq!(out.steps, vec![(1, MOVE_SPEED)], "net: {:?}", s.net_stats());
+    }
+
     #[test]
     fn garbage_from_a_player_is_on_their_record() {
         let (mut s, _, t2) = joined_pair();
@@ -458,7 +580,7 @@ mod tests {
     #[test]
     fn accepted_input_waits_for_end_tick() {
         let (mut s, t1, _) = joined_pair();
-        s.begin_tick();
+        s.begin_tick(1);
         s.receive(1, addr(1), &walk(t1, 1));
         assert_eq!(s.sim().player(1).unwrap().pos, Vec2::ZERO); // not yet
         let out = s.end_tick(1);
@@ -474,7 +596,7 @@ mod tests {
     #[test]
     fn shots_resolve_before_moves() {
         let (mut s, t1, t2) = joined_pair();
-        s.begin_tick();
+        s.begin_tick(1);
         s.receive(1, addr(2), &input(t2, 1, Vec2::new(0.0, 1.0), Vec2::new(-1.0, 0.0), false));
         s.receive(1, addr(1), &input(t1, 1, Vec2::ZERO, Vec2::new(1.0, 0.0), true));
         s.end_tick(1);
@@ -489,7 +611,7 @@ mod tests {
         let (mut s, t1, _) = joined_pair();
         let mut kills = Vec::new();
         for t in 1..=(MAX_HEALTH / SHOT_DAMAGE) as u32 {
-            s.begin_tick();
+            s.begin_tick(t);
             s.receive(t, addr(1), &input(t1, t, Vec2::ZERO, Vec2::new(1.0, 0.0), true));
             kills.extend(s.end_tick(t).kills);
         }
@@ -501,13 +623,14 @@ mod tests {
     fn begin_tick_respawns_before_the_snapshot() {
         let (mut s, t1, _) = joined_pair();
         for t in 1..=(MAX_HEALTH / SHOT_DAMAGE) as u32 {
-            s.begin_tick();
+            s.begin_tick(t);
             s.receive(t, addr(1), &input(t1, t, Vec2::ZERO, Vec2::new(1.0, 0.0), true));
             s.end_tick(t);
         }
         let mut snap = Vec::new();
-        for _ in 0..crate::sim::RESPAWN_TICKS {
-            snap = s.begin_tick();
+        let dead_at = (MAX_HEALTH / SHOT_DAMAGE) as u32;
+        for t in dead_at + 1..=dead_at + crate::sim::RESPAWN_TICKS {
+            snap = s.begin_tick(t);
         }
         let p2 = snap.iter().find(|p| p.id == 2).unwrap();
         assert!(p2.alive && p2.health == MAX_HEALTH && p2.pos == Vec2::new(10.0, 0.0));

@@ -18,6 +18,7 @@ pub mod honest;
 pub mod humanized;
 pub mod joinflood;
 pub mod nan;
+pub mod reflect;
 pub mod replay;
 pub mod speedhack;
 pub mod spoof;
@@ -39,7 +40,7 @@ pub trait Bot {
     /// The handshake sent once, before tick 1. Default is a legal join; a bot
     /// attacking the version guard overrides it.
     fn join(&self) -> ClientMsg {
-        ClientMsg::Join { name: self.name().into(), protocol: PROTOCOL_VERSION }
+        ClientMsg::Join { name: self.name().into(), protocol: PROTOCOL_VERSION, cookie: None }
     }
 
     /// Messages to send this tick. Most bots send 0 or 1; a flooder sends many.

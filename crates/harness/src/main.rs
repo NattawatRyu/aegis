@@ -51,6 +51,9 @@ fn main() -> std::io::Result<()> {
     }
     let net = r.net.dropped.iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(", ");
     println!("\nno player to pin it on (counters only): {}", if net.is_empty() { "-" } else { &net });
+    let t = r.bystander;
+    let amp = if t.tx == 0 { 0.0 } else { t.rx as f64 / t.tx as f64 };
+    println!("bystander (forged in its name): {} B sent as it, {} B sent to it, amplification {:.2}x", t.tx, t.rx, amp);
 
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scenarios/out");
     std::fs::create_dir_all(&dir)?;

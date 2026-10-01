@@ -48,11 +48,25 @@ pub struct NetServer {
     sock: UdpSocket,
     tick: u32,
     buf: Vec<u8>,
+    /// Replies sent, when a lockstep driver asked to see them.
+    reply_log: Option<Vec<(SocketAddr, ServerMsg)>>,
 }
 
 impl NetServer {
     pub fn bind(addr: impl ToSocketAddrs, server: Server) -> io::Result<Self> {
-        Ok(Self { server, sock: UdpSocket::bind(addr)?, tick: 0, buf: vec![0; MAX_DATAGRAM] })
+        Ok(Self { server, sock: UdpSocket::bind(addr)?, tick: 0, buf: vec![0; MAX_DATAGRAM], reply_log: None })
+    }
+
+    /// For a lockstep driver (the harness): record every reply sent, so it
+    /// knows which client sockets to read and what to expect there. Grows
+    /// until [`take_replies`](Self::take_replies) — not for a live server.
+    pub fn log_replies(&mut self) {
+        self.reply_log = Some(Vec::new());
+    }
+
+    /// The replies sent since the last call, in send order.
+    pub fn take_replies(&mut self) -> Vec<(SocketAddr, ServerMsg)> {
+        self.reply_log.as_mut().map(std::mem::take).unwrap_or_default()
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -99,9 +113,12 @@ impl NetServer {
             self.sock.set_read_timeout(Some(left.max(Duration::from_millis(1))))?;
             match self.sock.recv_from(&mut self.buf) {
                 Ok((n, from)) => {
-                    if let Some(s) = self.server.receive(self.tick, from, &self.buf[..n]) {
-                        let joined = encode(&ServerMsg::Joined { player_id: s.player_id, token: s.token, tick: self.tick });
-                        let _ = self.sock.send_to(&joined, from);
+                    if let Some(reply) = self.server.receive(self.tick, from, &self.buf[..n]) {
+                        let msg = reply.to_msg(self.tick);
+                        let _ = self.sock.send_to(&encode(&msg), from);
+                        if let Some(log) = &mut self.reply_log {
+                            log.push((from, msg));
+                        }
                     }
                     return Ok(true);
                 }
@@ -158,7 +175,26 @@ mod tests {
     }
 
     fn join() -> Vec<u8> {
-        frame(NO_TOKEN, &ClientMsg::Join { name: "t".into(), protocol: PROTOCOL_VERSION })
+        join_with(None)
+    }
+
+    fn join_with(cookie: Option<u64>) -> Vec<u8> {
+        frame(NO_TOKEN, &ClientMsg::Join { name: "t".into(), protocol: PROTOCOL_VERSION, cookie })
+    }
+
+    /// The client side of the handshake, over the wire: Join, read the
+    /// challenge, Join with its cookie. Returns what `joined` returns.
+    fn connect(n: &mut NetServer, c: &UdpSocket) -> ((u8, u32), u64) {
+        let to = n.local_addr().unwrap();
+        c.send_to(&join(), to).unwrap();
+        assert!(n.recv_one(WAIT).unwrap());
+        let cookie = match read(c) {
+            ServerMsg::Challenge { cookie } => cookie,
+            m => panic!("expected Challenge, got {m:?}"),
+        };
+        c.send_to(&join_with(Some(cookie)), to).unwrap();
+        assert!(n.recv_one(WAIT).unwrap());
+        joined(c)
     }
 
     fn input(token: u64, seq: u32) -> Vec<u8> {
@@ -183,9 +219,7 @@ mod tests {
     fn join_is_answered_and_snapshots_follow() {
         let mut n = net();
         let c = client();
-        c.send_to(&join(), n.local_addr().unwrap()).unwrap();
-        assert!(n.recv_one(WAIT).unwrap());
-        let (who, token) = joined(&c);
+        let (who, token) = connect(&mut n, &c);
         assert_eq!(who, (1, 0));
         assert_ne!(token, NO_TOKEN);
 
@@ -210,17 +244,13 @@ mod tests {
     #[test]
     fn a_vanished_client_does_not_stop_the_server() {
         let mut n = net();
-        let to = n.local_addr().unwrap();
         let gone = client();
-        gone.send_to(&join(), to).unwrap();
-        assert!(n.recv_one(WAIT).unwrap());
+        connect(&mut n, &gone);
         drop(gone);
         n.begin_tick().unwrap(); // snapshot into a closed port
 
         let c = client();
-        c.send_to(&join(), to).unwrap();
-        assert!(n.recv_one(WAIT).unwrap());
-        assert_eq!(joined(&c).0, (2, 1));
+        assert_eq!(connect(&mut n, &c).0, (2, 1));
     }
 
     #[test]
@@ -233,9 +263,7 @@ mod tests {
         assert_eq!(n.server().peers().count(), 0);
         #[cfg(windows)] // elsewhere it arrives truncated and fails decode instead
         assert_eq!(n.server().net_stats().get(OVERSIZE), 1);
-        c.send_to(&join(), to).unwrap();
-        assert!(n.recv_one(WAIT).unwrap());
-        assert_eq!(joined(&c).0, (1, 0));
+        assert_eq!(connect(&mut n, &c).0, (1, 0));
     }
 
     /// End to end: the token that makes an input count is the one that came
@@ -245,9 +273,7 @@ mod tests {
         let mut n = net();
         let to = n.local_addr().unwrap();
         let c = client();
-        c.send_to(&join(), to).unwrap();
-        assert!(n.recv_one(WAIT).unwrap());
-        let (_, token) = joined(&c);
+        let (_, token) = connect(&mut n, &c);
         c.send_to(&input(NO_TOKEN, 1), to).unwrap(); // forged-looking: no token
         c.send_to(&input(token, 1), to).unwrap(); // both queued when tick 1 opens
 

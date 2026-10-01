@@ -4,15 +4,17 @@
 //! per tick:
 //!
 //! ```text
-//! begin_tick  -> respawns, then the snapshot clients act on
+//! begin_tick  -> idle sessions end, respawns, then the snapshot clients act on
 //! receive     -> once per datagram:
 //!                address + token?  yes -> player budget -> decode -> pipeline
 //!                                  no  -> IP budget -> decode -> Join only
+//!                                         (no cookie -> Challenge; cookie -> admit)
 //! end_tick    -> shots against the pre-move world, then moves
 //! ```
 //!
 //! Identity is the source address **and** the session token issued to it. A
-//! player id is issued only when a legal Join arrives from a new address;
+//! player id is issued only when a legal Join from a new address brings back
+//! the cookie it was challenged with — proof it receives there;
 //! everything that is not authenticated is counted in [`NetStats`] and
 //! dropped, never written on a player's record — so a forger cannot frame its
 //! victim. Both transports run this same code, so an in-process run and a UDP
@@ -24,9 +26,10 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 
-use aegis_protocol::{split_frame, ClientMsg, PlayerId, PlayerState, Vec2, TICK_HZ};
+use aegis_protocol::{split_frame, ClientMsg, PlayerId, PlayerState, ServerMsg, Vec2, TICK_HZ};
 use aegis_telemetry::Telemetry;
 
+use crate::guards::cookie::CookieJar;
 use crate::guards::session::{self, Session};
 use crate::guards::source_rate::SourceRate;
 use crate::guards::{ip_sessions, joined, packet, version};
@@ -85,10 +88,31 @@ pub struct Server {
     /// The id issued last. The next goes to the first free id after it,
     /// wrapping — so a freed id is reused as late as possible.
     last_id: PlayerId,
+    /// Issues and checks join cookies (return routability).
+    cookies: CookieJar,
     /// Player `id` enters at `spawns[(id - 1) % len]`.
     spawns: Vec<Vec2>,
     /// Inputs accepted this tick, in arrival order, waiting for `end_tick`.
     pending: Vec<(PlayerId, ClientInput)>,
+}
+
+/// What [`Server::receive`] asks the transport to send back to the source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reply {
+    /// Send `ServerMsg::Challenge { cookie }`.
+    Challenge(u64),
+    /// Send `ServerMsg::Joined` with this session.
+    Joined(Session),
+}
+
+impl Reply {
+    /// The message on the wire, stamped with the current tick.
+    pub fn to_msg(self, tick: u32) -> ServerMsg {
+        match self {
+            Reply::Challenge(cookie) => ServerMsg::Challenge { cookie },
+            Reply::Joined(s) => ServerMsg::Joined { player_id: s.player_id, token: s.token, tick },
+        }
+    }
 }
 
 impl Server {
@@ -105,6 +129,7 @@ impl Server {
             sessions: BTreeMap::new(),
             last_seen: BTreeMap::new(),
             last_id: 0,
+            cookies: CookieJar::new(),
             spawns,
             pending: Vec::new(),
         }
@@ -137,11 +162,12 @@ impl Server {
     /// that passes every guard is queued for `end_tick`; everything else is
     /// recorded or counted, and dropped.
     ///
-    /// Returns the session when the datagram was a legal Join — a new player,
-    /// or a repeat from an admitted address — so the transport can answer
-    /// `ServerMsg::Joined` to `from` (a repeat means the last answer was
-    /// lost; the answer only ever goes to the admitted address itself).
-    pub fn receive(&mut self, tick: u32, from: SocketAddr, bytes: &[u8]) -> Option<Session> {
+    /// Returns what the transport must send back to `from`, if anything:
+    /// a [`Reply::Challenge`] for a Join without a valid cookie, or
+    /// [`Reply::Joined`] for one with — a new player, or a repeat from an
+    /// admitted address (its last answer was lost; it only ever goes to the
+    /// admitted address itself). Neither is larger than the Join that asked.
+    pub fn receive(&mut self, tick: u32, from: SocketAddr, bytes: &[u8]) -> Option<Reply> {
         let framed = split_frame(bytes);
         let known = joined::check_source(&self.sessions, from);
 
@@ -154,7 +180,7 @@ impl Server {
                     self.net.drop(r.label());
                     return None;
                 }
-                return self.receive_from(tick, s, body);
+                return self.receive_from(tick, s, body).map(Reply::Joined);
             }
         }
 
@@ -171,10 +197,15 @@ impl Server {
             }
         };
         let refused = match (msg, known) {
-            (ClientMsg::Join { protocol, .. }, known) => match (version::check_join(protocol), known) {
-                (Err(r), _) => r,
-                (Ok(()), Ok(s)) => return Some(s), // lost Joined: answer again
-                (Ok(()), Err(_)) => return self.admit(tick, from),
+            (ClientMsg::Join { protocol, cookie, .. }, known) => match (version::check_join(protocol), known, cookie) {
+                (Err(r), _, _) => r,
+                (Ok(()), Ok(s), _) => return Some(Reply::Joined(s)), // lost Joined: answer again
+                // Unproven address: a cookie to bring back, and nothing else.
+                (Ok(()), Err(_), None) => return Some(Reply::Challenge(self.cookies.issue(from, tick))),
+                (Ok(()), Err(_), Some(c)) => match self.cookies.verify(from, tick, c) {
+                    Ok(()) => return self.admit(tick, from).map(Reply::Joined),
+                    Err(r) => r,
+                },
             },
             (ClientMsg::Input { .. }, Ok(_)) => RejectReason::BadToken,
             (ClientMsg::Input { .. }, Err(not_joined)) => not_joined,
@@ -183,7 +214,8 @@ impl Server {
         None
     }
 
-    /// A legal Join from an address with no session: create the player.
+    /// A legal Join with a valid cookie from an address with no session:
+    /// create the player.
     fn admit(&mut self, tick: u32, from: SocketAddr) -> Option<Session> {
         if let Err(r) = ip_sessions::check_join(&self.sessions, from.ip()) {
             self.net.drop(r.label());
@@ -319,7 +351,23 @@ mod tests {
     }
 
     fn join(protocol: u16) -> Vec<u8> {
-        frame(NO_TOKEN, &ClientMsg::Join { name: "t".into(), protocol })
+        join_with(protocol, None)
+    }
+
+    fn join_with(protocol: u16, cookie: Option<u64>) -> Vec<u8> {
+        frame(NO_TOKEN, &ClientMsg::Join { name: "t".into(), protocol, cookie })
+    }
+
+    /// The full handshake a real client does: Join, and if challenged, Join
+    /// again with the cookie. The session, if admitted.
+    fn hs(s: &mut Server, tick: u32, from: SocketAddr) -> Option<Session> {
+        match s.receive(tick, from, &join(PROTOCOL_VERSION))? {
+            Reply::Joined(x) => Some(x),
+            Reply::Challenge(c) => match s.receive(tick, from, &join_with(PROTOCOL_VERSION, Some(c)))? {
+                Reply::Joined(x) => Some(x),
+                Reply::Challenge(_) => panic!("challenged twice"),
+            },
+        }
     }
 
     fn input(token: u64, seq: u32, move_dir: Vec2, aim: Vec2, shoot: bool) -> Vec<u8> {
@@ -335,7 +383,7 @@ mod tests {
     }
 
     fn admit(s: &mut Server, from: SocketAddr) -> u64 {
-        s.receive(0, from, &join(PROTOCOL_VERSION)).expect("legal join refused").token
+        hs(s, 0, from).expect("legal join refused").token
     }
 
     /// Player 1 at the origin, player 2 at (10, 0), and their tokens.
@@ -349,9 +397,9 @@ mod tests {
     #[test]
     fn legal_join_spawns_once_and_is_not_recorded() {
         let mut s = server();
-        let first = s.receive(0, addr(1), &join(PROTOCOL_VERSION)).unwrap();
+        let first = hs(&mut s, 0, addr(1)).unwrap();
         // a repeat is answered again, same session (the reply may have been lost)
-        assert_eq!(s.receive(0, addr(1), &join(PROTOCOL_VERSION)), Some(first));
+        assert_eq!(hs(&mut s, 0, addr(1)), Some(first));
         assert_eq!(first.player_id, 1);
         assert_eq!(s.sim().snapshot().len(), 1);
         assert!(s.telemetry().is_empty());
@@ -367,13 +415,52 @@ mod tests {
     #[test]
     fn ids_follow_legal_join_order_and_spawns_wrap() {
         let mut s = server();
-        let id = |s: &mut Server, n, v| s.receive(0, addr(n), &join(v)).map(|x| x.player_id);
-        assert_eq!(id(&mut s, 1, PROTOCOL_VERSION), Some(1));
-        assert_eq!(id(&mut s, 2, PROTOCOL_VERSION + 1), None); // refused: no id spent
-        assert_eq!(id(&mut s, 3, PROTOCOL_VERSION), Some(2));
-        assert_eq!(id(&mut s, 4, PROTOCOL_VERSION), Some(3));
+        let id = |s: &mut Server, n| hs(s, 0, addr(n)).map(|x| x.player_id);
+        assert_eq!(id(&mut s, 1), Some(1));
+        assert_eq!(s.receive(0, addr(2), &join(PROTOCOL_VERSION + 1)), None); // refused: no id spent
+        assert_eq!(id(&mut s, 3), Some(2));
+        assert_eq!(id(&mut s, 4), Some(3));
         assert_eq!(s.sim().player(2).unwrap().pos, Vec2::new(10.0, 0.0));
         assert_eq!(s.sim().player(3).unwrap().pos, Vec2::ZERO);
+    }
+
+    /// Return routability: a first Join gets a challenge and nothing else —
+    /// no id, no spawn, no snapshot target. Only the cookie, brought back
+    /// from the same address, admits.
+    #[test]
+    fn first_join_is_only_challenged() {
+        let mut s = server();
+        let Some(Reply::Challenge(c)) = s.receive(0, addr(1), &join(PROTOCOL_VERSION)) else { panic!("not challenged") };
+        assert_eq!(s.peers().count(), 0);
+        assert!(s.sim().snapshot().is_empty());
+        // the cookie from another address, or a wrong one, admits nobody
+        assert_eq!(s.receive(0, addr(2), &join_with(PROTOCOL_VERSION, Some(c))), None);
+        assert_eq!(s.receive(0, addr(1), &join_with(PROTOCOL_VERSION, Some(c ^ 1))), None);
+        assert_eq!(s.net_stats().get("bad_cookie"), 2);
+        assert_eq!(s.peers().count(), 0);
+        let Some(Reply::Joined(x)) = s.receive(0, addr(1), &join_with(PROTOCOL_VERSION, Some(c))) else { panic!("not admitted") };
+        assert_eq!(x.player_id, 1);
+    }
+
+    /// The cookie's edge, through the server: issued at tick 0 it still
+    /// admits at the last tick of the next bucket, not one tick later.
+    #[test]
+    fn a_stale_cookie_is_refused() {
+        use crate::guards::cookie::BUCKET_TICKS;
+        let mut s = server();
+        let Some(Reply::Challenge(c)) = s.receive(0, addr(1), &join(PROTOCOL_VERSION)) else { panic!() };
+        assert_eq!(s.receive(2 * BUCKET_TICKS, addr(1), &join_with(PROTOCOL_VERSION, Some(c))), None);
+        assert_eq!(s.net_stats().get("bad_cookie"), 1);
+        assert!(matches!(s.receive(2 * BUCKET_TICKS - 1, addr(1), &join_with(PROTOCOL_VERSION, Some(c))), Some(Reply::Joined(_))));
+    }
+
+    /// A Join with a cookie but the wrong version is a version refusal — the
+    /// cookie is never even looked at.
+    #[test]
+    fn version_is_checked_before_the_cookie() {
+        let mut s = server();
+        assert_eq!(s.receive(0, addr(1), &join_with(PROTOCOL_VERSION + 1, Some(123))), None);
+        assert_eq!((s.net_stats().get("bad_version"), s.net_stats().get("bad_cookie")), (1, 0));
     }
 
     #[test]
@@ -443,8 +530,8 @@ mod tests {
     #[test]
     fn rejoin_returns_the_same_session_only_to_its_address() {
         let (mut s, t1, _) = joined_pair();
-        assert_eq!(s.receive(0, addr(1), &join(PROTOCOL_VERSION)), Some(Session { player_id: 1, token: t1 }));
-        let other = s.receive(0, addr(9), &join(PROTOCOL_VERSION)).unwrap();
+        assert_eq!(hs(&mut s, 0, addr(1)), Some(Session { player_id: 1, token: t1 }));
+        let other = hs(&mut s, 0, addr(9)).unwrap();
         assert_ne!(other.token, t1);
         assert_eq!(other.player_id, 3);
     }
@@ -485,15 +572,16 @@ mod tests {
         use crate::guards::ip_sessions::MAX_PER_IP;
         let mut s = server();
         let port = |p: u16| SocketAddr::from(([10, 0, 0, 1], 5000 + p));
+        // One join per tick: a handshake is two datagrams against the IP budget.
         for p in 0..MAX_PER_IP as u16 {
-            assert!(s.receive(0, port(p), &join(PROTOCOL_VERSION)).is_some(), "port {p}");
+            assert!(hs(&mut s, p as u32, port(p)).is_some(), "port {p}");
         }
-        assert_eq!(s.receive(0, port(99), &join(PROTOCOL_VERSION)), None);
+        assert_eq!(hs(&mut s, 10, port(99)), None);
         assert_eq!(s.net_stats().get("ip_sessions"), 1);
-        assert!(s.receive(0, addr(2), &join(PROTOCOL_VERSION)).is_some());
+        assert!(hs(&mut s, 10, addr(2)).is_some());
 
-        s.begin_tick(IDLE_TICKS + 1); // all idle since tick 0
-        assert!(s.receive(IDLE_TICKS + 1, port(99), &join(PROTOCOL_VERSION)).is_some());
+        s.begin_tick(IDLE_TICKS + 1); // port 0 idle since tick 0: its slot frees
+        assert!(hs(&mut s, IDLE_TICKS + 1, port(99)).is_some());
     }
 
     /// Ids are handed out round-robin, so a freed id is the last one reused.
@@ -502,7 +590,7 @@ mod tests {
         let mut s = server();
         admit(&mut s, addr(1));
         s.begin_tick(IDLE_TICKS + 1); // id 1 ends
-        let ids: Vec<_> = (2..=3).map(|n| s.receive(IDLE_TICKS + 1, addr(n), &join(PROTOCOL_VERSION)).unwrap().player_id).collect();
+        let ids: Vec<_> = (2..=3).map(|n| hs(&mut s, IDLE_TICKS + 1, addr(n)).unwrap().player_id).collect();
         assert_eq!(ids, vec![2, 3]);
     }
 
@@ -516,11 +604,11 @@ mod tests {
         s.receive(1, SocketAddr::from(([10, 2, 0, 1], 4000)), &walk(old, 500));
         for n in 2..=255u8 {
             let from = SocketAddr::from(([10, 3, 0, n], 4000));
-            assert_eq!(s.receive(100, from, &join(PROTOCOL_VERSION)).map(|x| x.player_id), Some(n));
+            assert_eq!(hs(&mut s, 100, from).map(|x| x.player_id), Some(n));
         }
         s.begin_tick(IDLE_TICKS + 2); // only id 1 is idle long enough
         let newcomer = SocketAddr::from(([10, 4, 0, 1], 4000));
-        let fresh = s.receive(IDLE_TICKS + 2, newcomer, &join(PROTOCOL_VERSION)).unwrap();
+        let fresh = hs(&mut s, IDLE_TICKS + 2, newcomer).unwrap();
         assert_eq!(fresh.player_id, 1);
         assert_eq!(s.sim().player(1).unwrap().pos, Vec2::ZERO);
         s.receive(IDLE_TICKS + 3, newcomer, &walk(fresh.token, 1));
@@ -569,7 +657,7 @@ mod tests {
         let mut ids = Vec::new();
         for n in 0..256u32 {
             let from = SocketAddr::from(([10, 1, (n >> 8) as u8, n as u8], 4000));
-            ids.push(s.receive(0, from, &join(PROTOCOL_VERSION)).map(|x| x.player_id));
+            ids.push(hs(&mut s, 0, from).map(|x| x.player_id));
         }
         assert_eq!(ids[254], Some(255));
         assert_eq!(ids[255], None);

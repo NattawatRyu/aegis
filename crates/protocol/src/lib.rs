@@ -15,7 +15,9 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the wire format changes. Clients on a different version
 /// must be rejected at `Join` (handled by the server crate).
 /// v1: session token header on every client datagram.
-pub const PROTOCOL_VERSION: u16 = 1;
+/// v2: two-step join — a cookie challenge proves the client receives at its
+///     source address before the server admits it.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Bytes of session token in front of every client datagram.
 pub const TOKEN_LEN: usize = 8;
@@ -76,6 +78,9 @@ pub enum ClientMsg {
         /// Client's protocol version. The server's G1 version guard rejects a
         /// join whose value differs from `PROTOCOL_VERSION`.
         protocol: u16,
+        /// `None` on the first try; the server answers with a
+        /// [`ServerMsg::Challenge`], whose cookie the client sends back here.
+        cookie: Option<u64>,
     },
     /// `seq`: client's monotonic counter, used for dup/replay detection.
     /// `tick`: the tick the client believes it is acting on (lag context).
@@ -103,6 +108,12 @@ pub enum ServerMsg {
     Snapshot {
         tick: u32,
         players: Vec<PlayerState>,
+    },
+    /// Answer to a Join without a valid cookie: send the Join again with this
+    /// cookie. Proves the client receives at its source address. Never larger
+    /// than the smallest Join, so it cannot amplify.
+    Challenge {
+        cookie: u64,
     },
     Event {
         tick: u32,
@@ -160,11 +171,25 @@ mod tests {
 
     #[test]
     fn frame_roundtrip() {
-        let m = ClientMsg::Join { name: "riw".into(), protocol: PROTOCOL_VERSION };
+        let m = ClientMsg::Join { name: "riw".into(), protocol: PROTOCOL_VERSION, cookie: None };
         let bytes = frame(0xDEAD_BEEF_0000_0001, &m);
         let (token, body) = split_frame(&bytes).unwrap();
         assert_eq!(token, 0xDEAD_BEEF_0000_0001);
         assert_eq!(decode::<ClientMsg>(body).unwrap(), m);
+    }
+
+    /// No amplification by construction: the challenge (the only thing an
+    /// unproven address ever gets) is no larger than the smallest possible
+    /// Join — empty name, no cookie — that could have triggered it.
+    #[test]
+    fn challenge_is_never_larger_than_a_join() {
+        let smallest_join = frame(NO_TOKEN, &ClientMsg::Join { name: String::new(), protocol: 0, cookie: None });
+        let challenge = encode(&ServerMsg::Challenge { cookie: u64::MAX });
+        assert!(challenge.len() <= smallest_join.len(), "{} > {}", challenge.len(), smallest_join.len());
+        // A forged re-Join in an admitted player's name is answered with
+        // Joined, to that player — also no larger.
+        let joined = encode(&ServerMsg::Joined { player_id: 255, token: u64::MAX, tick: u32::MAX });
+        assert!(joined.len() <= smallest_join.len(), "{} > {}", joined.len(), smallest_join.len());
     }
 
     /// The edge: exactly a token and nothing else splits (into an empty body
@@ -178,7 +203,7 @@ mod tests {
 
     #[test]
     fn clientmsg_join_roundtrip() {
-        let m = ClientMsg::Join { name: "riw".into(), protocol: PROTOCOL_VERSION };
+        let m = ClientMsg::Join { name: "riw".into(), protocol: PROTOCOL_VERSION, cookie: None };
         let back: ClientMsg = decode(&encode(&m)).unwrap();
         assert_eq!(m, back);
     }

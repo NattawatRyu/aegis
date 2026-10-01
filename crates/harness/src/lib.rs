@@ -17,19 +17,21 @@
 //! All server behaviour lives in [`aegis_server`]; this crate only drives bots
 //! against it and keeps the lab's measurements (kills, largest step).
 
+use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::Duration;
 
 use aegis_client_sdk::{
     aimbot::AimbotBot, badversion::BadVersionBot, flood::FloodBot, garbage::GarbageBot,
-    honest::HonestBot, humanized::HumanizedAimbot, joinflood::JoinFloodBot, nan::NanBot, replay::ReplayBot,
+    honest::HonestBot, humanized::HumanizedAimbot, joinflood::JoinFloodBot, nan::NanBot,
+    reflect::{ReflectBot, BYSTANDER}, replay::ReplayBot,
     speedhack::SpeedhackBot, spoof::SpoofBot, Bot, BotCtx,
 };
 use aegis_detector::{Flag, Suite};
-use aegis_protocol::{decode, frame, PlayerId, PlayerState, ServerMsg, Vec2, NO_TOKEN};
+use aegis_protocol::{decode, encode, frame, split_frame, ClientMsg, PlayerId, PlayerState, ServerMsg, Vec2, NO_TOKEN};
 use aegis_server::net::MAX_DATAGRAM;
-use aegis_server::{NetServer, NetStats, Server, Session, TickOutcome};
+use aegis_server::{NetServer, NetStats, Reply, Server, Session, TickOutcome};
 use aegis_telemetry::{Telemetry, Totals};
 
 /// Bots spawn evenly on a circle this far from the center — inside every
@@ -65,21 +67,28 @@ impl Scenario {
                 Box::new(HumanizedAimbot::new()),
                 Box::new(SpoofBot::new()),
                 Box::new(JoinFloodBot::new()),
+                Box::new(ReflectBot::new()),
             ],
         }
     }
 
     /// For each bot, the slot whose address its per-tick datagrams leave
-    /// from: its own, or its victim's if it forges one.
+    /// from: its own, or its victim's if it forges one. The bystander — an
+    /// address nobody plays from — is the slot one past the last bot.
     fn routes(&self) -> Vec<usize> {
         self.bots
             .iter()
             .enumerate()
             .map(|(i, b)| match b.impersonates() {
                 None => i,
+                Some(BYSTANDER) => self.bystander(),
                 Some(v) => self.bots.iter().position(|o| o.name() == v).unwrap_or_else(|| panic!("no victim named {v}")),
             })
             .collect()
+    }
+
+    fn bystander(&self) -> usize {
+        self.bots.len()
     }
 
     /// A lobby of `LOBBY_SIZE` honest players, each with its own aim seed
@@ -126,6 +135,15 @@ pub struct Report {
     /// Datagrams dropped with no player to pin them on (source-rate drops,
     /// anything from an address that never joined).
     pub net: NetStats,
+    /// Bytes sent in the bystander's name (forged), and bytes the server sent
+    /// to the bystander. rx / tx is the server's amplification factor.
+    pub bystander: Traffic,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Traffic {
+    pub tx: u64,
+    pub rx: u64,
 }
 
 impl BotReport {
@@ -178,11 +196,12 @@ struct Lab {
     sessions: Vec<Option<Session>>,
     kills: Vec<u32>,
     max_step: Vec<f32>,
+    bystander: Traffic,
 }
 
 impl Lab {
     fn new(n: usize) -> Self {
-        Self { sessions: vec![None; n], kills: vec![0; n], max_step: vec![0.0; n] }
+        Self { sessions: vec![None; n], kills: vec![0; n], max_step: vec![0.0; n], bystander: Traffic::default() }
     }
 
     fn id(&self, i: usize) -> Option<PlayerId> {
@@ -233,7 +252,7 @@ impl Lab {
                 }
             })
             .collect();
-        Report { scenario: sc.name, ticks: sc.ticks, bots, telemetry: tel, net }
+        Report { scenario: sc.name, ticks: sc.ticks, bots, telemetry: tel, net, bystander: self.bystander }
     }
 }
 
@@ -241,32 +260,53 @@ impl Lab {
 /// address. Deterministic.
 pub fn run(mut sc: Scenario) -> Report {
     let n = sc.bots.len();
-    // Bot slot `i`, source port index `k`.
-    let addr = |i: usize, k: u16| SocketAddr::from((bot_ip(i), 40000 + k));
     let route = sc.routes();
     let mut server = Server::new(spawns(n));
     let mut lab = Lab::new(n);
 
     // Tick 0: the handshake, over the wire like everything else.
+    let mut retry = Vec::new();
     for (i, bot) in sc.bots.iter().enumerate() {
-        lab.sessions[i] = server.receive(0, addr(i, 0), &frame(NO_TOKEN, &bot.join()));
+        let d = frame(NO_TOKEN, &bot.join());
+        match server.receive(0, mem_addr(i, 0), &d) {
+            Some(Reply::Joined(s)) => lab.sessions[i] = Some(s),
+            Some(Reply::Challenge(c)) => retry.extend(with_cookie(&d, c).map(|r| (i, 0, r))),
+            None => {}
+        }
     }
+    answer_challenges(&mut server, &mut lab, 0, retry);
 
+    let bystander = mem_addr(sc.bystander(), 0);
     for tick in 1..=sc.ticks {
         let snapshot = server.begin_tick(tick);
+        if server.player_id(bystander).is_some() {
+            lab.bystander.rx += encode(&ServerMsg::Snapshot { tick, players: snapshot.clone() }).len() as u64;
+        }
+        let mut retry = Vec::new();
         for (i, bot) in sc.bots.iter_mut().enumerate() {
             // The server sends snapshots to admitted addresses only.
-            let seen: &[PlayerState] = if server.player_id(addr(i, 0)).is_some() { &snapshot } else { &[] };
+            let seen: &[PlayerState] = if server.player_id(mem_addr(i, 0)).is_some() { &snapshot } else { &[] };
             for (k, d) in bot.routed(&lab.ctx(i, tick, seen)) {
-                // A Joined answer goes to the address the datagram came from;
-                // only port 0's is read back (the UDP run reads only that one).
-                if let Some(s) = server.receive(tick, addr(route[i], k), &d) {
-                    if k == 0 {
-                        lab.sessions[route[i]] = Some(s);
-                    }
+                // A reply goes to the address the datagram came from. Only
+                // port 0's Joined is read back (the UDP run reads only that
+                // one), and only a bot's own address gets to answer a
+                // challenge — a forger never receives it.
+                let from = mem_addr(route[i], k);
+                if from == bystander {
+                    lab.bystander.tx += d.len() as u64;
+                }
+                let reply = server.receive(tick, from, &d);
+                if let (Some(r), true) = (reply, from == bystander) {
+                    lab.bystander.rx += encode(&r.to_msg(tick)).len() as u64;
+                }
+                match reply {
+                    Some(Reply::Joined(s)) if k == 0 && route[i] < n => lab.sessions[route[i]] = Some(s),
+                    Some(Reply::Challenge(c)) if route[i] == i => retry.extend(with_cookie(&d, c).map(|r| (i, k, r))),
+                    _ => {}
                 }
             }
         }
+        answer_challenges(&mut server, &mut lab, tick, retry);
         lab.measure(server.end_tick(tick));
     }
 
@@ -283,7 +323,7 @@ pub fn run_udp(mut sc: Scenario) -> io::Result<Report> {
     let mut net = NetServer::bind((Ipv4Addr::LOCALHOST, 0), Server::new(spawns(n)))?;
     let to = net.local_addr()?;
     // socks[i][k]: bot slot i, source port index k, all on the bot's IP.
-    let socks = sc
+    let mut socks = sc
         .bots
         .iter()
         .enumerate()
@@ -299,15 +339,34 @@ pub fn run_udp(mut sc: Scenario) -> io::Result<Report> {
         .collect::<io::Result<Vec<_>>>()?;
     let route = sc.routes();
     let mut lab = Lab::new(n);
-
-    for (i, bot) in sc.bots.iter().enumerate() {
-        socks[i][0].send_to(&frame(NO_TOKEN, &bot.join()), to)?;
+    // Which bot socket an address belongs to: where a reply to it lands.
+    let mut owner = HashMap::new();
+    for (i, ports) in socks.iter().enumerate() {
+        for (k, s) in ports.iter().enumerate() {
+            owner.insert(s.local_addr()?, (i, k as u16));
+        }
     }
-    pump(&mut net, n)?;
+    // The bystander: one more slot, after the map, so nothing it is sent is
+    // ever read as a bot's or answered. It only counts bytes.
+    let bystander = UdpSocket::bind((bot_ip(sc.bystander()), 0))?;
+    bystander.set_nonblocking(true)?;
+    socks.push(vec![bystander]);
+    net.log_replies();
+
+    // Tick 0: the handshake. Each sent datagram is (bot, slot, port, bytes).
+    let mut sent = Vec::new();
+    for (i, bot) in sc.bots.iter().enumerate() {
+        let d = frame(NO_TOKEN, &bot.join());
+        socks[i][0].send_to(&d, to)?;
+        sent.push((i, i, 0, d));
+    }
+    pump(&mut net, sent.len())?;
+    let retry = udp_challenges(&mut net, &socks, &owner, &sent)?;
+    answer_udp(&mut net, &socks, to, retry)?;
 
     for tick in 1..=sc.ticks {
         net.begin_tick()?;
-        let mut sent = 0;
+        let mut sent = Vec::new();
         for (i, bot) in sc.bots.iter_mut().enumerate() {
             // The server's word on who is admitted decides only whether to
             // wait for a snapshot; what is in it is read off the socket.
@@ -316,16 +375,54 @@ pub fn run_udp(mut sc: Scenario) -> io::Result<Report> {
                 None => Vec::new(),
             };
             for (k, d) in bot.routed(&lab.ctx(i, tick, &snapshot)) {
+                if route[i] == n {
+                    lab.bystander.tx += d.len() as u64;
+                }
                 socks[route[i]][k as usize].send_to(&d, to)?;
-                sent += 1;
+                sent.push((i, route[i], k, d));
             }
         }
-        pump(&mut net, sent)?;
+        pump(&mut net, sent.len())?;
+        let retry = udp_challenges(&mut net, &socks, &owner, &sent)?;
+        answer_udp(&mut net, &socks, to, retry)?;
+        drain_extra_ports(&socks)?;
+        lab.bystander.rx += drain_bytes(&socks[n][0], Duration::ZERO)?;
         lab.measure(net.end_tick());
     }
+    lab.bystander.rx += drain_bytes(&socks[n][0], Duration::from_millis(100))?;
 
     let (tel, stats) = net.into_server().into_parts();
     Ok(lab.report(&sc, tel, stats))
+}
+
+/// In-process address of bot slot `i`, source port index `k`.
+fn mem_addr(i: usize, k: u16) -> SocketAddr {
+    SocketAddr::from((bot_ip(i), 40000 + k))
+}
+
+/// The second phase of an in-process tick: after every bot has sent, each
+/// challenge a bot received at its own address is answered, in the order
+/// the challenges went out (the UDP run answers in the same order).
+fn answer_challenges(server: &mut Server, lab: &mut Lab, tick: u32, retry: Vec<(usize, u16, Vec<u8>)>) {
+    for (i, k, d) in retry {
+        if let Some(Reply::Joined(s)) = server.receive(tick, mem_addr(i, k), &d) {
+            if k == 0 {
+                lab.sessions[i] = Some(s);
+            }
+        }
+    }
+}
+
+/// What a client does when challenged: the same Join, sent again with the
+/// cookie. `None` if `datagram` is not a cookieless Join.
+fn with_cookie(datagram: &[u8], cookie: u64) -> Option<Vec<u8>> {
+    let (_, body) = split_frame(datagram)?;
+    match decode::<ClientMsg>(body).ok()? {
+        ClientMsg::Join { name, protocol, cookie: None } => {
+            Some(frame(NO_TOKEN, &ClientMsg::Join { name, protocol, cookie: Some(cookie) }))
+        }
+        _ => None,
+    }
 }
 
 /// Feed the server exactly `expected` datagrams, or fail.
@@ -337,6 +434,90 @@ fn pump(net: &mut NetServer, expected: usize) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The UDP side of a tick's second phase, step one: every challenge the
+/// server sent, in send order, read off the socket it went to — and kept for
+/// an answer only if that socket's own bot sent the cookieless Join (a
+/// forger's victim would not answer a challenge it never asked for). Same
+/// rule and order as the in-process run.
+#[allow(clippy::type_complexity)]
+fn udp_challenges(
+    net: &mut NetServer,
+    socks: &[Vec<UdpSocket>],
+    owner: &HashMap<SocketAddr, (usize, u16)>,
+    sent: &[(usize, usize, u16, Vec<u8>)],
+) -> io::Result<Vec<(usize, u16, Vec<u8>)>> {
+    let mut retry = Vec::new();
+    for (dest, msg) in net.take_replies() {
+        let ServerMsg::Challenge { cookie } = msg else { continue };
+        let Some(&(slot, k)) = owner.get(&dest) else { continue };
+        wait_for(&socks[slot][k as usize], &msg)?;
+        let asked = sent.iter().find(|(i, s, p, _)| *i == slot && *s == slot && *p == k);
+        if let Some(d) = asked.and_then(|(_, _, _, d)| with_cookie(d, cookie)) {
+            retry.push((slot, k, d));
+        }
+    }
+    Ok(retry)
+}
+
+/// Step two: send the answers and let the server read them. The Joined
+/// replies are left on the sockets (port 0's is read with the next snapshot).
+fn answer_udp(net: &mut NetServer, socks: &[Vec<UdpSocket>], to: SocketAddr, retry: Vec<(usize, u16, Vec<u8>)>) -> io::Result<()> {
+    for (i, k, d) in &retry {
+        socks[*i][*k as usize].send_to(d, to)?;
+    }
+    pump(net, retry.len())?;
+    net.take_replies();
+    Ok(())
+}
+
+/// Read from `sock` until `want` arrives, skipping whatever was queued
+/// before it (snapshots and Joined replies nobody reads on that port).
+fn wait_for(sock: &UdpSocket, want: &ServerMsg) -> io::Result<()> {
+    let mut buf = [0u8; MAX_DATAGRAM];
+    loop {
+        let n = sock.recv(&mut buf)?;
+        if decode::<ServerMsg>(&buf[..n]).ok().as_ref() == Some(want) {
+            return Ok(());
+        }
+    }
+}
+
+/// Empty every extra source port (index >= 1). Nobody reads the snapshots
+/// sent to them; left alone they fill the socket buffer and the next
+/// challenge to that port would be dropped on arrival.
+fn drain_extra_ports(socks: &[Vec<UdpSocket>]) -> io::Result<()> {
+    let mut buf = [0u8; MAX_DATAGRAM];
+    for s in socks.iter().flat_map(|ports| ports.iter().skip(1)) {
+        s.set_nonblocking(true)?;
+        loop {
+            match s.recv(&mut buf) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
+                Err(e) => return Err(e),
+            }
+        }
+        s.set_nonblocking(false)?;
+    }
+    Ok(())
+}
+
+/// Bytes waiting on a non-blocking socket, read and counted (after `settle`,
+/// for anything still in flight).
+fn drain_bytes(sock: &UdpSocket, settle: Duration) -> io::Result<u64> {
+    std::thread::sleep(settle);
+    let mut buf = [0u8; MAX_DATAGRAM];
+    let mut total = 0;
+    loop {
+        match sock.recv(&mut buf) {
+            Ok(n) => total += n as u64,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(total),
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Read this tick's snapshot, taking any `Joined` that arrives first.
@@ -460,6 +641,19 @@ mod tests {
         let r = standard();
         assert_eq!(r.net.get("server_full"), 0, "net: {:?}", r.net);
         assert!(r.net.get("ip_sessions") > 0, "the cap never fired: {:?}", r.net);
+    }
+
+    /// Forged Joins in a bystander's name must not turn the server into an
+    /// amplifier: an unproven address may get a challenge, never more bytes
+    /// than were sent in its name — and is never admitted. The guessed
+    /// cookie is refused every tick.
+    #[test]
+    fn reflect_cannot_use_the_server_as_an_amplifier() {
+        let r = standard();
+        let t = r.bystander;
+        assert!(t.tx > 0);
+        assert!(t.rx <= t.tx, "amplification {:.1}x: {t:?}", t.rx as f64 / t.tx as f64);
+        assert_eq!(r.net.get("bad_cookie"), u64::from(r.ticks));
     }
 
     /// No legal join, no id: badversion leaves no per-player record at all,
@@ -596,6 +790,18 @@ mod tests {
     }
 
     #[test]
+    fn with_cookie_answers_only_a_cookieless_join() {
+        let join = |cookie| ClientMsg::Join { name: "x".into(), protocol: aegis_protocol::PROTOCOL_VERSION, cookie };
+        let retry = with_cookie(&frame(NO_TOKEN, &join(None)), 42).unwrap();
+        let (token, body) = split_frame(&retry).unwrap();
+        assert_eq!((token, decode::<ClientMsg>(body).unwrap()), (NO_TOKEN, join(Some(42))));
+        assert_eq!(with_cookie(&frame(NO_TOKEN, &join(Some(7))), 42), None); // already has one
+        let input = ClientMsg::Input { seq: 1, tick: 1, move_dir: Vec2::ZERO, aim: Vec2::ZERO, shoot: false };
+        assert_eq!(with_cookie(&frame(9, &input), 42), None);
+        assert_eq!(with_cookie(&[1, 2, 3], 42), None); // not even a frame
+    }
+
+    #[test]
     fn same_scenario_same_bytes() {
         let (a, b) = (jsonl(&standard().telemetry), jsonl(&standard().telemetry));
         assert!(!a.is_empty());
@@ -615,6 +821,7 @@ mod tests {
             panic!("telemetry differs at line {}:\n  udp:        {u}\n  in-process: {m}", line + 1);
         }
         assert_eq!(udp.net, mem.net);
+        assert_eq!(udp.bystander, mem.bystander);
         for (u, m) in udp.bots.iter().zip(&mem.bots) {
             assert_eq!((u.name, u.id, u.kills, u.max_step), (m.name, m.id, m.kills, m.max_step));
         }

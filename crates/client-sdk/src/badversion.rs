@@ -35,7 +35,7 @@ impl Bot for BadVersionBot {
     }
 
     fn join(&self) -> ClientMsg {
-        ClientMsg::Join { name: "badver".into(), protocol: self.bad }
+        ClientMsg::Join { name: "badver".into(), protocol: self.bad, cookie: None }
     }
 
     fn act(&mut self, ctx: &BotCtx) -> Vec<ClientMsg> {

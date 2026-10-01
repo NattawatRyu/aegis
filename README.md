@@ -9,7 +9,8 @@ not by chasing individual cheats.
 > real UDP; every client datagram carries a session token checked before
 > decode, so a forged source address can neither act as a player nor spend
 > its rate budget. Sessions are capped per IP and end after 5 s idle, so one
-> machine cannot fill the server. No encryption: an on-path attacker can
+> machine cannot fill the server. Joining takes a cookie round trip, so a
+> forged Join cannot point the server's traffic at a bystander. No encryption: an on-path attacker can
 > still read tokens.
 > Nothing here is production-ready.
 

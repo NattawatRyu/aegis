@@ -19,7 +19,7 @@ mod tests {
 
     #[test]
     fn valid_bytes_decode() {
-        let bytes = encode(&ClientMsg::Join { name: "riw".into(), protocol: PROTOCOL_VERSION });
+        let bytes = encode(&ClientMsg::Join { name: "riw".into(), protocol: PROTOCOL_VERSION, cookie: None });
         assert!(decode_client(&bytes).is_ok());
     }
 

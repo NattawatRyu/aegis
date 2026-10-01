@@ -10,3 +10,4 @@ description = "Aegis authoritative game server: the sim owns the truth; guards r
 aegis-protocol = { path = "../protocol" }
 aegis-telemetry = { path = "../telemetry" }
 getrandom = "0.3"
+siphasher = "1"

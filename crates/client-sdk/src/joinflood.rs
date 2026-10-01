@@ -17,8 +17,10 @@ use aegis_protocol::{frame, ClientMsg, NO_TOKEN, PROTOCOL_VERSION};
 /// Enough to take every one of the 255 player ids.
 pub const SOURCES: u16 = 255;
 
-/// Joins per tick — the per-IP datagram budget, no more.
-pub const JOINS_PER_TICK: u16 = 8;
+/// Joins per tick. Each costs two datagrams against the per-IP budget of 8
+/// (the Join, then the Join with its cookie), so 4 fill it and no more —
+/// any faster and the rate limit, not the session cap, would be what stops it.
+pub const JOINS_PER_TICK: u16 = 4;
 
 pub struct JoinFloodBot {
     next: u16,
@@ -51,7 +53,7 @@ impl Bot for JoinFloodBot {
     }
 
     fn routed(&mut self, _ctx: &BotCtx) -> Vec<(u16, Vec<u8>)> {
-        let join = frame(NO_TOKEN, &ClientMsg::Join { name: self.name().into(), protocol: PROTOCOL_VERSION });
+        let join = frame(NO_TOKEN, &ClientMsg::Join { name: self.name().into(), protocol: PROTOCOL_VERSION, cookie: None });
         (0..JOINS_PER_TICK)
             .map(|_| {
                 self.next = self.next % SOURCES + 1; // 1..=SOURCES, then around again

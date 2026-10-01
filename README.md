@@ -5,10 +5,11 @@ resist **cheating** and **DDoS** from day one — by fixing the *architecture*,
 not by chasing individual cheats.
 
 > Status: **pre-alpha.** Step 1 (Lab / Testbed) and Step 2 (detector v0,
-> offline rules) done; Step 3 (pillar D) in progress — the server now runs
-> over real UDP with a per-IP pre-decode rate limit. Source addresses are not
-> yet authenticated (session token is next). Nothing here is
-> production-ready.
+> offline rules) done; Step 3 (pillar D) in progress — the server runs over
+> real UDP; every client datagram carries a session token checked before
+> decode, so a forged source address can neither act as a player nor spend
+> its rate budget. No encryption: an on-path attacker can still read tokens.
+> Nothing here is production-ready.
 
 ## Why
 

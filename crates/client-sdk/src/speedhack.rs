@@ -48,7 +48,7 @@ mod tests {
     #[test]
     fn emits_oversized_move_vector() {
         let mut b = SpeedhackBot::new();
-        let out = b.act(&BotCtx { tick: 1, my_id: 1, snapshot: &[] });
+        let out = b.act(&BotCtx { tick: 1, my_id: 1, token: 0, snapshot: &[] });
         if let ClientMsg::Input { move_dir, .. } = out[0] {
             assert!(move_dir.len() > 1.0);
         } else {

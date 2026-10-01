@@ -66,7 +66,7 @@ mod tests {
     #[test]
     fn then_sends_legal_inputs() {
         let mut b = BadVersionBot::new();
-        let out = b.act(&BotCtx { tick: 1, my_id: 1, snapshot: &[] });
+        let out = b.act(&BotCtx { tick: 1, my_id: 1, token: 0, snapshot: &[] });
         match out[0] {
             ClientMsg::Input { move_dir, .. } => assert!(move_dir.len() <= 1.0),
             _ => panic!("expected Input"),

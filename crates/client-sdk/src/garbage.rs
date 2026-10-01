@@ -3,8 +3,9 @@
 //! Input truncated by one byte. Countered by the packet guard (G2) at decode:
 //! each is dropped, none panics the server.
 //!
-//! It joins legally on purpose, so the packet guard is the *only* thing that
-//! can stop it — a rejected join would hide whether G2 works.
+//! It joins legally on purpose, and puts its real session token in front of
+//! each body, so the packet guard is the *only* thing that can stop it — a
+//! rejected join or a bad token would hide whether G2 works.
 
 use super::{Bot, BotCtx};
 use aegis_protocol::{encode, ClientMsg, Vec2};
@@ -47,26 +48,36 @@ impl Bot for GarbageBot {
             aim: Vec2::new(1.0, 0.0),
             shoot: false,
         });
-        vec![
-            Vec::new(),                     // empty
-            vec![0xFF; 4],                  // enum tag no ClientMsg variant has
+        let bodies = [
+            Vec::new(),                      // empty
+            vec![0xFF; 4],                   // enum tag no ClientMsg variant has
             real[..real.len() - 1].to_vec(), // truncated mid-field
-        ]
+        ];
+        bodies
+            .into_iter()
+            .map(|body| {
+                let mut d = ctx.token.to_le_bytes().to_vec();
+                d.extend(body);
+                d
+            })
+            .collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aegis_protocol::decode;
+    use aegis_protocol::{decode, split_frame};
 
     #[test]
     fn every_datagram_fails_to_decode() {
         let mut b = GarbageBot::new();
-        let out = b.datagrams(&BotCtx { tick: 1, my_id: 1, snapshot: &[] });
+        let out = b.datagrams(&BotCtx { tick: 1, my_id: 1, token: 77, snapshot: &[] });
         assert_eq!(out.len(), SHAPES);
         for d in &out {
-            assert!(decode::<ClientMsg>(d).is_err(), "decoded: {:?}", d);
+            let (token, body) = split_frame(d).expect("every shape carries the real token");
+            assert_eq!(token, 77);
+            assert!(decode::<ClientMsg>(body).is_err(), "decoded: {:?}", body);
         }
     }
 

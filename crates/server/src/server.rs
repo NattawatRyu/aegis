@@ -6,25 +6,28 @@
 //! ```text
 //! begin_tick  -> respawns, then the snapshot clients act on
 //! receive     -> once per datagram:
-//!                source_rate -> who is it? -> decode -> version / pipeline
+//!                address + token?  yes -> player budget -> decode -> pipeline
+//!                                  no  -> IP budget -> decode -> Join only
 //! end_tick    -> shots against the pre-move world, then moves
 //! ```
 //!
-//! Identity is the source address. A player id is issued only when a legal
-//! Join arrives from a new address; everything else from an unknown address is
-//! counted in [`NetStats`] and dropped. Both transports run this same code, so
-//! an in-process run and a UDP run of the same scenario are directly
-//! comparable.
+//! Identity is the source address **and** the session token issued to it. A
+//! player id is issued only when a legal Join arrives from a new address;
+//! everything that is not authenticated is counted in [`NetStats`] and
+//! dropped, never written on a player's record — so a forger cannot frame its
+//! victim. Both transports run this same code, so an in-process run and a UDP
+//! run of the same scenario are directly comparable.
 //!
-//! Every verdict and every aim-evidence shot of an admitted player is written
-//! to [`Telemetry`]: that stream is what the detector (pillar C) reads.
+//! Every verdict and every aim-evidence shot of an authenticated player is
+//! written to [`Telemetry`]: that stream is what the detector (pillar C) reads.
 
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
-use aegis_protocol::{ClientMsg, PlayerId, PlayerState, Vec2};
+use aegis_protocol::{split_frame, ClientMsg, PlayerId, PlayerState, Vec2};
 use aegis_telemetry::Telemetry;
 
+use crate::guards::session::{self, Session};
 use crate::guards::source_rate::SourceRate;
 use crate::guards::{joined, packet, version};
 use crate::{ClientInput, GuardCtx, GuardVerdict, Pipeline, RejectReason, Sim};
@@ -42,10 +45,10 @@ pub struct TickOutcome {
     pub steps: Vec<(PlayerId, f32)>,
 }
 
-/// Datagrams dropped without a player to pin them on: source-rate drops
-/// (counted before anyone looks at who sent them) and anything from an
-/// address that never joined. Counters only — bounded no matter how hard the
-/// server is flooded.
+/// Datagrams dropped without a player to pin them on: rate-budget drops
+/// (counted before anything is decoded) and everything unauthenticated —
+/// from an address that never joined, or with the wrong token. Counters only —
+/// bounded no matter how hard the server is flooded.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct NetStats {
     pub dropped: BTreeMap<&'static str, u64>,
@@ -66,9 +69,12 @@ pub struct Server {
     pipe: Pipeline,
     tel: Telemetry,
     net: NetStats,
-    source_rate: SourceRate,
-    /// Admitted source -> its player id. Ids are 1.. in join order, never reused.
-    sources: BTreeMap<SocketAddr, PlayerId>,
+    /// Budget for authenticated datagrams, per player.
+    player_rate: SourceRate<PlayerId>,
+    /// Budget for everything else, per source IP.
+    ip_rate: SourceRate<IpAddr>,
+    /// Admitted address -> its session. Ids are 1.. in join order, never reused.
+    sessions: BTreeMap<SocketAddr, Session>,
     /// Player `id` enters at `spawns[(id - 1) % len]`.
     spawns: Vec<Vec2>,
     /// Inputs accepted this tick, in arrival order, waiting for `end_tick`.
@@ -84,8 +90,9 @@ impl Server {
             pipe: Pipeline::standard(),
             tel: Telemetry::new(),
             net: NetStats::default(),
-            source_rate: SourceRate::new(),
-            sources: BTreeMap::new(),
+            player_rate: SourceRate::new(),
+            ip_rate: SourceRate::new(),
+            sessions: BTreeMap::new(),
             spawns,
             pending: Vec::new(),
         }
@@ -98,47 +105,71 @@ impl Server {
         self.sim.snapshot()
     }
 
-    /// Receive one datagram from `from`. An input that passes every guard is
-    /// queued for `end_tick`; everything else is recorded and dropped.
+    /// Receive one datagram (a token-framed `ClientMsg`) from `from`. An input
+    /// that passes every guard is queued for `end_tick`; everything else is
+    /// recorded or counted, and dropped.
     ///
-    /// Returns `Some(id)` when the datagram was a legal Join — a new player or
-    /// a repeat from an admitted one — so the transport can answer
-    /// `ServerMsg::Joined` (a repeat means the last answer was lost).
-    pub fn receive(&mut self, tick: u32, from: SocketAddr, bytes: &[u8]) -> Option<PlayerId> {
-        if let Err(r) = self.source_rate.check(tick, from.ip()) {
+    /// Returns the session when the datagram was a legal Join — a new player,
+    /// or a repeat from an admitted address — so the transport can answer
+    /// `ServerMsg::Joined` to `from` (a repeat means the last answer was
+    /// lost; the answer only ever goes to the admitted address itself).
+    pub fn receive(&mut self, tick: u32, from: SocketAddr, bytes: &[u8]) -> Option<Session> {
+        let framed = split_frame(bytes);
+        let known = joined::check_source(&self.sessions, from);
+
+        // Authenticated: this address and its token. Its own budget, so
+        // forgeries from the same IP cannot spend it.
+        if let (Some((token, body)), Ok(s)) = (framed, known) {
+            if session::verify(&s, token).is_ok() {
+                if let Err(r) = self.player_rate.check(tick, s.player_id) {
+                    self.net.drop(r.label());
+                    return None;
+                }
+                return self.receive_from(tick, s, body);
+            }
+        }
+
+        // Everything else shares its IP's budget, and only a Join comes of it.
+        if let Err(r) = self.ip_rate.check(tick, from.ip()) {
             self.net.drop(r.label());
             return None;
         }
-        match joined::check_source(&self.sources, from) {
-            Ok(player) => self.receive_from(tick, player, bytes),
-            Err(not_joined) => self.admit(from, bytes, not_joined),
-        }
+        let msg = match framed.ok_or(RejectReason::MalformedPacket).and_then(|(_, body)| packet::decode_client(body)) {
+            Ok(m) => m,
+            Err(r) => {
+                self.net.drop(r.label());
+                return None;
+            }
+        };
+        let refused = match (msg, known) {
+            (ClientMsg::Join { protocol, .. }, known) => match (version::check_join(protocol), known) {
+                (Err(r), _) => r,
+                (Ok(()), Ok(s)) => return Some(s), // lost Joined: answer again
+                (Ok(()), Err(_)) => return self.admit(from),
+            },
+            (ClientMsg::Input { .. }, Ok(_)) => RejectReason::BadToken,
+            (ClientMsg::Input { .. }, Err(not_joined)) => not_joined,
+        };
+        self.net.drop(refused.label());
+        None
     }
 
-    /// A datagram from an unknown address: only a legal Join gets through,
-    /// and it is what creates the player.
-    fn admit(&mut self, from: SocketAddr, bytes: &[u8], not_joined: RejectReason) -> Option<PlayerId> {
-        let refused = match packet::decode_client(bytes) {
-            Ok(ClientMsg::Join { protocol, .. }) => version::check_join(protocol).err().map(RejectReason::label),
-            Ok(ClientMsg::Input { .. }) => Some(not_joined.label()),
-            Err(r) => Some(r.label()),
-        };
-        if let Some(label) = refused {
-            self.net.drop(label);
-            return None;
-        }
-        let Ok(id) = PlayerId::try_from(self.sources.len() + 1) else {
+    /// A legal Join from an address with no session: create the player.
+    fn admit(&mut self, from: SocketAddr) -> Option<Session> {
+        let Ok(player_id) = PlayerId::try_from(self.sessions.len() + 1) else {
             self.net.drop(SERVER_FULL);
             return None;
         };
-        self.sources.insert(from, id);
-        self.sim.spawn(id, self.spawns[(id as usize - 1) % self.spawns.len()]);
-        Some(id)
+        let s = Session { player_id, token: session::new_token() };
+        self.sessions.insert(from, s);
+        self.sim.spawn(player_id, self.spawns[(player_id as usize - 1) % self.spawns.len()]);
+        Some(s)
     }
 
-    /// A datagram from an admitted player: everything is on their record.
-    fn receive_from(&mut self, tick: u32, player: PlayerId, bytes: &[u8]) -> Option<PlayerId> {
-        let msg = match packet::decode_client(bytes) {
+    /// An authenticated datagram: everything is on the player's record.
+    fn receive_from(&mut self, tick: u32, s: Session, body: &[u8]) -> Option<Session> {
+        let player = s.player_id;
+        let msg = match packet::decode_client(body) {
             Ok(m) => m,
             Err(r) => {
                 self.tel.reject(tick, player, r.label());
@@ -148,7 +179,7 @@ impl Server {
         match msg {
             // Already in: a repeated join changes nothing but is answered again.
             ClientMsg::Join { protocol, .. } => match version::check_join(protocol) {
-                Ok(()) => Some(player),
+                Ok(()) => Some(s),
                 Err(r) => {
                     self.tel.reject(tick, player, r.label());
                     None
@@ -201,12 +232,12 @@ impl Server {
 
     /// The player admitted from `from`, if any.
     pub fn player_id(&self, from: SocketAddr) -> Option<PlayerId> {
-        self.sources.get(&from).copied()
+        self.sessions.get(&from).map(|s| s.player_id)
     }
 
-    /// Every admitted source and its player — who a snapshot goes to.
+    /// Every admitted address and its player — who a snapshot goes to.
     pub fn peers(&self) -> impl Iterator<Item = (SocketAddr, PlayerId)> + '_ {
-        self.sources.iter().map(|(&a, &p)| (a, p))
+        self.sessions.iter().map(|(&a, s)| (a, s.player_id))
     }
 
     pub fn sim(&self) -> &Sim {
@@ -237,7 +268,7 @@ mod tests {
     use super::*;
     use crate::guards::source_rate::MAX_PER_TICK;
     use crate::sim::{MAX_HEALTH, MOVE_SPEED, SHOT_DAMAGE};
-    use aegis_protocol::{encode, PROTOCOL_VERSION};
+    use aegis_protocol::{frame, NO_TOKEN, PROTOCOL_VERSION};
     use aegis_telemetry::Outcome;
 
     fn addr(n: u8) -> SocketAddr {
@@ -245,43 +276,59 @@ mod tests {
     }
 
     fn join(protocol: u16) -> Vec<u8> {
-        encode(&ClientMsg::Join { name: "t".into(), protocol })
+        frame(NO_TOKEN, &ClientMsg::Join { name: "t".into(), protocol })
     }
 
-    fn input(seq: u32, move_dir: Vec2, aim: Vec2, shoot: bool) -> Vec<u8> {
-        encode(&ClientMsg::Input { seq, tick: seq, move_dir, aim, shoot })
+    fn input(token: u64, seq: u32, move_dir: Vec2, aim: Vec2, shoot: bool) -> Vec<u8> {
+        frame(token, &ClientMsg::Input { seq, tick: seq, move_dir, aim, shoot })
+    }
+
+    fn walk(token: u64, seq: u32) -> Vec<u8> {
+        input(token, seq, Vec2::new(1.0, 0.0), Vec2::new(1.0, 0.0), false)
     }
 
     fn server() -> Server {
         Server::new(vec![Vec2::ZERO, Vec2::new(10.0, 0.0)])
     }
 
-    /// Player 1 at the origin, player 2 at (10, 0).
-    fn joined_pair() -> Server {
+    fn admit(s: &mut Server, from: SocketAddr) -> u64 {
+        s.receive(0, from, &join(PROTOCOL_VERSION)).expect("legal join refused").token
+    }
+
+    /// Player 1 at the origin, player 2 at (10, 0), and their tokens.
+    fn joined_pair() -> (Server, u64, u64) {
         let mut s = server();
-        assert_eq!(s.receive(0, addr(1), &join(PROTOCOL_VERSION)), Some(1));
-        assert_eq!(s.receive(0, addr(2), &join(PROTOCOL_VERSION)), Some(2));
-        s
+        let t1 = admit(&mut s, addr(1));
+        let t2 = admit(&mut s, addr(2));
+        (s, t1, t2)
     }
 
     #[test]
     fn legal_join_spawns_once_and_is_not_recorded() {
         let mut s = server();
-        assert_eq!(s.receive(0, addr(1), &join(PROTOCOL_VERSION)), Some(1));
-        // a repeat is answered again (the reply may have been lost) but changes nothing
-        assert_eq!(s.receive(0, addr(1), &join(PROTOCOL_VERSION)), Some(1));
-        assert_eq!(s.player_id(addr(1)), Some(1));
+        let first = s.receive(0, addr(1), &join(PROTOCOL_VERSION)).unwrap();
+        // a repeat is answered again, same session (the reply may have been lost)
+        assert_eq!(s.receive(0, addr(1), &join(PROTOCOL_VERSION)), Some(first));
+        assert_eq!(first.player_id, 1);
         assert_eq!(s.sim().snapshot().len(), 1);
         assert!(s.telemetry().is_empty());
     }
 
     #[test]
+    fn every_player_gets_its_own_token() {
+        let (_, t1, t2) = joined_pair();
+        assert_ne!(t1, t2);
+        assert!(t1 != NO_TOKEN && t2 != NO_TOKEN);
+    }
+
+    #[test]
     fn ids_follow_legal_join_order_and_spawns_wrap() {
         let mut s = server();
-        assert_eq!(s.receive(0, addr(1), &join(PROTOCOL_VERSION)), Some(1));
-        assert_eq!(s.receive(0, addr(2), &join(PROTOCOL_VERSION + 1)), None); // refused: no id spent
-        assert_eq!(s.receive(0, addr(3), &join(PROTOCOL_VERSION)), Some(2));
-        assert_eq!(s.receive(0, addr(4), &join(PROTOCOL_VERSION)), Some(3));
+        let id = |s: &mut Server, n, v| s.receive(0, addr(n), &join(v)).map(|x| x.player_id);
+        assert_eq!(id(&mut s, 1, PROTOCOL_VERSION), Some(1));
+        assert_eq!(id(&mut s, 2, PROTOCOL_VERSION + 1), None); // refused: no id spent
+        assert_eq!(id(&mut s, 3, PROTOCOL_VERSION), Some(2));
+        assert_eq!(id(&mut s, 4, PROTOCOL_VERSION), Some(3));
         assert_eq!(s.sim().player(2).unwrap().pos, Vec2::new(10.0, 0.0));
         assert_eq!(s.sim().player(3).unwrap().pos, Vec2::ZERO);
     }
@@ -299,41 +346,84 @@ mod tests {
     #[test]
     fn unknown_source_never_gets_an_id_or_a_record() {
         let mut s = server();
-        s.receive(1, addr(1), &input(1, Vec2::new(1.0, 0.0), Vec2::new(1.0, 0.0), true));
-        s.receive(1, addr(1), &[0xFF, 0xFF, 0xFF]);
+        s.receive(1, addr(1), &walk(NO_TOKEN, 1));
+        s.receive(1, addr(1), &[0xFF, 0xFF, 0xFF]); // too short to carry a token
+        s.receive(1, addr(1), &[0xFF; 12]); // a token, then garbage
         assert_eq!(s.end_tick(1), TickOutcome::default());
         assert_eq!(s.peers().count(), 0);
         assert!(s.telemetry().is_empty());
-        assert_eq!((s.net_stats().get("not_joined"), s.net_stats().get("malformed_packet")), (1, 1));
+        assert_eq!((s.net_stats().get("not_joined"), s.net_stats().get("malformed_packet")), (1, 2));
     }
 
-    /// The other half of "identity is the address": an admitted player's
-    /// address on another port is somebody else, and gets nothing.
     #[test]
-    fn same_ip_other_port_is_not_the_player() {
-        let mut s = joined_pair();
+    fn same_ip_other_port_is_not_the_player_even_with_its_token() {
+        let (mut s, t1, _) = joined_pair();
         let other = SocketAddr::from(([10, 0, 0, 1], 4001));
-        s.receive(1, other, &input(1, Vec2::new(1.0, 0.0), Vec2::ZERO, false));
+        s.receive(1, other, &walk(t1, 1));
         assert_eq!(s.end_tick(1), TickOutcome::default());
         assert_eq!(s.net_stats().get("not_joined"), 1);
     }
 
+    /// The forgery: the victim's address with any token but the victim's —
+    /// none, a guess, or the forger's own valid one. Nothing moves, nothing
+    /// lands on the victim's record, each one is counted.
+    #[test]
+    fn forged_source_with_wrong_token_is_counted_not_applied() {
+        let (mut s, t1, t2) = joined_pair();
+        for (seq, t) in [NO_TOKEN, t1 ^ 1, t2].into_iter().enumerate() {
+            s.receive(1, addr(1), &walk(t, seq as u32 + 1));
+        }
+        assert_eq!(s.end_tick(1), TickOutcome::default());
+        assert!(s.telemetry().is_empty(), "victim's record: {:?}", s.telemetry().records());
+        assert_eq!(s.net_stats().get("bad_token"), 3);
+    }
+
+    /// Starvation: a burst of forgeries from the victim's IP arrives first and
+    /// fills that IP's budget. The victim's real, token-bearing input still
+    /// gets in — it is budgeted per player, not per IP.
+    #[test]
+    fn forged_burst_does_not_starve_the_victim() {
+        let (mut s, t1, _) = joined_pair();
+        for seq in 0..MAX_PER_TICK * 4 {
+            s.receive(1, addr(1), &walk(NO_TOKEN, 1_000 + seq));
+        }
+        s.receive(1, addr(1), &walk(t1, 1));
+        assert_eq!(s.end_tick(1).steps, vec![(1, MOVE_SPEED)]);
+        assert_eq!(s.telemetry().per_player(1).accepted, 1);
+        assert_eq!(s.net_stats().get("bad_token"), MAX_PER_TICK as u64);
+        assert_eq!(s.net_stats().get("source_rate"), MAX_PER_TICK as u64 * 3);
+    }
+
+    /// A lost Joined is recovered by joining again — from the admitted
+    /// address, the session comes back unchanged; from anywhere else it is a
+    /// new player, never the old one's token.
+    #[test]
+    fn rejoin_returns_the_same_session_only_to_its_address() {
+        let (mut s, t1, _) = joined_pair();
+        assert_eq!(s.receive(0, addr(1), &join(PROTOCOL_VERSION)), Some(Session { player_id: 1, token: t1 }));
+        let other = s.receive(0, addr(9), &join(PROTOCOL_VERSION)).unwrap();
+        assert_ne!(other.token, t1);
+        assert_eq!(other.player_id, 3);
+    }
+
     #[test]
     fn garbage_from_a_player_is_on_their_record() {
-        let mut s = joined_pair();
-        s.receive(1, addr(2), &[0xFF, 0xFF, 0xFF]);
+        let (mut s, _, t2) = joined_pair();
+        let mut bad = t2.to_le_bytes().to_vec();
+        bad.extend([0xFF, 0xFF, 0xFF]);
+        s.receive(1, addr(2), &bad);
         let r = &s.telemetry().records()[0];
         assert_eq!((r.player, &r.outcome), (2, &Outcome::Rejected { reason: "malformed_packet" }));
     }
 
-    /// The edge: datagram MAX_PER_TICK from one IP is decoded, the next is
+    /// The edge: datagram MAX_PER_TICK from one player is decoded, the next is
     /// not — it never reaches the pipeline, so input_rate never sees it and
     /// there is no record of it, only a counter.
     #[test]
     fn source_rate_drops_past_the_cap_before_decode() {
-        let mut s = joined_pair();
+        let (mut s, t1, _) = joined_pair();
         for seq in 1..=MAX_PER_TICK + 1 {
-            s.receive(1, addr(1), &input(seq, Vec2::ZERO, Vec2::ZERO, false));
+            s.receive(1, addr(1), &input(t1, seq, Vec2::ZERO, Vec2::ZERO, false));
         }
         let t = s.telemetry().per_player(1);
         assert_eq!((t.accepted, t.rejected.get("rate_exceeded").copied()), (1, Some(MAX_PER_TICK - 1)));
@@ -345,7 +435,7 @@ mod tests {
     fn unjoined_flood_costs_at_most_the_cap_in_decodes() {
         let mut s = server();
         for _ in 0..100 {
-            s.receive(1, addr(9), &input(1, Vec2::ZERO, Vec2::ZERO, false));
+            s.receive(1, addr(9), &walk(NO_TOKEN, 1));
         }
         assert_eq!(s.net_stats().get("not_joined"), MAX_PER_TICK as u64);
         assert_eq!(s.net_stats().get("source_rate"), 100 - MAX_PER_TICK as u64);
@@ -357,7 +447,7 @@ mod tests {
         let mut ids = Vec::new();
         for n in 0..256u32 {
             let from = SocketAddr::from(([10, 1, (n >> 8) as u8, n as u8], 4000));
-            ids.push(s.receive(0, from, &join(PROTOCOL_VERSION)));
+            ids.push(s.receive(0, from, &join(PROTOCOL_VERSION)).map(|x| x.player_id));
         }
         assert_eq!(ids[254], Some(255));
         assert_eq!(ids[255], None);
@@ -367,9 +457,9 @@ mod tests {
 
     #[test]
     fn accepted_input_waits_for_end_tick() {
-        let mut s = joined_pair();
+        let (mut s, t1, _) = joined_pair();
         s.begin_tick();
-        s.receive(1, addr(1), &input(1, Vec2::new(1.0, 0.0), Vec2::new(1.0, 0.0), false));
+        s.receive(1, addr(1), &walk(t1, 1));
         assert_eq!(s.sim().player(1).unwrap().pos, Vec2::ZERO); // not yet
         let out = s.end_tick(1);
         assert_eq!(out.steps, vec![(1, MOVE_SPEED)]);
@@ -383,10 +473,10 @@ mod tests {
     /// because the shot is judged against the world player 1 was shown.
     #[test]
     fn shots_resolve_before_moves() {
-        let mut s = joined_pair();
+        let (mut s, t1, t2) = joined_pair();
         s.begin_tick();
-        s.receive(1, addr(2), &input(1, Vec2::new(0.0, 1.0), Vec2::new(-1.0, 0.0), false));
-        s.receive(1, addr(1), &input(1, Vec2::ZERO, Vec2::new(1.0, 0.0), true));
+        s.receive(1, addr(2), &input(t2, 1, Vec2::new(0.0, 1.0), Vec2::new(-1.0, 0.0), false));
+        s.receive(1, addr(1), &input(t1, 1, Vec2::ZERO, Vec2::new(1.0, 0.0), true));
         s.end_tick(1);
         assert_eq!(s.sim().player(2).unwrap().health, MAX_HEALTH - SHOT_DAMAGE);
         assert_eq!(s.sim().player(2).unwrap().pos, Vec2::new(10.0, MOVE_SPEED));
@@ -396,11 +486,11 @@ mod tests {
 
     #[test]
     fn kill_is_reported_with_the_killer() {
-        let mut s = joined_pair();
+        let (mut s, t1, _) = joined_pair();
         let mut kills = Vec::new();
         for t in 1..=(MAX_HEALTH / SHOT_DAMAGE) as u32 {
             s.begin_tick();
-            s.receive(t, addr(1), &input(t, Vec2::ZERO, Vec2::new(1.0, 0.0), true));
+            s.receive(t, addr(1), &input(t1, t, Vec2::ZERO, Vec2::new(1.0, 0.0), true));
             kills.extend(s.end_tick(t).kills);
         }
         assert_eq!(kills, vec![1]);
@@ -409,10 +499,10 @@ mod tests {
 
     #[test]
     fn begin_tick_respawns_before_the_snapshot() {
-        let mut s = joined_pair();
+        let (mut s, t1, _) = joined_pair();
         for t in 1..=(MAX_HEALTH / SHOT_DAMAGE) as u32 {
             s.begin_tick();
-            s.receive(t, addr(1), &input(t, Vec2::ZERO, Vec2::new(1.0, 0.0), true));
+            s.receive(t, addr(1), &input(t1, t, Vec2::ZERO, Vec2::new(1.0, 0.0), true));
             s.end_tick(t);
         }
         let mut snap = Vec::new();

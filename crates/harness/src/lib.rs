@@ -24,12 +24,12 @@ use std::time::Duration;
 use aegis_client_sdk::{
     aimbot::AimbotBot, badversion::BadVersionBot, flood::FloodBot, garbage::GarbageBot,
     honest::HonestBot, humanized::HumanizedAimbot, nan::NanBot, replay::ReplayBot,
-    speedhack::SpeedhackBot, Bot, BotCtx,
+    speedhack::SpeedhackBot, spoof::SpoofBot, Bot, BotCtx,
 };
 use aegis_detector::{Flag, Suite};
-use aegis_protocol::{decode, encode, PlayerId, PlayerState, ServerMsg, Vec2};
+use aegis_protocol::{decode, frame, PlayerId, PlayerState, ServerMsg, Vec2, NO_TOKEN};
 use aegis_server::net::MAX_DATAGRAM;
-use aegis_server::{NetServer, NetStats, Server, TickOutcome};
+use aegis_server::{NetServer, NetStats, Server, Session, TickOutcome};
 use aegis_telemetry::{Telemetry, Totals};
 
 /// Bots spawn evenly on a circle this far from the center — inside every
@@ -63,8 +63,22 @@ impl Scenario {
                 Box::new(NanBot::new()),
                 Box::new(AimbotBot::new()),
                 Box::new(HumanizedAimbot::new()),
+                Box::new(SpoofBot::new()),
             ],
         }
+    }
+
+    /// For each bot, the slot whose address its per-tick datagrams leave
+    /// from: its own, or its victim's if it forges one.
+    fn routes(&self) -> Vec<usize> {
+        self.bots
+            .iter()
+            .enumerate()
+            .map(|(i, b)| match b.impersonates() {
+                None => i,
+                Some(v) => self.bots.iter().position(|o| o.name() == v).unwrap_or_else(|| panic!("no victim named {v}")),
+            })
+            .collect()
     }
 
     /// A lobby of `LOBBY_SIZE` honest players, each with its own aim seed
@@ -160,23 +174,28 @@ pub fn honest_sweep(lobbies: u32) -> Vec<aegis_detector::PlayerStats> {
 /// What the harness tracks per bot while the scenario runs, whichever
 /// transport carries the bytes. Indexed by bot slot.
 struct Lab {
-    ids: Vec<Option<PlayerId>>,
+    sessions: Vec<Option<Session>>,
     kills: Vec<u32>,
     max_step: Vec<f32>,
 }
 
 impl Lab {
     fn new(n: usize) -> Self {
-        Self { ids: vec![None; n], kills: vec![0; n], max_step: vec![0.0; n] }
+        Self { sessions: vec![None; n], kills: vec![0; n], max_step: vec![0.0; n] }
+    }
+
+    fn id(&self, i: usize) -> Option<PlayerId> {
+        self.sessions[i].map(|s| s.player_id)
     }
 
     fn ctx<'a>(&self, i: usize, tick: u32, snapshot: &'a [PlayerState]) -> BotCtx<'a> {
-        // An unadmitted bot has no id; 0 is never issued.
-        BotCtx { tick, my_id: self.ids[i].unwrap_or(0), snapshot }
+        // An unadmitted bot has no id (0 is never issued) and no token.
+        let s = self.sessions[i];
+        BotCtx { tick, my_id: s.map_or(0, |s| s.player_id), token: s.map_or(NO_TOKEN, |s| s.token), snapshot }
     }
 
     fn slot(&self, p: PlayerId) -> usize {
-        self.ids.iter().position(|&x| x == Some(p)).expect("outcome for a player no bot owns")
+        (0..self.sessions.len()).position(|i| self.id(i) == Some(p)).expect("outcome for a player no bot owns")
     }
 
     fn measure(&mut self, out: TickOutcome) {
@@ -198,7 +217,7 @@ impl Lab {
             .iter()
             .enumerate()
             .map(|(i, bot)| {
-                let id = self.ids[i];
+                let id = self.id(i);
                 let totals = id.map(|p| tel.per_player(p)).unwrap_or_default();
                 let flags = id.and_then(|p| stats.get(&p)).map(|s| suite.check(s)).unwrap_or_default();
                 BotReport {
@@ -222,22 +241,24 @@ impl Lab {
 pub fn run(mut sc: Scenario) -> Report {
     let n = sc.bots.len();
     let addr = |i: usize| SocketAddr::from((bot_ip(i), 40000));
+    let route = sc.routes();
     let mut server = Server::new(spawns(n));
     let mut lab = Lab::new(n);
 
     // Tick 0: the handshake, over the wire like everything else.
     for (i, bot) in sc.bots.iter().enumerate() {
-        lab.ids[i] = server.receive(0, addr(i), &encode(&bot.join()));
+        lab.sessions[i] = server.receive(0, addr(i), &frame(NO_TOKEN, &bot.join()));
     }
 
     for tick in 1..=sc.ticks {
         let snapshot = server.begin_tick();
         for (i, bot) in sc.bots.iter_mut().enumerate() {
             // The server sends snapshots to admitted players only.
-            let seen: &[PlayerState] = if lab.ids[i].is_some() { &snapshot } else { &[] };
+            let seen: &[PlayerState] = if lab.sessions[i].is_some() { &snapshot } else { &[] };
             for d in bot.datagrams(&lab.ctx(i, tick, seen)) {
-                if let Some(id) = server.receive(tick, addr(i), &d) {
-                    lab.ids[i] = Some(id);
+                // A Joined answer goes to the address the datagram came from.
+                if let Some(s) = server.receive(tick, addr(route[i]), &d) {
+                    lab.sessions[route[i]] = Some(s);
                 }
             }
         }
@@ -263,10 +284,11 @@ pub fn run_udp(mut sc: Scenario) -> io::Result<Report> {
             Ok(s)
         })
         .collect::<io::Result<Vec<_>>>()?;
+    let route = sc.routes();
     let mut lab = Lab::new(n);
 
     for (i, bot) in sc.bots.iter().enumerate() {
-        socks[i].send_to(&encode(&bot.join()), to)?;
+        socks[i].send_to(&frame(NO_TOKEN, &bot.join()), to)?;
     }
     pump(&mut net, n)?;
 
@@ -277,11 +299,11 @@ pub fn run_udp(mut sc: Scenario) -> io::Result<Report> {
             // The server's word on who is admitted decides only whether to
             // wait for a snapshot; what is in it is read off the socket.
             let snapshot = match net.server().player_id(socks[i].local_addr()?) {
-                Some(_) => read_snapshot(&socks[i], tick, &mut lab.ids[i])?,
+                Some(_) => read_snapshot(&socks[i], tick, &mut lab.sessions[i])?,
                 None => Vec::new(),
             };
             for d in bot.datagrams(&lab.ctx(i, tick, &snapshot)) {
-                socks[i].send_to(&d, to)?;
+                socks[route[i]].send_to(&d, to)?;
                 sent += 1;
             }
         }
@@ -305,12 +327,12 @@ fn pump(net: &mut NetServer, expected: usize) -> io::Result<()> {
 }
 
 /// Read this tick's snapshot, taking any `Joined` that arrives first.
-fn read_snapshot(sock: &UdpSocket, tick: u32, id: &mut Option<PlayerId>) -> io::Result<Vec<PlayerState>> {
+fn read_snapshot(sock: &UdpSocket, tick: u32, session: &mut Option<Session>) -> io::Result<Vec<PlayerState>> {
     let mut buf = [0u8; MAX_DATAGRAM];
     loop {
         let n = sock.recv(&mut buf)?;
         match decode::<ServerMsg>(&buf[..n]) {
-            Ok(ServerMsg::Joined { player_id, .. }) => *id = Some(player_id),
+            Ok(ServerMsg::Joined { player_id, token, .. }) => *session = Some(Session { player_id, token }),
             Ok(ServerMsg::Snapshot { tick: t, players }) if t == tick => return Ok(players),
             other => {
                 let msg = format!("tick {tick}: expected a snapshot, got {other:?}");
@@ -323,7 +345,7 @@ fn read_snapshot(sock: &UdpSocket, tick: u32, id: &mut Option<PlayerId>) -> io::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aegis_client_sdk::{flood, garbage};
+    use aegis_client_sdk::{flood, garbage, spoof};
     use aegis_server::guards::source_rate::MAX_PER_TICK;
     use aegis_server::sim::MOVE_SPEED;
     use aegis_detector::detectors::{accuracy, aim_exact, anomaly_rate};
@@ -376,11 +398,19 @@ mod tests {
     fn flood_gets_exactly_one_input_per_tick_and_most_is_never_decoded() {
         let r = standard();
         let b = r.bot("flood");
-        let per_tick = flood::DEFAULT_PER_TICK as u32;
         assert_eq!(b.totals.accepted, r.ticks);
         assert_eq!(rejected(b, "rate_exceeded"), (MAX_PER_TICK - 1) * r.ticks);
         assert_eq!(b.totals.total_rejected(), (MAX_PER_TICK - 1) * r.ticks);
-        assert_eq!(r.net.get("source_rate"), u64::from((per_tick - MAX_PER_TICK) * r.ticks));
+    }
+
+    /// Every source-rate drop is accounted for: the flood's excess over its
+    /// own (player) budget, plus the spoof's excess over the victim IP's
+    /// unauthenticated budget. Nothing else in the scenario is over a cap.
+    #[test]
+    fn source_rate_drops_are_exactly_the_two_floods() {
+        let r = standard();
+        let over = |per_tick: usize| u64::from((per_tick as u32 - MAX_PER_TICK) * r.ticks);
+        assert_eq!(r.net.get("source_rate"), over(flood::DEFAULT_PER_TICK) + over(spoof::PER_TICK));
     }
 
     #[test]
@@ -389,6 +419,25 @@ mod tests {
         let b = r.bot("replay");
         assert_eq!(b.totals.accepted, 1);
         assert_eq!(rejected(b, "replay"), r.ticks - 1);
+    }
+
+    /// Forged datagrams from the victim's address get nothing: the victim
+    /// still gets every input in, its record stays clean (nothing to frame it
+    /// with), it moves only as it chose — and the forgeries are counted.
+    #[test]
+    fn spoof_cannot_act_as_starve_or_frame_its_victim() {
+        let r = standard();
+        let v = r.bot(spoof::VICTIM);
+        assert_eq!(v.totals.accepted, r.ticks);
+        assert_eq!(v.totals.total_rejected(), 0, "victim's record: {:?}", v.totals.rejected);
+        assert_eq!(v.totals.anomalies, 0);
+        assert!(v.flags.is_empty());
+        let s = r.bot("spoof");
+        assert!(s.joined());
+        assert_eq!(s.totals, Totals::default()); // it never sent as itself
+        // Up to the victim IP's unauthenticated budget, each forgery is
+        // decoded and refused for its token; the rest never get that far.
+        assert_eq!(r.net.get("bad_token"), u64::from(MAX_PER_TICK * r.ticks));
     }
 
     /// No legal join, no id: badversion leaves no per-player record at all,

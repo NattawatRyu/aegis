@@ -5,9 +5,10 @@
 //! function, for guards that don't run per-input), and add one line to
 //! [`Pipeline::standard`]. Nothing else in the server needs to change.
 //!
-//! Four guards run at their own stage rather than in the per-input pipeline,
+//! Five guards run at their own stage rather than in the per-input pipeline,
 //! because they act on data the pipeline never sees:
-//!   - [`source_rate`] — runs first, on the source IP, before any decode.
+//!   - [`session`] — runs first, on the source address + token header.
+//!   - [`source_rate`] — then, per player or per source IP, before any decode.
 //!   - [`packet`]  — runs at decode, on the raw datagram bytes.
 //!   - [`version`] — runs at `Join`, on the client's declared protocol version.
 //!   - [`joined`]  — runs before the pipeline, on the admitted source addresses.
@@ -18,6 +19,7 @@
 
 use aegis_protocol::{PlayerId, Vec2};
 
+pub mod session;
 pub mod source_rate;
 pub mod version;
 pub mod packet;
@@ -50,6 +52,7 @@ pub struct ClientInput {
 /// anomaly signal the telemetry crate feeds to the detector (pillar C).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
+    BadToken,
     SourceRate,
     BadVersion,
     MalformedPacket,
@@ -62,7 +65,8 @@ pub enum RejectReason {
 impl RejectReason {
     /// Every reason, for coverage checks ("does some bot trip each guard?").
     /// A new variant goes here too.
-    pub const ALL: [RejectReason; 7] = [
+    pub const ALL: [RejectReason; 8] = [
+        RejectReason::BadToken,
         RejectReason::SourceRate,
         RejectReason::BadVersion,
         RejectReason::MalformedPacket,
@@ -76,6 +80,7 @@ impl RejectReason {
     /// the enum here so the telemetry crate stays decoupled from server types.
     pub fn label(self) -> &'static str {
         match self {
+            RejectReason::BadToken => "bad_token",
             RejectReason::SourceRate => "source_rate",
             RejectReason::BadVersion => "bad_version",
             RejectReason::MalformedPacket => "malformed_packet",

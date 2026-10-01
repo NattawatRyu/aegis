@@ -1,15 +1,27 @@
-//! Aegis wire protocol v0 — the contract every crate depends on.
+//! Aegis wire protocol v1 — the contract every crate depends on.
 //!
 //! Core rule: **the server never accepts a position from the client.**
 //! Clients send *intent* (`move_dir`, `aim`, `shoot`); the server computes
 //! the authoritative state. This makes teleport / speedhack impossible by
 //! construction rather than by after-the-fact detection.
+//!
+//! Every client datagram is a [`frame`]: an 8-byte session token, then the
+//! encoded [`ClientMsg`]. The token is 0 until the server issues one in
+//! [`ServerMsg::Joined`]. It sits in a fixed header so the server can check
+//! it before spending a decode.
 
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever the wire format changes. Clients on a different version
 /// must be rejected at `Join` (handled by the server crate).
-pub const PROTOCOL_VERSION: u16 = 0;
+/// v1: session token header on every client datagram.
+pub const PROTOCOL_VERSION: u16 = 1;
+
+/// Bytes of session token in front of every client datagram.
+pub const TOKEN_LEN: usize = 8;
+
+/// The token a client sends before it has one (its Join, and nothing else).
+pub const NO_TOKEN: u64 = 0;
 
 /// Fixed simulation rate. Inputs arriving faster than this buy the sender
 /// nothing — the server folds at most one input per player per tick.
@@ -78,8 +90,11 @@ pub enum ClientMsg {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ServerMsg {
+    /// `token` goes in front of every datagram this client sends from now on.
+    /// It is only good from the address this reply was sent to.
     Joined {
         player_id: PlayerId,
+        token: u64,
         tick: u32,
     },
     /// Full snapshot for now. Pillar D replaces this with a per-player culled
@@ -125,9 +140,41 @@ pub fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, bincode::Err
     bincode::deserialize(bytes)
 }
 
+/// A client datagram: `token` (little-endian) then `msg`.
+pub fn frame(token: u64, msg: &ClientMsg) -> Vec<u8> {
+    let mut out = token.to_le_bytes().to_vec();
+    out.extend(encode(msg));
+    out
+}
+
+/// Split a client datagram into its token and body. `None` if it is too short
+/// to carry a token at all.
+pub fn split_frame(bytes: &[u8]) -> Option<(u64, &[u8])> {
+    let (head, body) = bytes.split_first_chunk::<TOKEN_LEN>()?;
+    Some((u64::from_le_bytes(*head), body))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_roundtrip() {
+        let m = ClientMsg::Join { name: "riw".into(), protocol: PROTOCOL_VERSION };
+        let bytes = frame(0xDEAD_BEEF_0000_0001, &m);
+        let (token, body) = split_frame(&bytes).unwrap();
+        assert_eq!(token, 0xDEAD_BEEF_0000_0001);
+        assert_eq!(decode::<ClientMsg>(body).unwrap(), m);
+    }
+
+    /// The edge: exactly a token and nothing else splits (into an empty body
+    /// the decoder will refuse); one byte less does not split at all.
+    #[test]
+    fn split_frame_at_the_header_edge() {
+        assert_eq!(split_frame(&[7, 0, 0, 0, 0, 0, 0, 0]), Some((7, &[][..])));
+        assert_eq!(split_frame(&[7, 0, 0, 0, 0, 0, 0]), None);
+        assert_eq!(split_frame(&[]), None);
+    }
 
     #[test]
     fn clientmsg_join_roundtrip() {

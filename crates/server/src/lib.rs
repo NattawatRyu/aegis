@@ -15,6 +15,7 @@ pub mod net;
 pub mod server;
 pub mod sim;
 
+pub use guards::session::Session;
 pub use guards::{ClientInput, GuardCtx, GuardVerdict, Pipeline, RejectReason};
 pub use net::NetServer;
 pub use server::{NetStats, Server, TickOutcome};

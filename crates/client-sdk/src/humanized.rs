@@ -66,7 +66,7 @@ mod tests {
         let snap = [state(1, Vec2::ZERO), state(2, Vec2::new(10.0, 0.0))];
         let mut exact = 0;
         for tick in 1..=300 {
-            match b.act(&BotCtx { tick, my_id: 1, snapshot: &snap })[0] {
+            match b.act(&BotCtx { tick, my_id: 1, token: 0, snapshot: &snap })[0] {
                 ClientMsg::Input { aim, shoot, .. } => {
                     assert!(shoot);
                     let off = aim.y.atan2(aim.x).abs();

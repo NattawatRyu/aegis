@@ -48,8 +48,8 @@ mod tests {
     #[test]
     fn repeats_the_same_seq() {
         let mut b = ReplayBot::new();
-        let a = b.act(&BotCtx { tick: 1, my_id: 1, snapshot: &[] });
-        let c = b.act(&BotCtx { tick: 2, my_id: 1, snapshot: &[] });
+        let a = b.act(&BotCtx { tick: 1, my_id: 1, token: 0, snapshot: &[] });
+        let c = b.act(&BotCtx { tick: 2, my_id: 1, token: 0, snapshot: &[] });
         let sa = match a[0] { ClientMsg::Input { seq, .. } => seq, _ => panic!() };
         let sc = match c[0] { ClientMsg::Input { seq, .. } => seq, _ => panic!() };
         assert_eq!(sa, sc);

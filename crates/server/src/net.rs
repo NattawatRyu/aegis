@@ -18,9 +18,8 @@
 //! The three steps are public so a test can drive the loop in lockstep (send,
 //! then read exactly what was sent) instead of against the clock.
 //!
-//! Known gap, closed in D3: identity is the source address, and UDP source
-//! addresses can be forged. Until the session token, a spoofer who knows a
-//! player's address can send inputs as that player.
+//! Source addresses can be forged; that is answered in [`Server::receive`] by
+//! the session token (see [`crate::guards::session`]), not here.
 
 use std::io::{self, ErrorKind};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
@@ -100,8 +99,8 @@ impl NetServer {
             self.sock.set_read_timeout(Some(left.max(Duration::from_millis(1))))?;
             match self.sock.recv_from(&mut self.buf) {
                 Ok((n, from)) => {
-                    if let Some(player_id) = self.server.receive(self.tick, from, &self.buf[..n]) {
-                        let joined = encode(&ServerMsg::Joined { player_id, tick: self.tick });
+                    if let Some(s) = self.server.receive(self.tick, from, &self.buf[..n]) {
+                        let joined = encode(&ServerMsg::Joined { player_id: s.player_id, token: s.token, tick: self.tick });
                         let _ = self.sock.send_to(&joined, from);
                     }
                     return Ok(true);
@@ -144,7 +143,7 @@ impl NetServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aegis_protocol::{decode, ClientMsg, Vec2, PROTOCOL_VERSION};
+    use aegis_protocol::{decode, frame, ClientMsg, Vec2, NO_TOKEN, PROTOCOL_VERSION};
 
     const WAIT: Duration = Duration::from_secs(1);
 
@@ -159,11 +158,11 @@ mod tests {
     }
 
     fn join() -> Vec<u8> {
-        encode(&ClientMsg::Join { name: "t".into(), protocol: PROTOCOL_VERSION })
+        frame(NO_TOKEN, &ClientMsg::Join { name: "t".into(), protocol: PROTOCOL_VERSION })
     }
 
-    fn input(seq: u32) -> Vec<u8> {
-        encode(&ClientMsg::Input { seq, tick: seq, move_dir: Vec2::new(1.0, 0.0), aim: Vec2::new(1.0, 0.0), shoot: false })
+    fn input(token: u64, seq: u32) -> Vec<u8> {
+        frame(token, &ClientMsg::Input { seq, tick: seq, move_dir: Vec2::new(1.0, 0.0), aim: Vec2::new(1.0, 0.0), shoot: false })
     }
 
     fn read(c: &UdpSocket) -> ServerMsg {
@@ -172,13 +171,23 @@ mod tests {
         decode(&buf[..n]).unwrap()
     }
 
+    /// (player_id, tick) of the `Joined` the client reads next, and its token.
+    fn joined(c: &UdpSocket) -> ((u8, u32), u64) {
+        match read(c) {
+            ServerMsg::Joined { player_id, token, tick } => ((player_id, tick), token),
+            m => panic!("expected Joined, got {m:?}"),
+        }
+    }
+
     #[test]
     fn join_is_answered_and_snapshots_follow() {
         let mut n = net();
         let c = client();
         c.send_to(&join(), n.local_addr().unwrap()).unwrap();
         assert!(n.recv_one(WAIT).unwrap());
-        assert_eq!(read(&c), ServerMsg::Joined { player_id: 1, tick: 0 });
+        let (who, token) = joined(&c);
+        assert_eq!(who, (1, 0));
+        assert_ne!(token, NO_TOKEN);
 
         n.begin_tick().unwrap();
         match read(&c) {
@@ -211,7 +220,7 @@ mod tests {
         let c = client();
         c.send_to(&join(), to).unwrap();
         assert!(n.recv_one(WAIT).unwrap());
-        assert_eq!(read(&c), ServerMsg::Joined { player_id: 2, tick: 1 });
+        assert_eq!(joined(&c).0, (2, 1));
     }
 
     #[test]
@@ -226,9 +235,11 @@ mod tests {
         assert_eq!(n.server().net_stats().get(OVERSIZE), 1);
         c.send_to(&join(), to).unwrap();
         assert!(n.recv_one(WAIT).unwrap());
-        assert_eq!(read(&c), ServerMsg::Joined { player_id: 1, tick: 0 });
+        assert_eq!(joined(&c).0, (1, 0));
     }
 
+    /// End to end: the token that makes an input count is the one that came
+    /// back over the wire. The same input without it moves nobody.
     #[test]
     fn run_tick_applies_an_input_and_keeps_time() {
         let mut n = net();
@@ -236,13 +247,15 @@ mod tests {
         let c = client();
         c.send_to(&join(), to).unwrap();
         assert!(n.recv_one(WAIT).unwrap());
-        read(&c);
-        c.send_to(&input(1), to).unwrap(); // already queued when tick 1 opens
+        let (_, token) = joined(&c);
+        c.send_to(&input(NO_TOKEN, 1), to).unwrap(); // forged-looking: no token
+        c.send_to(&input(token, 1), to).unwrap(); // both queued when tick 1 opens
 
         let t = Instant::now();
         let out = n.run_tick().unwrap();
         let took = t.elapsed();
         assert_eq!(out.steps, vec![(1, crate::sim::MOVE_SPEED)]);
+        assert_eq!(n.server().net_stats().get("bad_token"), 1);
         assert!(took >= TICK, "tick ended early: {took:?}");
         // Loose upper bound: a busy CI box can overshoot, but not by 10 ticks.
         assert!(took < TICK * 10, "tick overran: {took:?}");

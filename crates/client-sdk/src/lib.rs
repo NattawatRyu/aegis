@@ -8,7 +8,7 @@
 //! ETHICS: every bot here is meant to be pointed at a server *you run*. That is
 //! the whole design of the lab — attack yourself, measure the defense.
 
-use aegis_protocol::{encode, ClientMsg, PlayerId, PlayerState, Vec2, PROTOCOL_VERSION};
+use aegis_protocol::{frame, ClientMsg, PlayerId, PlayerState, Vec2, PROTOCOL_VERSION};
 
 pub mod aimbot;
 pub mod badversion;
@@ -19,6 +19,7 @@ pub mod humanized;
 pub mod nan;
 pub mod replay;
 pub mod speedhack;
+pub mod spoof;
 
 /// What a bot sees before deciding this tick — the same information a real
 /// client has. An aimbot exploits `snapshot`; culling it (pillar D) is what
@@ -26,6 +27,8 @@ pub mod speedhack;
 pub struct BotCtx<'a> {
     pub tick: u32,
     pub my_id: PlayerId,
+    /// The session token from this bot's `Joined` (`NO_TOKEN` if it has none).
+    pub token: u64,
     pub snapshot: &'a [PlayerState],
 }
 
@@ -41,11 +44,19 @@ pub trait Bot {
     /// Messages to send this tick. Most bots send 0 or 1; a flooder sends many.
     fn act(&mut self, ctx: &BotCtx) -> Vec<ClientMsg>;
 
-    /// The raw datagrams that go on the wire this tick. Default: `act`,
-    /// encoded. Only a bot attacking the decoder itself (sending bytes that
-    /// are not a `ClientMsg` at all) needs to override this.
+    /// The raw datagrams that go on the wire this tick. Default: `act`, each
+    /// framed with the bot's session token. Only a bot attacking the decoder
+    /// itself (sending bytes that are not a `ClientMsg` at all) needs to
+    /// override this.
     fn datagrams(&mut self, ctx: &BotCtx) -> Vec<Vec<u8>> {
-        self.act(ctx).iter().map(encode).collect()
+        self.act(ctx).iter().map(|m| frame(ctx.token, m)).collect()
+    }
+
+    /// The bot (by name) whose source address this bot's per-tick datagrams
+    /// carry — a forged source. `None`, the default, sends from its own. The
+    /// join always goes out from the bot's own address.
+    fn impersonates(&self) -> Option<&'static str> {
+        None
     }
 }
 

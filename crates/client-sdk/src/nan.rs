@@ -46,7 +46,7 @@ mod tests {
     use super::*;
 
     fn vecs(b: &mut NanBot, tick: u32) -> (Vec2, Vec2) {
-        match b.act(&BotCtx { tick, my_id: 1, snapshot: &[] })[0] {
+        match b.act(&BotCtx { tick, my_id: 1, token: 0, snapshot: &[] })[0] {
             ClientMsg::Input { move_dir, aim, .. } => (move_dir, aim),
             _ => panic!("expected Input"),
         }

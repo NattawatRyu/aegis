@@ -57,7 +57,7 @@ mod tests {
     #[test]
     fn emits_many_inputs_same_tick() {
         let mut b = FloodBot::new(50);
-        let out = b.act(&BotCtx { tick: 7, my_id: 1, snapshot: &[] });
+        let out = b.act(&BotCtx { tick: 7, my_id: 1, token: 0, snapshot: &[] });
         assert_eq!(out.len(), 50);
         for m in &out {
             match m {

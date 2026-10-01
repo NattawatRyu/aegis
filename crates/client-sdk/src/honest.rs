@@ -75,7 +75,7 @@ mod tests {
     fn no_enemy_walks_without_shooting() {
         let mut b = HonestBot::new();
         let snap = [state(1, Vec2::ZERO)];
-        let out = b.act(&BotCtx { tick: 1, my_id: 1, snapshot: &snap });
+        let out = b.act(&BotCtx { tick: 1, my_id: 1, token: 0, snapshot: &snap });
         assert_eq!(out.len(), 1);
         if let ClientMsg::Input { shoot, move_dir, .. } = out[0] {
             assert!(!shoot);
@@ -91,7 +91,7 @@ mod tests {
         let snap = [state(1, Vec2::ZERO), state(2, Vec2::new(3.0, 4.0))];
         // bearing to (3,4) is (0.6, 0.8); every shot lands within the error cone
         for tick in 1..=200 {
-            let out = b.act(&BotCtx { tick, my_id: 1, snapshot: &snap });
+            let out = b.act(&BotCtx { tick, my_id: 1, token: 0, snapshot: &snap });
             if let ClientMsg::Input { shoot, aim, .. } = out[0] {
                 assert!(shoot);
                 assert!((aim.len() - 1.0).abs() < 1e-5);
@@ -109,7 +109,7 @@ mod tests {
         let mut b = HonestBot::new();
         let snap = [state(1, Vec2::ZERO), state(2, Vec2::new(3.0, 4.0))];
         let exact = (1..=200)
-            .filter(|&tick| match b.act(&BotCtx { tick, my_id: 1, snapshot: &snap })[0] {
+            .filter(|&tick| match b.act(&BotCtx { tick, my_id: 1, token: 0, snapshot: &snap })[0] {
                 ClientMsg::Input { aim, .. } => (aim.x - 0.6).abs() < 1e-6 && (aim.y - 0.8).abs() < 1e-6,
                 _ => panic!("expected Input"),
             })
@@ -122,7 +122,7 @@ mod tests {
         let mut b = HonestBot::with_seed(0);
         let snap = [state(1, Vec2::ZERO), state(2, Vec2::new(1.0, 0.0))];
         let exact = (1..=100)
-            .filter(|&tick| match b.act(&BotCtx { tick, my_id: 1, snapshot: &snap })[0] {
+            .filter(|&tick| match b.act(&BotCtx { tick, my_id: 1, token: 0, snapshot: &snap })[0] {
                 ClientMsg::Input { aim, .. } => aim == Vec2::new(1.0, 0.0),
                 _ => panic!("expected Input"),
             })
@@ -133,7 +133,7 @@ mod tests {
     #[test]
     fn different_seeds_aim_differently() {
         let snap = [state(1, Vec2::ZERO), state(2, Vec2::new(1.0, 0.0))];
-        let aim = |seed| match HonestBot::with_seed(seed).act(&BotCtx { tick: 1, my_id: 1, snapshot: &snap })[0] {
+        let aim = |seed| match HonestBot::with_seed(seed).act(&BotCtx { tick: 1, my_id: 1, token: 0, snapshot: &snap })[0] {
             ClientMsg::Input { aim, .. } => aim,
             _ => panic!("expected Input"),
         };
@@ -144,8 +144,8 @@ mod tests {
     fn seq_increases_each_tick() {
         let mut b = HonestBot::new();
         let snap = [state(1, Vec2::ZERO)];
-        let s1 = seq_of(&b.act(&BotCtx { tick: 1, my_id: 1, snapshot: &snap })[0]);
-        let s2 = seq_of(&b.act(&BotCtx { tick: 2, my_id: 1, snapshot: &snap })[0]);
+        let s1 = seq_of(&b.act(&BotCtx { tick: 1, my_id: 1, token: 0, snapshot: &snap })[0]);
+        let s2 = seq_of(&b.act(&BotCtx { tick: 2, my_id: 1, token: 0, snapshot: &snap })[0]);
         assert!(s2 > s1);
     }
 

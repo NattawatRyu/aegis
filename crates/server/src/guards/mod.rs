@@ -5,11 +5,12 @@
 //! function, for guards that don't run per-input), and add one line to
 //! [`Pipeline::standard`]. Nothing else in the server needs to change.
 //!
-//! Three guards run at their own stage rather than in the per-input pipeline,
+//! Four guards run at their own stage rather than in the per-input pipeline,
 //! because they act on data the pipeline never sees:
+//!   - [`source_rate`] — runs first, on the source IP, before any decode.
 //!   - [`packet`]  — runs at decode, on the raw datagram bytes.
 //!   - [`version`] — runs at `Join`, on the client's declared protocol version.
-//!   - [`joined`]  — runs before the pipeline, on the server's admitted set.
+//!   - [`joined`]  — runs before the pipeline, on the admitted source addresses.
 //!
 //! Hit / movement authority is NOT a guard: the protocol gives a client no way
 //! to assert a position or a hit, so there is nothing to reject. That defense
@@ -17,6 +18,7 @@
 
 use aegis_protocol::{PlayerId, Vec2};
 
+pub mod source_rate;
 pub mod version;
 pub mod packet;
 pub mod joined;
@@ -48,6 +50,7 @@ pub struct ClientInput {
 /// anomaly signal the telemetry crate feeds to the detector (pillar C).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
+    SourceRate,
     BadVersion,
     MalformedPacket,
     NotJoined,
@@ -59,7 +62,8 @@ pub enum RejectReason {
 impl RejectReason {
     /// Every reason, for coverage checks ("does some bot trip each guard?").
     /// A new variant goes here too.
-    pub const ALL: [RejectReason; 6] = [
+    pub const ALL: [RejectReason; 7] = [
+        RejectReason::SourceRate,
         RejectReason::BadVersion,
         RejectReason::MalformedPacket,
         RejectReason::NotJoined,
@@ -72,6 +76,7 @@ impl RejectReason {
     /// the enum here so the telemetry crate stays decoupled from server types.
     pub fn label(self) -> &'static str {
         match self {
+            RejectReason::SourceRate => "source_rate",
             RejectReason::BadVersion => "bad_version",
             RejectReason::MalformedPacket => "malformed_packet",
             RejectReason::NotJoined => "not_joined",

@@ -6,13 +6,18 @@
 //!   - [`guards`] — the input-trust pipeline. Each cheat class is one module;
 //!     see [`guards`] for the full list and how to add more.
 //!
-//! Networking (UDP tick loop) is the next sub-step; today everything here is
-//! pure and deterministic so every defense is unit-testable without a socket.
+//! [`server`] ties them into a tick (receive -> guards -> sim -> telemetry)
+//! without owning a socket; [`net`] puts it behind a UDP socket. The
+//! in-process harness and the UDP loop drive the exact same code.
 
 pub mod guards;
+pub mod net;
+pub mod server;
 pub mod sim;
 
 pub use guards::{ClientInput, GuardCtx, GuardVerdict, Pipeline, RejectReason};
+pub use net::NetServer;
+pub use server::{NetStats, Server, TickOutcome};
 pub use sim::{ShotResult, Sim};
 
 #[cfg(test)]

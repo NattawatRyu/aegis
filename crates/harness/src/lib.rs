@@ -5,16 +5,21 @@
 //! how "the speedhack is blocked" becomes a number instead of a claim.
 //!
 //! Everything goes through the wire: each bot's messages are encoded to bytes
-//! and decoded by the packet guard, exactly as a UDP server would receive them.
-//! The bot's slot stands in for the source address, so a datagram that fails
-//! to decode is still attributed to the player who sent it.
+//! and handed to [`Server::receive`] with the bot's source address, exactly as
+//! the UDP loop does. Two transports carry those bytes:
+//!   - [`run`] — in-process, deterministic (no sockets, no clock, no RNG): two
+//!     runs of the same scenario produce byte-identical telemetry.
+//!   - [`run_udp`] — real sockets over loopback, one IP per bot, driven in
+//!     lockstep (each tick reads exactly the datagrams that were sent). Its
+//!     telemetry must be byte-identical to [`run`]'s: the in-process run is
+//!     the oracle for the network one.
 //!
-//! In-process and deterministic (no sockets, no clock, no RNG): two runs of the
-//! same scenario produce byte-identical telemetry. The dispatch in [`World`]
-//! is server logic; it moves into the server crate when the UDP loop arrives
-//! (pillar D).
+//! All server behaviour lives in [`aegis_server`]; this crate only drives bots
+//! against it and keeps the lab's measurements (kills, largest step).
 
-use std::collections::BTreeSet;
+use std::io;
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::time::Duration;
 
 use aegis_client_sdk::{
     aimbot::AimbotBot, badversion::BadVersionBot, flood::FloodBot, garbage::GarbageBot,
@@ -22,14 +27,19 @@ use aegis_client_sdk::{
     speedhack::SpeedhackBot, Bot, BotCtx,
 };
 use aegis_detector::{Flag, Suite};
-use aegis_protocol::{encode, ClientMsg, PlayerId, Vec2};
-use aegis_server::guards::{joined, packet, version};
-use aegis_server::{ClientInput, GuardCtx, GuardVerdict, Pipeline, Sim};
+use aegis_protocol::{decode, encode, PlayerId, PlayerState, ServerMsg, Vec2};
+use aegis_server::net::MAX_DATAGRAM;
+use aegis_server::{NetServer, NetStats, Server, TickOutcome};
 use aegis_telemetry::{Telemetry, Totals};
 
 /// Bots spawn evenly on a circle this far from the center — inside every
 /// bot's shot range, so the aimbot always has targets.
 pub const SPAWN_RADIUS: f32 = 20.0;
+
+/// How long the UDP run waits for a datagram it knows was sent before calling
+/// it lost. Loopback does not drop under this load; if it ever does, the run
+/// fails loudly instead of comparing a short tick.
+pub const UDP_WAIT: Duration = Duration::from_secs(2);
 
 pub struct Scenario {
     pub name: &'static str,
@@ -76,10 +86,9 @@ pub const LOBBY_SIZE: u32 = 4;
 
 #[derive(Debug)]
 pub struct BotReport {
-    pub id: PlayerId,
     pub name: &'static str,
-    /// Join passed the version guard and the player was spawned.
-    pub joined: bool,
+    /// The id the server issued — `None` if its join was never legal.
+    pub id: Option<PlayerId>,
     pub totals: Totals,
     /// Shots that count as aim evidence — the `Shot` records in telemetry, so
     /// the detector and this report count the same thing. Point-blank shots
@@ -99,9 +108,16 @@ pub struct Report {
     pub ticks: u32,
     pub bots: Vec<BotReport>,
     pub telemetry: Telemetry,
+    /// Datagrams dropped with no player to pin them on (source-rate drops,
+    /// anything from an address that never joined).
+    pub net: NetStats,
 }
 
 impl BotReport {
+    pub fn joined(&self) -> bool {
+        self.id.is_some()
+    }
+
     pub fn accuracy(&self) -> f32 {
         if self.shots == 0 {
             0.0
@@ -117,63 +133,20 @@ impl Report {
     }
 }
 
-/// Server-side state for one run.
-struct World {
-    sim: Sim,
-    pipe: Pipeline,
-    tel: Telemetry,
-    joined: BTreeSet<PlayerId>,
+fn spawns(n: usize) -> Vec<Vec2> {
+    (0..n)
+        .map(|i| {
+            let a = std::f32::consts::TAU * i as f32 / n as f32;
+            Vec2::new(SPAWN_RADIUS * a.cos(), SPAWN_RADIUS * a.sin())
+        })
+        .collect()
 }
 
-impl World {
-    /// Receive one datagram from `player`. Returns the input to fold into the
-    /// sim if it got through every guard. Accepted joins are not recorded:
-    /// telemetry is the per-input stream the detector learns from.
-    fn receive(&mut self, tick: u32, player: PlayerId, bytes: &[u8], spawn: Vec2) -> Option<ClientInput> {
-        let msg = match packet::decode_client(bytes) {
-            Ok(m) => m,
-            Err(r) => return self.reject(tick, player, r.label()),
-        };
-        match msg {
-            ClientMsg::Join { protocol, .. } => {
-                match version::check_join(protocol) {
-                    Ok(()) if self.joined.insert(player) => self.sim.spawn(player, spawn),
-                    Ok(()) => {} // already in: a repeated join changes nothing
-                    Err(r) => {
-                        self.tel.reject(tick, player, r.label());
-                    }
-                }
-                None
-            }
-            ClientMsg::Input { seq, tick: client_tick, move_dir, aim, shoot } => {
-                if let Err(r) = joined::check_input(&self.joined, player) {
-                    return self.reject(tick, player, r.label());
-                }
-                let mut input = ClientInput { seq, tick: client_tick, move_dir, aim, shoot };
-                match self.pipe.run(&GuardCtx { tick, player }, &mut input) {
-                    GuardVerdict::Ok { anomaly } => {
-                        self.tel.accept(tick, player, anomaly);
-                        Some(input)
-                    }
-                    GuardVerdict::Rejected(r) => self.reject(tick, player, r.label()),
-                }
-            }
-        }
-    }
-
-    fn reject(&mut self, tick: u32, player: PlayerId, reason: &'static str) -> Option<ClientInput> {
-        self.tel.reject(tick, player, reason);
-        None
-    }
-}
-
-fn spawn_pos(i: usize, n: usize) -> Vec2 {
-    let a = std::f32::consts::TAU * i as f32 / n as f32;
-    Vec2::new(SPAWN_RADIUS * a.cos(), SPAWN_RADIUS * a.sin())
-}
-
-fn dist(a: Vec2, b: Vec2) -> f32 {
-    Vec2::new(a.x - b.x, a.y - b.y).len()
+/// Bot `i` sends from its own IP, as on a real network: the source-rate guard
+/// budgets per IP. The server takes 127.0.0.1. Both runs use these IPs, so
+/// both admit the same players in the same order.
+pub fn bot_ip(i: usize) -> Ipv4Addr {
+    Ipv4Addr::new(127, 0, 0, u8::try_from(i + 2).expect("at most 254 bots"))
 }
 
 /// Detector stats for every player across `lobbies` honest lobbies (seeds
@@ -184,86 +157,174 @@ pub fn honest_sweep(lobbies: u32) -> Vec<aegis_detector::PlayerStats> {
         .collect()
 }
 
+/// What the harness tracks per bot while the scenario runs, whichever
+/// transport carries the bytes. Indexed by bot slot.
+struct Lab {
+    ids: Vec<Option<PlayerId>>,
+    kills: Vec<u32>,
+    max_step: Vec<f32>,
+}
+
+impl Lab {
+    fn new(n: usize) -> Self {
+        Self { ids: vec![None; n], kills: vec![0; n], max_step: vec![0.0; n] }
+    }
+
+    fn ctx<'a>(&self, i: usize, tick: u32, snapshot: &'a [PlayerState]) -> BotCtx<'a> {
+        // An unadmitted bot has no id; 0 is never issued.
+        BotCtx { tick, my_id: self.ids[i].unwrap_or(0), snapshot }
+    }
+
+    fn slot(&self, p: PlayerId) -> usize {
+        self.ids.iter().position(|&x| x == Some(p)).expect("outcome for a player no bot owns")
+    }
+
+    fn measure(&mut self, out: TickOutcome) {
+        for p in out.kills {
+            let s = self.slot(p);
+            self.kills[s] += 1;
+        }
+        for (p, d) in out.steps {
+            let s = self.slot(p);
+            self.max_step[s] = self.max_step[s].max(d);
+        }
+    }
+
+    fn report(self, sc: &Scenario, tel: Telemetry, net: NetStats) -> Report {
+        let stats = aegis_detector::stats(tel.records());
+        let suite = Suite::standard();
+        let bots = sc
+            .bots
+            .iter()
+            .enumerate()
+            .map(|(i, bot)| {
+                let id = self.ids[i];
+                let totals = id.map(|p| tel.per_player(p)).unwrap_or_default();
+                let flags = id.and_then(|p| stats.get(&p)).map(|s| suite.check(s)).unwrap_or_default();
+                BotReport {
+                    name: bot.name(),
+                    id,
+                    shots: totals.shots,
+                    hits: totals.hits,
+                    totals,
+                    kills: self.kills[i],
+                    max_step: self.max_step[i],
+                    flags,
+                }
+            })
+            .collect();
+        Report { scenario: sc.name, ticks: sc.ticks, bots, telemetry: tel, net }
+    }
+}
+
+/// Run a scenario in-process: the server is called directly with each bot's
+/// address. Deterministic.
 pub fn run(mut sc: Scenario) -> Report {
     let n = sc.bots.len();
-    let id = |i: usize| (i + 1) as PlayerId;
-    let spawns: Vec<Vec2> = (0..n).map(|i| spawn_pos(i, n)).collect();
-    let mut w = World { sim: Sim::new(), pipe: Pipeline::standard(), tel: Telemetry::new(), joined: BTreeSet::new() };
-    let mut kills = vec![0u32; n];
-    let mut max_step = vec![0f32; n];
+    let addr = |i: usize| SocketAddr::from((bot_ip(i), 40000));
+    let mut server = Server::new(spawns(n));
+    let mut lab = Lab::new(n);
 
     // Tick 0: the handshake, over the wire like everything else.
     for (i, bot) in sc.bots.iter().enumerate() {
-        w.receive(0, id(i), &encode(&bot.join()), spawns[i]);
+        lab.ids[i] = server.receive(0, addr(i), &encode(&bot.join()));
     }
 
     for tick in 1..=sc.ticks {
-        w.sim.step_respawns();
-        let snapshot = w.sim.snapshot();
-        let mut accepted: Vec<(usize, ClientInput)> = Vec::new();
+        let snapshot = server.begin_tick();
         for (i, bot) in sc.bots.iter_mut().enumerate() {
-            let ctx = BotCtx { tick, my_id: id(i), snapshot: &snapshot };
-            for d in bot.datagrams(&ctx) {
-                if let Some(input) = w.receive(tick, id(i), &d, spawns[i]) {
-                    accepted.push((i, input));
+            // The server sends snapshots to admitted players only.
+            let seen: &[PlayerState] = if lab.ids[i].is_some() { &snapshot } else { &[] };
+            for d in bot.datagrams(&lab.ctx(i, tick, seen)) {
+                if let Some(id) = server.receive(tick, addr(i), &d) {
+                    lab.ids[i] = Some(id);
                 }
             }
         }
+        lab.measure(server.end_tick(tick));
+    }
 
-        // Shots resolve against the world the clients were shown (nobody has
-        // moved yet this tick), then everyone moves.
-        // Every shot resolves; only shots that say something about aim are
-        // recorded. No enemy, or an enemy point-blank, leaves no evidence
-        // either way (see `Sim::aim_error`).
-        for &(i, input) in &accepted {
-            if !input.shoot {
-                continue;
-            }
-            let err = w.sim.aim_error(id(i), input.aim);
-            let r = w.sim.apply_shot(id(i), input.aim);
-            kills[i] += r.is_some_and(|r| r.killed) as u32;
-            if let Some(err) = err {
-                w.tel.shot(tick, id(i), r.is_some(), err);
+    let (tel, net) = server.into_parts();
+    lab.report(&sc, tel, net)
+}
+
+/// Run a scenario over real UDP on loopback: a [`NetServer`] and one socket
+/// per bot. Lockstep, not real-time — each tick the server reads exactly as
+/// many datagrams as the bots sent — so the result does not depend on timing.
+/// What a bot sees (its id, the snapshot) comes off the wire.
+pub fn run_udp(mut sc: Scenario) -> io::Result<Report> {
+    let n = sc.bots.len();
+    let mut net = NetServer::bind((Ipv4Addr::LOCALHOST, 0), Server::new(spawns(n)))?;
+    let to = net.local_addr()?;
+    let socks = (0..n)
+        .map(|i| {
+            let s = UdpSocket::bind((bot_ip(i), 0))?;
+            s.set_read_timeout(Some(UDP_WAIT))?;
+            Ok(s)
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let mut lab = Lab::new(n);
+
+    for (i, bot) in sc.bots.iter().enumerate() {
+        socks[i].send_to(&encode(&bot.join()), to)?;
+    }
+    pump(&mut net, n)?;
+
+    for tick in 1..=sc.ticks {
+        net.begin_tick()?;
+        let mut sent = 0;
+        for (i, bot) in sc.bots.iter_mut().enumerate() {
+            // The server's word on who is admitted decides only whether to
+            // wait for a snapshot; what is in it is read off the socket.
+            let snapshot = match net.server().player_id(socks[i].local_addr()?) {
+                Some(_) => read_snapshot(&socks[i], tick, &mut lab.ids[i])?,
+                None => Vec::new(),
+            };
+            for d in bot.datagrams(&lab.ctx(i, tick, &snapshot)) {
+                socks[i].send_to(&d, to)?;
+                sent += 1;
             }
         }
-        for &(i, input) in &accepted {
-            let before = w.sim.player(id(i)).map(|p| p.pos);
-            w.sim.apply_move(id(i), input.move_dir);
-            if let (Some(a), Some(b)) = (before, w.sim.player(id(i)).map(|p| p.pos)) {
-                max_step[i] = max_step[i].max(dist(a, b));
+        pump(&mut net, sent)?;
+        lab.measure(net.end_tick());
+    }
+
+    let (tel, stats) = net.into_server().into_parts();
+    Ok(lab.report(&sc, tel, stats))
+}
+
+/// Feed the server exactly `expected` datagrams, or fail.
+fn pump(net: &mut NetServer, expected: usize) -> io::Result<()> {
+    for got in 0..expected {
+        if !net.recv_one(UDP_WAIT)? {
+            let msg = format!("tick {}: lost {} of {} datagrams", net.tick(), expected - got, expected);
+            return Err(io::Error::new(io::ErrorKind::TimedOut, msg));
+        }
+    }
+    Ok(())
+}
+
+/// Read this tick's snapshot, taking any `Joined` that arrives first.
+fn read_snapshot(sock: &UdpSocket, tick: u32, id: &mut Option<PlayerId>) -> io::Result<Vec<PlayerState>> {
+    let mut buf = [0u8; MAX_DATAGRAM];
+    loop {
+        let n = sock.recv(&mut buf)?;
+        match decode::<ServerMsg>(&buf[..n]) {
+            Ok(ServerMsg::Joined { player_id, .. }) => *id = Some(player_id),
+            Ok(ServerMsg::Snapshot { tick: t, players }) if t == tick => return Ok(players),
+            other => {
+                let msg = format!("tick {tick}: expected a snapshot, got {other:?}");
+                return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
             }
         }
     }
-
-    let stats = aegis_detector::stats(w.tel.records());
-    let suite = Suite::standard();
-    let bots = sc
-        .bots
-        .iter()
-        .enumerate()
-        .map(|(i, bot)| {
-            let totals = w.tel.per_player(id(i));
-            let flags = stats.get(&id(i)).map(|s| suite.check(s)).unwrap_or_default();
-            BotReport {
-                id: id(i),
-                name: bot.name(),
-                joined: w.joined.contains(&id(i)),
-                shots: totals.shots,
-                hits: totals.hits,
-                totals,
-                kills: kills[i],
-                max_step: max_step[i],
-                flags,
-            }
-        })
-        .collect();
-    Report { scenario: sc.name, ticks: sc.ticks, bots, telemetry: w.tel }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aegis_client_sdk::garbage;
+    use aegis_client_sdk::{flood, garbage};
+    use aegis_server::guards::source_rate::MAX_PER_TICK;
     use aegis_server::sim::MOVE_SPEED;
     use aegis_detector::detectors::{accuracy, aim_exact, anomaly_rate};
     use aegis_detector::FlagReason;
@@ -277,11 +338,17 @@ mod tests {
         b.totals.rejected.get(reason).copied().unwrap_or(0)
     }
 
+    fn jsonl(t: &Telemetry) -> Vec<u8> {
+        let mut v = Vec::new();
+        t.write_jsonl(&mut v).unwrap();
+        v
+    }
+
     #[test]
     fn honest_passes_clean() {
         let r = standard();
         let b = r.bot("honest");
-        assert!(b.joined);
+        assert!(b.joined());
         assert_eq!(b.totals.accepted, r.ticks);
         assert_eq!(b.totals.anomalies, 0);
         assert_eq!(b.totals.total_rejected(), 0);
@@ -303,14 +370,17 @@ mod tests {
         }
     }
 
+    /// Two layers: source_rate drops everything past the cap undecoded (a
+    /// counter, no record), then input_rate lets one of the rest through.
     #[test]
-    fn flood_gets_exactly_one_input_per_tick() {
+    fn flood_gets_exactly_one_input_per_tick_and_most_is_never_decoded() {
         let r = standard();
         let b = r.bot("flood");
+        let per_tick = flood::DEFAULT_PER_TICK as u32;
         assert_eq!(b.totals.accepted, r.ticks);
-        // FloodBot::default sends 50 per tick; all but the first are rejected.
-        assert_eq!(rejected(b, "rate_exceeded"), 49 * r.ticks);
-        assert_eq!(b.totals.total_rejected(), 49 * r.ticks);
+        assert_eq!(rejected(b, "rate_exceeded"), (MAX_PER_TICK - 1) * r.ticks);
+        assert_eq!(b.totals.total_rejected(), (MAX_PER_TICK - 1) * r.ticks);
+        assert_eq!(r.net.get("source_rate"), u64::from((per_tick - MAX_PER_TICK) * r.ticks));
     }
 
     #[test]
@@ -321,23 +391,26 @@ mod tests {
         assert_eq!(rejected(b, "replay"), r.ticks - 1);
     }
 
+    /// No legal join, no id: badversion leaves no per-player record at all,
+    /// only counters — and costs no id that a real player could have had.
     #[test]
-    fn badversion_never_spawns_and_every_input_is_refused() {
+    fn badversion_never_gets_an_id_and_every_input_is_refused() {
         let r = standard();
         let b = r.bot("badversion");
-        assert!(!b.joined);
-        assert_eq!(rejected(b, "bad_version"), 1);
-        assert_eq!(rejected(b, "not_joined"), r.ticks);
-        assert_eq!(b.totals.accepted, 0);
-        assert!(r.telemetry.records().iter().all(|rec| rec.player != b.id || rec.tick == 0
-            || matches!(rec.outcome, aegis_telemetry::Outcome::Rejected { reason: "not_joined" })));
+        assert!(!b.joined());
+        assert_eq!(b.totals, Totals::default());
+        assert_eq!(r.net.get("bad_version"), 1);
+        assert_eq!(r.net.get("not_joined"), u64::from(r.ticks));
+        let mut ids: Vec<PlayerId> = r.bots.iter().filter_map(|b| b.id).collect();
+        ids.sort();
+        assert_eq!(ids, (1..=r.bots.len() as PlayerId - 1).collect::<Vec<_>>());
     }
 
     #[test]
     fn garbage_is_dropped_at_decode() {
         let r = standard();
         let b = r.bot("garbage");
-        assert!(b.joined); // the join was legal: only the packet guard stands in the way
+        assert!(b.joined()); // the join was legal: only the packet guard stands in the way
         assert_eq!(b.totals.accepted, 0);
         assert_eq!(rejected(b, "malformed_packet"), garbage::SHAPES as u32 * r.ticks);
     }
@@ -346,21 +419,24 @@ mod tests {
     fn nan_is_stopped_by_sanity_before_the_sim() {
         let r = standard();
         let b = r.bot("nan");
-        assert!(b.joined);
+        assert!(b.joined());
         assert_eq!(b.totals.accepted, 0);
         assert_eq!(rejected(b, "malformed_input"), r.ticks);
         assert_eq!(b.shots, 0); // a NaN aim never reached apply_shot
     }
 
     /// Coverage: every reject reason the server has is produced by some bot in
-    /// the standard scenario. A guard no bot trips is a guard nobody has seen
-    /// fire.
+    /// the standard scenario — on a player's record or, for datagrams with no
+    /// player, in the net counters. A guard no bot trips is a guard nobody has
+    /// seen fire.
     #[test]
     fn every_reject_reason_fires() {
         let r = standard();
         let all = r.telemetry.totals();
         for reason in RejectReason::ALL {
-            assert!(all.rejected.get(reason.label()).copied().unwrap_or(0) > 0, "{} never fired", reason.label());
+            let l = reason.label();
+            let n = u64::from(all.rejected.get(l).copied().unwrap_or(0)) + r.net.get(l);
+            assert!(n > 0, "{l} never fired");
         }
     }
 
@@ -434,7 +510,7 @@ mod tests {
         // The detector reads telemetry, not the harness counters; the aimbot's
         // snaps must be visible there as near-zero aim_err.
         let r = standard();
-        let id = r.bot("aimbot").id;
+        let id = r.bot("aimbot").id.unwrap();
         let errs: Vec<f32> = r
             .telemetry
             .records()
@@ -450,10 +526,26 @@ mod tests {
 
     #[test]
     fn same_scenario_same_bytes() {
-        let (mut a, mut b) = (Vec::new(), Vec::new());
-        standard().telemetry.write_jsonl(&mut a).unwrap();
-        standard().telemetry.write_jsonl(&mut b).unwrap();
+        let (a, b) = (jsonl(&standard().telemetry), jsonl(&standard().telemetry));
         assert!(!a.is_empty());
         assert_eq!(a, b);
+    }
+
+    /// The oracle for the network: the same scenario over real UDP sockets
+    /// produces the same telemetry, byte for byte, as the in-process run —
+    /// and the same ids, kills, steps and net counters.
+    #[test]
+    fn udp_run_matches_in_process_byte_for_byte() {
+        let (mem, udp) = (standard(), run_udp(Scenario::standard()).unwrap());
+        let (a, b) = (jsonl(&udp.telemetry), jsonl(&mem.telemetry));
+        if a != b {
+            let (a, b) = (String::from_utf8(a).unwrap(), String::from_utf8(b).unwrap());
+            let (line, (u, m)) = a.lines().zip(b.lines()).enumerate().find(|(_, (u, m))| u != m).unwrap_or_default();
+            panic!("telemetry differs at line {}:\n  udp:        {u}\n  in-process: {m}", line + 1);
+        }
+        assert_eq!(udp.net, mem.net);
+        for (u, m) in udp.bots.iter().zip(&mem.bots) {
+            assert_eq!((u.name, u.id, u.kills, u.max_step), (m.name, m.id, m.kills, m.max_step));
+        }
     }
 }

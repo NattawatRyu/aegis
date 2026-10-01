@@ -5,7 +5,9 @@ resist **cheating** and **DDoS** from day one — by fixing the *architecture*,
 not by chasing individual cheats.
 
 > Status: **pre-alpha.** Step 1 (Lab / Testbed) and Step 2 (detector v0,
-> offline rules) done: in-process, no network yet. Nothing here is
+> offline rules) done; Step 3 (pillar D) in progress — the server now runs
+> over real UDP with a per-IP pre-decode rate limit. Source addresses are not
+> yet authenticated (session token is next). Nothing here is
 > production-ready.
 
 ## Why
@@ -47,7 +49,8 @@ illegal regardless of intent.
 ```
 crates/
   protocol/     wire types — the intent-only contract every crate depends on
-  server/       authoritative sim + guards (one defense per file in guards/)
+  server/       authoritative sim + guards (one defense per file in guards/),
+                and the UDP loop (net.rs)
   client-sdk/   programmable bots: honest + one cheat per file
   telemetry/    guard verdicts + shot evidence as jsonl, for the detector
   detector/     pillar C: one detector per file, flags for human review
@@ -59,7 +62,14 @@ Run the lab:
 
 ```
 cargo run -p aegis-harness            # every bot vs guards + detector
+cargo run -p aegis-harness -- --udp   # same, over real UDP on loopback
 cargo run -p aegis-harness -- sweep   # honest population per detector signal
+```
+
+The UDP run must write telemetry byte-identical to the in-process run:
+
+```
+cmp scenarios/out/standard.jsonl scenarios/out/standard.udp.jsonl
 ```
 
 ## License

@@ -1,7 +1,9 @@
 //! FloodBot — emits many valid inputs in a single tick to try to act more than
-//! once per tick. Countered by the input_rate guard (G4): only the first is
-//! folded, the rest are rejected. Each input has an increasing seq and a legal
-//! move vector, so *only* the rate guard should stop them.
+//! once per tick, and to make the server pay to decode each one. Countered by
+//! two guards: source_rate drops everything past its per-IP cap before decode,
+//! then input_rate (G4) folds only the first of the rest. Each input has an
+//! increasing seq and a legal move vector, so *only* the rate guards should
+//! stop them.
 
 use super::{Bot, BotCtx};
 use aegis_protocol::{ClientMsg, Vec2};
@@ -17,9 +19,13 @@ impl FloodBot {
     }
 }
 
+/// Datagrams per tick from [`FloodBot::default`] — well past the server's
+/// per-IP source-rate cap, so both rate guards have work to do.
+pub const DEFAULT_PER_TICK: usize = 50;
+
 impl Default for FloodBot {
     fn default() -> Self {
-        Self::new(50)
+        Self::new(DEFAULT_PER_TICK)
     }
 }
 

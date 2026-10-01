@@ -8,3 +8,4 @@ description = "Aegis authoritative game server: the sim owns the truth; guards r
 
 [dependencies]
 aegis-protocol = { path = "../protocol" }
+aegis-telemetry = { path = "../telemetry" }

@@ -2,6 +2,10 @@
 //! stopped and what the detector flagged, and write the telemetry to
 //! `scenarios/out/<scenario>.jsonl`.
 //!
+//! `aegis-harness --udp` runs the same scenario over real UDP sockets on
+//! loopback and writes `<scenario>.udp.jsonl` — which must be byte-identical
+//! to the in-process file.
+//!
 //! `aegis-harness sweep [lobbies]` instead runs that many honest lobbies and
 //! prints how the honest population scores on every detector signal — the
 //! measurement the detector thresholds are set from.
@@ -9,7 +13,7 @@
 use std::path::PathBuf;
 
 use aegis_detector::detectors::aim_exact::EXACT_RAD;
-use aegis_harness::{honest_sweep, run, Scenario};
+use aegis_harness::{honest_sweep, run, run_udp, Scenario};
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -18,10 +22,12 @@ fn main() -> std::io::Result<()> {
         sweep(lobbies);
         return Ok(());
     }
+    let udp = args.get(1).map(String::as_str) == Some("--udp");
 
-    let r = run(Scenario::standard());
+    let r = if udp { run_udp(Scenario::standard())? } else { run(Scenario::standard()) };
 
-    println!("scenario: {}  ticks: {}\n", r.scenario, r.ticks);
+    let transport = if udp { "udp loopback" } else { "in-process" };
+    println!("scenario: {}  ticks: {}  transport: {}\n", r.scenario, r.ticks, transport);
     println!(
         "{:<11} {:>6} {:>8} {:>7}  {:<32} {:>5} {:>5} {:>5} {:>5} {:>8}  flags",
         "bot", "joined", "accepted", "anomaly", "rejected", "shots", "hits", "acc", "kills", "max_step"
@@ -39,14 +45,16 @@ fn main() -> std::io::Result<()> {
         };
         println!(
             "{:<11} {:>6} {:>8} {:>7}  {:<32} {:>5} {:>5} {:>5.2} {:>5} {:>8.3}  {}",
-            b.name, b.joined, b.totals.accepted, b.totals.anomalies, rejected,
+            b.name, b.joined(), b.totals.accepted, b.totals.anomalies, rejected,
             b.shots, b.hits, b.accuracy(), b.kills, b.max_step, flags
         );
     }
+    let net = r.net.dropped.iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(", ");
+    println!("\nno player to pin it on (counters only): {}", if net.is_empty() { "-" } else { &net });
 
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scenarios/out");
     std::fs::create_dir_all(&dir)?;
-    let file = format!("{}.jsonl", r.scenario);
+    let file = format!("{}{}.jsonl", r.scenario, if udp { ".udp" } else { "" });
     r.telemetry.save(dir.join(&file))?;
     println!("\n{} records -> scenarios/out/{}", r.telemetry.len(), file);
     Ok(())

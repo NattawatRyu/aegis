@@ -15,9 +15,10 @@ pub const MIN_SHOTS: u32 = 30;
 
 /// Flag strictly above this hit rate.
 ///
-/// Measured (`aegis-harness sweep 250`, 1000 honest bots, 2026-09-30):
-/// p50 0.228, p99 0.384, max 0.438. Both aimbots: 0.98-0.99. The line sits
-/// ~1.8x the best honest run, because a real player population has a fatter
+/// Measured (`aegis-harness sweep 250`, 1000 honest bots, 2026-10-02, walled
+/// arena + culled snapshots): p50 0.112, p99 0.199, max 0.231. Both aimbots:
+/// 0.96-0.99. (Open arena, 2026-09-30: max 0.438.) The line sits ~1.8x the
+/// open-arena best honest run, because a real player population has a fatter
 /// top tail than one seeded bot — re-measure on real telemetry before
 /// trusting it on a live game.
 pub const THRESHOLD: f32 = 0.8;

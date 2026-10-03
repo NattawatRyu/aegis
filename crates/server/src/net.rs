@@ -20,41 +20,192 @@
 //!
 //! Source addresses can be forged; that is answered in [`Server::receive`] by
 //! the session token (see [`crate::guards::session`]), not here.
+//!
+//! Behind a relay ([`NetServer::behind_relay`], the `aegis-relay` crate) this
+//! socket is the origin: it hears only the relay, reads each datagram's real
+//! client address out of its envelope, and answers through the relay.
 
 use std::io::{self, ErrorKind};
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use aegis_protocol::{encode, ServerMsg, TICK_HZ};
+use aegis_protocol::{encode, unwrap, wrap, Dir, EnvelopeError, LinkKey, ServerMsg, ENVELOPE_MAX, TICK_HZ};
 
 use crate::{Server, TickOutcome};
 
 /// One tick of wall-clock time at [`TICK_HZ`].
 pub const TICK: Duration = Duration::from_nanos(1_000_000_000 / TICK_HZ as u64);
 
-/// Receive buffer. Every legal client message is far smaller; anything that
-/// does not fit is not a client message.
-pub const MAX_DATAGRAM: usize = 2048;
+pub use aegis_protocol::MAX_DATAGRAM;
 
 /// [`crate::NetStats`] label for a datagram larger than [`MAX_DATAGRAM`]
 /// (Windows reports these as an error instead of truncating them).
 pub const OVERSIZE: &str = "oversize";
 
+/// [`crate::NetStats`] label, behind a relay: a datagram from any address
+/// but the relay's. Someone found the origin and is talking to it directly.
+pub const NOT_RELAY: &str = "not_relay";
+
+/// [`crate::NetStats`] label, behind a relay: an authentic envelope that is
+/// not well-formed, or a datagram too short to carry a MAC.
+pub const BAD_ENVELOPE: &str = "bad_envelope";
+
+/// [`crate::NetStats`] label, behind a relay: a datagram from the relay's
+/// address whose MAC is wrong — someone forging the relay's source address
+/// without the link key.
+pub const BAD_MAC: &str = "bad_mac";
+
+/// [`crate::NetStats`] label: a datagram read off the socket while
+/// [`BACKLOG`] were already waiting for the tick loop, dropped.
+pub const BACKLOG_FULL: &str = "backlog_full";
+
+/// Most datagrams that may wait between the reader and the tick loop. A
+/// flood faster than the loop can judge is dropped here, at a fixed memory
+/// cost, as the kernel's own socket buffer would — never queued without
+/// bound. Several ticks of a full lobby's traffic.
+pub const BACKLOG: usize = 4096;
+
 /// WSAEMSGSIZE: the datagram was larger than the buffer, and is gone.
 const WSAEMSGSIZE: i32 = 10040;
+
+/// What the reader thread hands the tick loop.
+enum Rx {
+    Datagram(SocketAddr, Vec<u8>),
+    Oversize,
+}
+
+/// The socket's one reader: a thread in a blocking `recv_from` with **no
+/// read timeout**, passing every datagram, in order, down a channel. The
+/// tick loop waits on the channel, whose timeout is safe. A read timeout on
+/// the socket itself is suspect on Windows: the relay lost datagrams with a
+/// 10 ms poll (4 of 12 parallel runs, 0 of 12 after going blocking), and the
+/// old read-to-deadline loop of this file, replayed on a bare socket under
+/// load, lost 1 datagram in 20000 in 4 of 35 runs against 0 of 35 for this
+/// reader (2026-10-02). Suggestive, not proof of mechanism — part may be the
+/// socket buffer overflowing while the tick loop is busy, which a reader that
+/// never stops draining also helps. Guarded by
+/// `real_time_ticks_read_every_datagram`.
+struct Reader {
+    rx: Receiver<io::Result<Rx>>,
+    /// Datagrams dropped because the backlog was full, not yet counted.
+    full: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    wake: SocketAddr,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Reader {
+    /// A reader holding at most `backlog` datagrams for the tick loop.
+    fn spawn(sock: UdpSocket, backlog: usize) -> io::Result<Self> {
+        let local = sock.local_addr()?;
+        let wake = match local.ip() {
+            ip if ip.is_unspecified() && local.is_ipv4() => SocketAddr::new(Ipv4Addr::LOCALHOST.into(), local.port()),
+            ip if ip.is_unspecified() => SocketAddr::new(Ipv6Addr::LOCALHOST.into(), local.port()),
+            _ => local,
+        };
+        let (tx, rx) = mpsc::sync_channel(backlog);
+        let full = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (f, flag) = (full.clone(), stop.clone());
+        let thread = std::thread::spawn(move || read_loop(&sock, &tx, &f, &flag));
+        Ok(Self { rx, full, stop, wake, thread: Some(thread) })
+    }
+}
+
+impl Drop for Reader {
+    /// Unblock the read with one empty datagram; the thread checks the flag
+    /// before handling anything it reads.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let local: SocketAddr = if self.wake.is_ipv4() { (Ipv4Addr::LOCALHOST, 0).into() } else { (Ipv6Addr::LOCALHOST, 0).into() };
+        if let Ok(w) = UdpSocket::bind(local) {
+            let _ = w.send_to(&[], self.wake);
+        }
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+fn read_loop(sock: &UdpSocket, tx: &SyncSender<io::Result<Rx>>, full: &AtomicU64, stop: &AtomicBool) {
+    let mut buf = vec![0u8; MAX_DATAGRAM + ENVELOPE_MAX];
+    loop {
+        let got = sock.recv_from(&mut buf);
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let item = match got {
+            Ok((n, peer)) => Ok(Rx::Datagram(peer, buf[..n].to_vec())),
+            Err(e) if e.raw_os_error() == Some(WSAEMSGSIZE) => Ok(Rx::Oversize),
+            // Windows: an earlier send went to a closed port. Says nothing
+            // about this socket; one client leaving must not stop the server.
+            Err(e) if e.kind() == ErrorKind::ConnectionReset => continue,
+            Err(e) => Err(e),
+        };
+        if item.is_err() {
+            // The socket is broken: hand the error over (waiting for room —
+            // it is the last thing sent) and stop.
+            let _ = tx.send(item);
+            return;
+        }
+        match tx.try_send(item) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                full.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Disconnected(_)) => return,
+        }
+    }
+}
 
 pub struct NetServer {
     server: Server,
     sock: UdpSocket,
+    reader: Reader,
     tick: u32,
-    buf: Vec<u8>,
     /// Replies sent, when a lockstep driver asked to see them.
     reply_log: Option<Vec<(SocketAddr, ServerMsg)>>,
+    /// The relay this server is the origin behind, and the key they share.
+    relay: Option<(SocketAddr, LinkKey)>,
 }
 
 impl NetServer {
     pub fn bind(addr: impl ToSocketAddrs, server: Server) -> io::Result<Self> {
-        Ok(Self { server, sock: UdpSocket::bind(addr)?, tick: 0, buf: vec![0; MAX_DATAGRAM], reply_log: None })
+        let sock = UdpSocket::bind(addr)?;
+        let reader = Reader::spawn(sock.try_clone()?, BACKLOG)?;
+        Ok(Self { server, sock, reader, tick: 0, reply_log: None, relay: None })
+    }
+
+    /// Become the origin behind the relay whose upstream socket is `relay`,
+    /// sharing `key` with it: from now on only datagrams from that address
+    /// with a valid MAC are read (each a [`wrap`]ped client datagram, judged
+    /// against the client's address), and everything sent goes to it
+    /// wrapped. A client never receives a byte from this socket, so it never
+    /// learns this address; and forging the relay's address is not enough to
+    /// speak for a client without the key.
+    ///
+    /// Not a firewall: a datagram from elsewhere is dropped after it has
+    /// crossed the link, so a flood at a leaked origin address still fills
+    /// it. What protects the origin is that its address is never published.
+    ///
+    /// Tokens issued from now on are MAC'd under `key` too, so the relay can
+    /// drop a forged token before it crosses ([`Server::share_token_key`]):
+    /// call this before anyone joins.
+    pub fn behind_relay(&mut self, relay: SocketAddr, key: LinkKey) {
+        self.relay = Some((relay, key));
+        self.server.share_token_key(key);
+    }
+
+    /// Send `bytes` to client `to`: directly, or wrapped through the relay.
+    fn send(&self, to: SocketAddr, bytes: &[u8]) {
+        let _ = match &self.relay {
+            Some((r, key)) => self.sock.send_to(&wrap(key, Dir::Down, to, bytes), r),
+            None => self.sock.send_to(bytes, to),
+        };
     }
 
     /// For a lockstep driver (the harness): record every reply sent, so it
@@ -87,54 +238,58 @@ impl NetServer {
         self.server
     }
 
-    /// Advance to the next tick and send its snapshot to every admitted
-    /// address. A send that fails is that client's problem, not the tick's.
+    /// Advance to the next tick and send every admitted address its player's
+    /// view — never the whole world. A send that fails is that client's
+    /// problem, not the tick's.
     pub fn begin_tick(&mut self) -> io::Result<()> {
         self.tick += 1;
-        let snap = encode(&ServerMsg::Snapshot { tick: self.tick, players: self.server.begin_tick(self.tick) });
-        for (to, _) in self.server.peers() {
-            let _ = self.sock.send_to(&snap, to);
+        self.server.begin_tick(self.tick);
+        for (to, id) in self.server.peers() {
+            let snap = encode(&ServerMsg::Snapshot { tick: self.tick, players: self.server.sim().view(id) });
+            self.send(to, &snap);
         }
         Ok(())
     }
 
     /// Wait up to `wait` for one datagram and feed it to the server. Returns
-    /// whether a datagram was consumed.
-    ///
-    /// Errors that say something about one earlier packet rather than about
-    /// the socket are skipped, not returned: on Windows a datagram sent to a
-    /// client that has gone away makes a later `recv_from` fail with
-    /// ConnectionReset, and one client leaving must not stop the server.
+    /// whether a datagram was consumed. The wait is on the reader's channel,
+    /// never a socket timeout (see [`Reader`]).
     pub fn recv_one(&mut self, wait: Duration) -> io::Result<bool> {
-        let deadline = Instant::now() + wait;
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            // A zero read timeout is an error, not "don't block".
-            self.sock.set_read_timeout(Some(left.max(Duration::from_millis(1))))?;
-            match self.sock.recv_from(&mut self.buf) {
-                Ok((n, from)) => {
-                    if let Some(reply) = self.server.receive(self.tick, from, &self.buf[..n]) {
-                        let msg = reply.to_msg(self.tick);
-                        let _ = self.sock.send_to(&encode(&msg), from);
-                        if let Some(log) = &mut self.reply_log {
-                            log.push((from, msg));
-                        }
-                    }
+        let full = self.reader.full.swap(0, Ordering::Relaxed);
+        self.server.count_drops(BACKLOG_FULL, full);
+        let (peer, datagram) = match self.reader.rx.recv_timeout(wait) {
+            Ok(Ok(Rx::Datagram(peer, d))) => (peer, d),
+            Ok(Ok(Rx::Oversize)) => {
+                self.server.count_drop(OVERSIZE);
+                return Ok(true);
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(RecvTimeoutError::Timeout) => return Ok(false),
+            Err(RecvTimeoutError::Disconnected) => return Err(io::Error::other("aegis-server: socket reader stopped")),
+        };
+        // Behind a relay: only the relay, and only an envelope.
+        let (from, bytes) = match &self.relay {
+            None => (peer, &datagram[..]),
+            Some((r, _)) if peer != *r => {
+                self.server.count_drop(NOT_RELAY);
+                return Ok(true);
+            }
+            Some((_, key)) => match unwrap(key, Dir::Up, &datagram) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.server.count_drop(if e == EnvelopeError::BadMac { BAD_MAC } else { BAD_ENVELOPE });
                     return Ok(true);
                 }
-                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => return Ok(false),
-                Err(e) if e.raw_os_error() == Some(WSAEMSGSIZE) => {
-                    self.server.count_drop(OVERSIZE);
-                    return Ok(true);
-                }
-                Err(e) if e.kind() == ErrorKind::ConnectionReset => {
-                    if left.is_zero() {
-                        return Ok(false);
-                    }
-                }
-                Err(e) => return Err(e),
+            },
+        };
+        if let Some(reply) = self.server.receive(self.tick, from, bytes) {
+            let msg = reply.to_msg(self.tick);
+            self.send(from, &encode(&msg));
+            if let Some(log) = &mut self.reply_log {
+                log.push((from, msg));
             }
         }
+        Ok(true)
     }
 
     /// Fold this tick's accepted inputs into the world.
@@ -266,6 +421,99 @@ mod tests {
         assert_eq!(connect(&mut n, &c).0, (1, 0));
     }
 
+    /// Read one wrapped datagram off the relay's socket.
+    fn read_wrapped(r: &UdpSocket) -> (SocketAddr, ServerMsg) {
+        let mut buf = [0u8; MAX_DATAGRAM + ENVELOPE_MAX];
+        let n = r.recv(&mut buf).expect("nothing came to the relay");
+        let (to, body) = unwrap(&KEY, Dir::Down, &buf[..n]).expect("origin sent the relay a bad envelope");
+        (to, decode(body).unwrap())
+    }
+
+    const KEY: LinkKey = [3; 16];
+
+    /// A datagram as the relay would forward it from client `c`.
+    fn up(c: SocketAddr, d: &[u8]) -> Vec<u8> {
+        wrap(&KEY, Dir::Up, c, d)
+    }
+
+    /// Behind a relay, the origin talks to the relay alone. A client that
+    /// found the origin's address gets nothing back, and nothing it sends is
+    /// read as a player; the same Join through the relay is answered, to the
+    /// relay, addressed to that client.
+    #[test]
+    fn behind_a_relay_only_the_relay_is_heard() {
+        let mut n = net();
+        let to = n.local_addr().unwrap();
+        let relay = client();
+        n.behind_relay(relay.local_addr().unwrap(), KEY);
+        let c = client();
+        c.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+
+        c.send_to(&join(), to).unwrap(); // straight at the origin
+        assert!(n.recv_one(WAIT).unwrap());
+        assert_eq!(n.server().net_stats().get(NOT_RELAY), 1);
+
+        let me = c.local_addr().unwrap();
+        relay.send_to(&up(me, &join()), to).unwrap();
+        assert!(n.recv_one(WAIT).unwrap());
+        let (dest, msg) = read_wrapped(&relay);
+        assert_eq!(dest, me);
+        let ServerMsg::Challenge { cookie } = msg else { panic!("expected Challenge, got {msg:?}") };
+        relay.send_to(&up(me, &join_with(Some(cookie))), to).unwrap();
+        assert!(n.recv_one(WAIT).unwrap());
+        assert!(matches!(read_wrapped(&relay), (d, ServerMsg::Joined { player_id: 1, .. }) if d == me));
+        assert_eq!(n.server().player_id(me), Some(1), "admitted under the client's address, not the relay's");
+
+        n.begin_tick().unwrap();
+        assert!(matches!(read_wrapped(&relay), (d, ServerMsg::Snapshot { tick: 1, .. }) if d == me));
+        let mut buf = [0u8; MAX_DATAGRAM];
+        assert!(c.recv(&mut buf).is_err(), "the origin sent a client a datagram");
+    }
+
+    /// Edge: from the relay's own address, a datagram that is not an
+    /// envelope is counted and dropped, not read as a client's.
+    #[test]
+    fn a_bad_envelope_from_the_relay_is_dropped() {
+        let mut n = net();
+        let to = n.local_addr().unwrap();
+        let relay = client();
+        n.behind_relay(relay.local_addr().unwrap(), KEY);
+        relay.send_to(&[9, 1, 2], to).unwrap();
+        assert!(n.recv_one(WAIT).unwrap());
+        assert_eq!(n.server().net_stats().get(BAD_ENVELOPE), 1);
+        assert_eq!(n.server().net_stats().get(NOT_RELAY), 0);
+    }
+
+    /// The link MAC at its edge. A sender at the relay's own address — what
+    /// forging that source address looks like to the origin — with the wrong
+    /// key gets nothing: its Join is not answered and no one is admitted. A
+    /// captured down envelope sent back up is refused too. The same Join
+    /// under the right key is answered.
+    #[test]
+    fn the_relays_address_without_the_key_speaks_for_no_one() {
+        let mut n = net();
+        let to = n.local_addr().unwrap();
+        let relay = client();
+        relay.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        n.behind_relay(relay.local_addr().unwrap(), KEY);
+        let victim: SocketAddr = "10.9.9.9:4000".parse().unwrap();
+
+        relay.send_to(&wrap(&[4; 16], Dir::Up, victim, &join()), to).unwrap();
+        assert!(n.recv_one(WAIT).unwrap());
+        assert_eq!(n.server().net_stats().get(BAD_MAC), 1);
+        let mut buf = [0u8; MAX_DATAGRAM + ENVELOPE_MAX];
+        assert!(relay.recv(&mut buf).is_err(), "a forged envelope was answered");
+
+        relay.send_to(&wrap(&KEY, Dir::Down, victim, &join()), to).unwrap();
+        assert!(n.recv_one(WAIT).unwrap());
+        assert_eq!(n.server().net_stats().get(BAD_MAC), 2);
+        assert!(relay.recv(&mut buf).is_err(), "a reversed envelope was answered");
+
+        relay.send_to(&up(victim, &join()), to).unwrap();
+        assert!(n.recv_one(WAIT).unwrap());
+        assert!(matches!(read_wrapped(&relay), (d, ServerMsg::Challenge { .. }) if d == victim));
+    }
+
     /// End to end: the token that makes an input count is the one that came
     /// back over the wire. The same input without it moves nobody.
     #[test]
@@ -285,5 +533,64 @@ mod tests {
         assert!(took >= TICK, "tick ended early: {took:?}");
         // Loose upper bound: a busy CI box can overshoot, but not by 10 ticks.
         assert!(took < TICK * 10, "tick overran: {took:?}");
+    }
+
+    /// The backlog at its edge: with nobody draining, exactly `cap` datagrams
+    /// wait and every one past that is dropped and counted — memory stays
+    /// fixed however hard the socket is flooded.
+    #[test]
+    fn backlog_holds_exactly_its_cap_and_counts_the_rest() {
+        const CAP: usize = 8;
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let to = sock.local_addr().unwrap();
+        let r = Reader::spawn(sock, CAP).unwrap();
+        let c = client();
+        for i in 0..CAP as u8 + 5 {
+            c.send_to(&[i], to).unwrap();
+        }
+        let t = Instant::now();
+        while r.full.load(Ordering::Relaxed) < 5 && t.elapsed() < WAIT {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(r.full.load(Ordering::Relaxed), 5);
+        // the first CAP, in order
+        for i in 0..CAP as u8 {
+            match r.rx.recv_timeout(WAIT) {
+                Ok(Ok(Rx::Datagram(_, d))) => assert_eq!(d, vec![i]),
+                _ => panic!("datagram {i} missing"),
+            }
+        }
+        assert!(r.rx.try_recv().is_err(), "more than CAP were kept");
+    }
+
+    /// Real-time ticks lose nothing. A sender streams datagrams across many
+    /// tick boundaries — every tick's read loop ends on its deadline, the
+    /// moment a datagram can be in flight — and every one is read: behind a
+    /// relay at an address no one uses, each datagram is exactly one
+    /// `not_relay`, so the count is exact.
+    #[test]
+    fn real_time_ticks_read_every_datagram() {
+        const N: u64 = 20000;
+        let mut n = net();
+        let to = n.local_addr().unwrap();
+        n.behind_relay("127.0.0.1:9".parse().unwrap(), [0; 16]);
+        let sender = std::thread::spawn(move || {
+            let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+            for i in 0..N {
+                s.send_to(&[1, 2, 3], to).unwrap();
+                if i % 16 == 0 {
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+            }
+        });
+        let start = Instant::now();
+        while !sender.is_finished() || n.server().net_stats().get(NOT_RELAY) < N {
+            n.run_tick().unwrap();
+            if start.elapsed() > Duration::from_secs(10) {
+                break;
+            }
+        }
+        sender.join().unwrap();
+        assert_eq!(n.server().net_stats().get(NOT_RELAY), N, "datagrams lost between ticks");
     }
 }

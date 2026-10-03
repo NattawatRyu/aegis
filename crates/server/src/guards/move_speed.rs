@@ -2,13 +2,19 @@
 //! STOPS: speedhack via move_dir magnitude (sending (10,0) to move 10x/tick)
 //! HOW:   clamp move_dir to unit length before the sim consumes it
 //! EDGE:  (10,0) -> len 1.0 (flagged anomaly) | exactly-unit untouched |
-//!        sub-unit untouched (no anomaly)
+//!        sub-unit untouched (no anomaly) | one ulp over unit (a normalized
+//!        vector's rounding) -> clamped, not flagged
 //!
 //! Honest clients never send a move vector longer than 1, so a clamp actually
 //! changing the vector is itself the anomaly signal — flagged, not blocked, so
 //! a legitimate float rounding edge never kicks a real player.
 
 use super::{ClientInput, GuardCtx, GuardVerdict, InputGuard};
+
+/// How far past unit length a move vector may be before the clamp counts as
+/// an anomaly. f32 normalization overshoots by ~1e-7; a speedhack worth
+/// running asks for far more than 0.01%.
+pub const ROUNDING_TOLERANCE: f32 = 1e-4;
 
 pub struct MoveSpeedGuard;
 
@@ -18,9 +24,9 @@ impl InputGuard for MoveSpeedGuard {
     }
 
     fn check(&mut self, _ctx: &GuardCtx, input: &mut ClientInput) -> GuardVerdict {
-        let before = input.move_dir;
+        let len = input.move_dir.len();
         input.move_dir = input.move_dir.clamped_unit();
-        GuardVerdict::Ok { anomaly: input.move_dir != before }
+        GuardVerdict::Ok { anomaly: len > 1.0 + ROUNDING_TOLERANCE }
     }
 }
 
@@ -48,6 +54,23 @@ mod tests {
         let mut i = with_move(Vec2::new(1.0, 0.0));
         assert_eq!(g.check(&GuardCtx { tick: 1, player: 1 }, &mut i), GuardVerdict::Ok { anomaly: false });
         assert_eq!(i.move_dir, Vec2::new(1.0, 0.0));
+    }
+
+    /// Edge: a client that normalizes its direction can land one f32 ulp over
+    /// unit length. That is clamped (no speed gained) but is not an anomaly;
+    /// anything past the tolerance still is.
+    #[test]
+    fn rounding_over_unit_is_clamped_not_flagged() {
+        let mut g = MoveSpeedGuard;
+        let ulp_over = Vec2::new(1.0 + f32::EPSILON, 0.0);
+        assert!(ulp_over.len() > 1.0);
+        let mut i = with_move(ulp_over);
+        assert_eq!(g.check(&GuardCtx { tick: 1, player: 1 }, &mut i), GuardVerdict::Ok { anomaly: false });
+        assert!(i.move_dir.len() <= 1.0);
+
+        let mut i = with_move(Vec2::new(1.0 + 2.0 * ROUNDING_TOLERANCE, 0.0));
+        assert_eq!(g.check(&GuardCtx { tick: 1, player: 1 }, &mut i), GuardVerdict::Ok { anomaly: true });
+        assert!(i.move_dir.len() <= 1.0);
     }
 
     #[test]

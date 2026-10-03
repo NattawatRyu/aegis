@@ -4,16 +4,24 @@
 //!
 //! `aegis-harness --udp` runs the same scenario over real UDP sockets on
 //! loopback and writes `<scenario>.udp.jsonl` — which must be byte-identical
-//! to the in-process file.
+//! to the in-process file. `aegis-harness --relay` does the same with the
+//! server as an origin behind a relay and writes `<scenario>.relay.jsonl` —
+//! also byte-identical.
 //!
 //! `aegis-harness sweep [lobbies]` instead runs that many honest lobbies and
 //! prints how the honest population scores on every detector signal — the
 //! measurement the detector thresholds are set from.
+//!
+//! `aegis-harness cull [lobbies] [max_lag]` replays honest lobbies and prints,
+//! per culling margin, what it leaks and how late a lagging client sees an
+//! enemy — the measurement `MAX_MARGIN_TICKS` is set from.
+//! `aegis-harness cull-scale [lobbies]` asks what that leak would be in a
+//! world where players move less per tick.
 
 use std::path::PathBuf;
 
 use aegis_detector::detectors::aim_exact::EXACT_RAD;
-use aegis_harness::{honest_sweep, run, run_udp, Scenario};
+use aegis_harness::{cull_sweep, honest_sweep, leak_by_step, run, run_relay, run_udp, Scenario};
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -22,15 +30,27 @@ fn main() -> std::io::Result<()> {
         sweep(lobbies);
         return Ok(());
     }
-    let udp = args.get(1).map(String::as_str) == Some("--udp");
+    if args.get(1).map(String::as_str) == Some("cull") {
+        let lobbies = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(50);
+        let max_lag = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(6);
+        cull(lobbies, max_lag);
+        return Ok(());
+    }
+    if args.get(1).map(String::as_str) == Some("cull-scale") {
+        cull_scale(args.get(2).and_then(|s| s.parse().ok()).unwrap_or(50));
+        return Ok(());
+    }
+    let mode = args.get(1).map(String::as_str);
+    let (r, transport, suffix) = match mode {
+        Some("--udp") => (run_udp(Scenario::standard())?, "udp loopback", ".udp"),
+        Some("--relay") => (run_relay(Scenario::standard())?, "udp loopback via relay", ".relay"),
+        _ => (run(Scenario::standard()), "in-process", ""),
+    };
 
-    let r = if udp { run_udp(Scenario::standard())? } else { run(Scenario::standard()) };
-
-    let transport = if udp { "udp loopback" } else { "in-process" };
     println!("scenario: {}  ticks: {}  transport: {}\n", r.scenario, r.ticks, transport);
     println!(
-        "{:<11} {:>6} {:>8} {:>7}  {:<32} {:>5} {:>5} {:>5} {:>5} {:>8}  flags",
-        "bot", "joined", "accepted", "anomaly", "rejected", "shots", "hits", "acc", "kills", "max_step"
+        "{:<11} {:>6} {:>8} {:>7}  {:<32} {:>5} {:>5} {:>5} {:>5} {:>8} {:>11}  flags",
+        "bot", "joined", "accepted", "anomaly", "rejected", "shots", "hits", "acc", "kills", "max_step", "hidden/wall"
     );
     for b in &r.bots {
         let rejected = if b.totals.rejected.is_empty() {
@@ -44,9 +64,9 @@ fn main() -> std::io::Result<()> {
             b.flags.iter().map(|f| format!("{} {:.2}", f.reason.label(), f.value)).collect::<Vec<_>>().join(", ")
         };
         println!(
-            "{:<11} {:>6} {:>8} {:>7}  {:<32} {:>5} {:>5} {:>5.2} {:>5} {:>8.3}  {}",
+            "{:<11} {:>6} {:>8} {:>7}  {:<32} {:>5} {:>5} {:>5.2} {:>5} {:>8.3} {:>11}  {}",
             b.name, b.joined(), b.totals.accepted, b.totals.anomalies, rejected,
-            b.shots, b.hits, b.accuracy(), b.kills, b.max_step, flags
+            b.shots, b.hits, b.accuracy(), b.kills, b.max_step, format!("{}/{}", b.hidden, b.walled), flags
         );
     }
     let net = r.net.dropped.iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(", ");
@@ -54,13 +74,52 @@ fn main() -> std::io::Result<()> {
     let t = r.bystander;
     let amp = if t.tx == 0 { 0.0 } else { t.rx as f64 / t.tx as f64 };
     println!("bystander (forged in its name): {} B sent as it, {} B sent to it, amplification {:.2}x", t.tx, t.rx, amp);
+    if let Some(e) = r.relay {
+        let seen = e.up + e.short + e.bad_token + e.oversize;
+        let cut = e.short + e.bad_token + e.oversize;
+        println!(
+            "relay edge: {} client datagrams in, {} forwarded, {} dropped ({:.0}%: bad_token {}, short {}, oversize {})",
+            seen, e.up, cut, 100.0 * cut as f64 / seen.max(1) as f64, e.bad_token, e.short, e.oversize
+        );
+    }
 
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scenarios/out");
     std::fs::create_dir_all(&dir)?;
-    let file = format!("{}{}.jsonl", r.scenario, if udp { ".udp" } else { "" });
+    let file = format!("{}{}.jsonl", r.scenario, suffix);
     r.telemetry.save(dir.join(&file))?;
     println!("\n{} records -> scenarios/out/{}", r.telemetry.len(), file);
     Ok(())
+}
+
+fn cull(lobbies: u32, max_lag: u32) {
+    let s = cull_sweep(lobbies, max_lag);
+    let pct = |n: u64, of: u64| 100.0 * n as f64 / of.max(1) as f64;
+    println!("honest lobbies: {lobbies}  visible pairs: {}  walled pairs: {}\n", s.visible, s.walled);
+    println!("late % (enemy in sight, missing from the snapshot sent `lag` ticks earlier) and leak % (walled, sent anyway)\n");
+    print!("{:<8} {:>7}", "margin", "leak%");
+    (0..=max_lag).for_each(|l| print!(" {:>7}", format!("lag {l}")));
+    println!();
+    for k in 0..=max_lag as usize {
+        print!("{:<8} {:>7.2}", k, pct(s.leaked[k], s.walled));
+        s.late[k].iter().for_each(|&n| print!(" {:>7.2}", pct(n, s.visible)));
+        println!();
+    }
+}
+
+fn cull_scale(lobbies: u32) {
+    const STEPS: [f32; 7] = [5.0, 2.5, 1.0, 0.5, 0.25, 0.1, 0.05];
+    const MAX_MARGIN: u32 = 6;
+    let (walled, leaked) = leak_by_step(lobbies, &STEPS, MAX_MARGIN);
+    println!("honest lobbies: {lobbies}  walled pairs: {walled}  (walls 8-10 units wide, 30 Hz)\n");
+    println!("leak % of walled pairs, by move step per tick and margin in ticks\n");
+    print!("{:<6} {:>7}", "step", "u/s");
+    (0..=MAX_MARGIN).for_each(|k| print!(" {:>6}", format!("m{k}")));
+    println!();
+    for (step, row) in STEPS.iter().zip(&leaked) {
+        print!("{:<6} {:>7.1}", step, step * 30.0);
+        row.iter().for_each(|&n| print!(" {:>6.2}", 100.0 * n as f64 / walled.max(1) as f64));
+        println!();
+    }
 }
 
 fn sweep(lobbies: u32) {

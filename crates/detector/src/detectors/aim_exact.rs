@@ -24,8 +24,9 @@ pub const EXACT_RAD: f32 = 1e-3;
 
 /// Flag strictly above this share of exact shots.
 ///
-/// Measured (`aegis-harness sweep 250`, 1000 honest bots, 2026-09-30):
-/// p50 0.007, p99 0.028, max 0.037. Snap aimbot: 0.99. At 0.25 the line is
+/// Measured (`aegis-harness sweep 250`, 1000 honest bots, 2026-10-02, walled
+/// arena + culled snapshots): p50 0.006, p99 0.025, max 0.040. Snap aimbot:
+/// 0.99. (Open arena, 2026-09-30: max 0.037.) At 0.25 the line is
 /// ~7x the best honest run and still catches an aimbot switched on for only
 /// a third of its shots (a "toggle" cheater).
 pub const THRESHOLD: f32 = 0.25;

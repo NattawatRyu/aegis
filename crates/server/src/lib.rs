@@ -10,6 +10,7 @@
 //! without owning a socket; [`net`] puts it behind a UDP socket. The
 //! in-process harness and the UDP loop drive the exact same code.
 
+pub mod cull;
 pub mod guards;
 pub mod net;
 pub mod server;
@@ -19,7 +20,8 @@ pub use guards::session::Session;
 pub use guards::{ClientInput, GuardCtx, GuardVerdict, Pipeline, RejectReason};
 pub use net::NetServer;
 pub use server::{NetStats, Reply, Server, TickOutcome};
-pub use sim::{ShotResult, Sim};
+pub use cull::{Cull, MAX_MARGIN_TICKS};
+pub use sim::{ShotResult, Sim, Wall, ARENA_WALLS};
 
 #[cfg(test)]
 mod integration {

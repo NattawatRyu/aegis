@@ -10,8 +10,18 @@ not by chasing individual cheats.
 > decode, so a forged source address can neither act as a player nor spend
 > its rate budget. Sessions are capped per IP and end after 5 s idle, so one
 > machine cannot fill the server. Joining takes a cookie round trip, so a
-> forged Join cannot point the server's traffic at a bystander. No encryption: an on-path attacker can
-> still read tokens.
+> forged Join cannot point the server's traffic at a bystander. The arena has
+> walls, and each client is sent only the players it can see, so a wallhack
+> has nothing to draw. The server can run as an origin behind a relay:
+> clients only ever hear from the relay's address, and the origin drops
+> anything not from the relay under the shared key. No encryption: an on-path attacker can still
+> read tokens. No latency margin on culling yet: an enemy appears the tick
+> it comes into sight. The relay-to-origin link is authenticated (a shared
+> key, a MAC per datagram) but not encrypted. The relay drops, statelessly,
+> any datagram whose session token was not issued for its source address
+> (tokens carry a MAC the relay can check) — 41% of the standard scenario's
+> client traffic never reaches the origin. Joins and per-IP budgets are
+> still judged at the origin.
 > Nothing here is production-ready.
 
 ## Why
@@ -58,6 +68,7 @@ crates/
   client-sdk/   programmable bots: honest + one cheat per file
   telemetry/    guard verdicts + shot evidence as jsonl, for the detector
   detector/     pillar C: one detector per file, flags for human review
+  relay/        pillar D: the only address clients see; forwards to a private origin
   harness/      runs every bot against the real guards + sim, reports per bot
 scenarios/out/  harness telemetry output (gitignored)
 ```
@@ -65,15 +76,19 @@ scenarios/out/  harness telemetry output (gitignored)
 Run the lab:
 
 ```
-cargo run -p aegis-harness            # every bot vs guards + detector
-cargo run -p aegis-harness -- --udp   # same, over real UDP on loopback
-cargo run -p aegis-harness -- sweep   # honest population per detector signal
+cargo run -p aegis-harness              # every bot vs guards + detector
+cargo run -p aegis-harness -- --udp     # same, over real UDP on loopback
+cargo run -p aegis-harness -- --relay   # same, server hidden behind a relay
+cargo run -p aegis-harness -- sweep     # honest population per detector signal
 ```
 
-The UDP run must write telemetry byte-identical to the in-process run:
+Both network runs must write telemetry byte-identical to the in-process run
+(the relay run also accounts, label by label, for every datagram it stopped
+at the edge):
 
 ```
 cmp scenarios/out/standard.jsonl scenarios/out/standard.udp.jsonl
+cmp scenarios/out/standard.jsonl scenarios/out/standard.relay.jsonl
 ```
 
 ## License

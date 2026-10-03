@@ -9,3 +9,4 @@ description = "Aegis wire protocol — the intent-only contract every crate depe
 [dependencies]
 serde.workspace = true
 bincode.workspace = true
+siphasher = "1"

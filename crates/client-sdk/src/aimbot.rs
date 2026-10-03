@@ -8,9 +8,11 @@
 //! That is the point. This bot proves that server-authoritative netcode + the
 //! input-trust guards are necessary but not sufficient: an aimbot plays inside
 //! the rules. Catching it needs the detector (pillar C, behavioural analysis of
-//! the telemetry stream), and taking away its inputs needs snapshot culling
-//! (pillar D). The lab exists so we can see this with our own eyes before we
-//! build C and D.
+//! the telemetry stream). Snapshot culling (pillar D) does not stop it: it only
+//! aims at players it can see, and those are in its view by design. Culling
+//! stops [`super::esp`] instead. In the walled arena culling even helps an
+//! aimbot a little — it no longer wastes shots on the nearest player behind a
+//! wall.
 
 use super::{my_pos, nearest_enemy, unit_towards, Bot, BotCtx};
 use aegis_protocol::{ClientMsg, Vec2};

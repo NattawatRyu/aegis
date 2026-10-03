@@ -17,6 +17,9 @@ pub struct HonestBot {
     seq: u32,
     walk: Vec2,
     rng: u32,
+    /// Where the last snapshot put it. Unchanged after a step means a wall
+    /// (or the arena edge) is in the way, so it turns.
+    last: Option<Vec2>,
 }
 
 impl HonestBot {
@@ -29,7 +32,7 @@ impl HonestBot {
     /// honest players, not one honest player many times. A zero seed would
     /// stall xorshift at 0 (perfect aim forever), so it is remapped.
     pub fn with_seed(seed: u32) -> Self {
-        Self { seq: 0, walk: Vec2::new(1.0, 0.0), rng: if seed == 0 { 0x9E37_79B9 } else { seed } }
+        Self { seq: 0, walk: Vec2::new(1.0, 0.0), rng: if seed == 0 { 0x9E37_79B9 } else { seed }, last: None }
     }
 
     /// Next aim error in [-AIM_ERROR_RAD, AIM_ERROR_RAD].
@@ -51,6 +54,12 @@ impl Bot for HonestBot {
 
     fn act(&mut self, ctx: &BotCtx) -> Vec<ClientMsg> {
         self.seq += 1;
+        // Stuck: turn a quarter left. Only what a player sees of itself.
+        let me = my_pos(ctx);
+        if me.is_some() && me == self.last {
+            self.walk = Vec2::new(-self.walk.y, self.walk.x);
+        }
+        self.last = me;
         let (aim, shoot) = match nearest_enemy(ctx) {
             Some(e) => {
                 let bearing = unit_towards(my_pos(ctx).unwrap_or(Vec2::ZERO), e.pos);
@@ -138,6 +147,25 @@ mod tests {
             _ => panic!("expected Input"),
         };
         assert_ne!(aim(1), aim(2));
+    }
+
+    fn walk_of(m: &ClientMsg) -> Vec2 {
+        match m {
+            ClientMsg::Input { move_dir, .. } => *move_dir,
+            _ => panic!("expected Input"),
+        }
+    }
+
+    /// Edge: a step that moved keeps the heading; the first snapshot with no
+    /// change turns it a quarter left, and a second one turns it again.
+    #[test]
+    fn turns_when_a_step_goes_nowhere() {
+        let mut b = HonestBot::new();
+        let at = |x| [state(1, Vec2::new(x, 0.0))];
+        assert_eq!(walk_of(&b.act(&BotCtx { tick: 1, my_id: 1, token: 0, snapshot: &at(0.0) })[0]), Vec2::new(1.0, 0.0));
+        assert_eq!(walk_of(&b.act(&BotCtx { tick: 2, my_id: 1, token: 0, snapshot: &at(5.0) })[0]), Vec2::new(1.0, 0.0));
+        assert_eq!(walk_of(&b.act(&BotCtx { tick: 3, my_id: 1, token: 0, snapshot: &at(5.0) })[0]), Vec2::new(-0.0, 1.0));
+        assert_eq!(walk_of(&b.act(&BotCtx { tick: 4, my_id: 1, token: 0, snapshot: &at(5.0) })[0]), Vec2::new(-1.0, -0.0));
     }
 
     #[test]

@@ -23,8 +23,10 @@ dependencies = [
  "aegis-client-sdk",
  "aegis-detector",
  "aegis-protocol",
+ "aegis-relay",
  "aegis-server",
  "aegis-telemetry",
+ "getrandom",
 ]
 
 [[package]]
@@ -33,6 +35,14 @@ version = "0.0.0"
 dependencies = [
  "bincode",
  "serde",
+ "siphasher",
+]
+
+[[package]]
+name = "aegis-relay"
+version = "0.0.0"
+dependencies = [
+ "aegis-protocol",
 ]
 
 [[package]]

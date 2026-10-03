@@ -12,6 +12,8 @@ use aegis_protocol::{frame, ClientMsg, PlayerId, PlayerState, Vec2, PROTOCOL_VER
 
 pub mod aimbot;
 pub mod badversion;
+pub mod direct;
+pub mod esp;
 pub mod flood;
 pub mod garbage;
 pub mod honest;
@@ -24,8 +26,8 @@ pub mod speedhack;
 pub mod spoof;
 
 /// What a bot sees before deciding this tick — the same information a real
-/// client has. An aimbot exploits `snapshot`; culling it (pillar D) is what
-/// takes that power away.
+/// client has. `snapshot` is the server's view for this player (pillar D
+/// culling): only players it can see, so ESP has nothing behind a wall to use.
 pub struct BotCtx<'a> {
     pub tick: u32,
     pub my_id: PlayerId,
@@ -59,6 +61,13 @@ pub trait Bot {
     /// join always goes out from the bot's own address.
     fn impersonates(&self) -> Option<&'static str> {
         None
+    }
+
+    /// Whether this bot sends straight to the origin's address instead of the
+    /// address it was given (the relay's) — it found the origin somehow.
+    /// Without a relay the two are the same address.
+    fn bypasses_relay(&self) -> bool {
+        false
     }
 
     /// How many source ports this bot sends from (all on its one IP). Index

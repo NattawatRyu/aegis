@@ -26,14 +26,14 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 
-use aegis_protocol::{split_frame, ClientMsg, PlayerId, PlayerState, ServerMsg, Vec2, TICK_HZ};
+use aegis_protocol::{split_frame, ClientMsg, LinkKey, PlayerId, PlayerState, ServerMsg, Vec2, TICK_HZ};
 use aegis_telemetry::Telemetry;
 
 use crate::guards::cookie::CookieJar;
 use crate::guards::session::{self, Session};
 use crate::guards::source_rate::SourceRate;
 use crate::guards::{ip_sessions, joined, packet, version};
-use crate::{ClientInput, GuardCtx, GuardVerdict, Pipeline, RejectReason, Sim};
+use crate::{ClientInput, GuardCtx, GuardVerdict, Pipeline, RejectReason, Sim, Wall};
 
 /// [`NetStats`] label for a legal join refused because all 255 ids are taken.
 pub const SERVER_FULL: &str = "server_full";
@@ -90,6 +90,9 @@ pub struct Server {
     last_id: PlayerId,
     /// Issues and checks join cookies (return routability).
     cookies: CookieJar,
+    /// What session tokens are MAC'd under: random, or the link key shared
+    /// with a relay so it can pre-check them ([`Server::share_token_key`]).
+    token_key: LinkKey,
     /// Player `id` enters at `spawns[(id - 1) % len]`.
     spawns: Vec<Vec2>,
     /// Inputs accepted this tick, in arrival order, waiting for `end_tick`.
@@ -116,11 +119,17 @@ impl Reply {
 }
 
 impl Server {
-    /// A server whose players enter at `spawns`, in join order (wrapping).
+    /// A server whose players enter at `spawns`, in join order (wrapping), in
+    /// an open arena.
     pub fn new(spawns: Vec<Vec2>) -> Self {
+        Self::with_walls(spawns, &[])
+    }
+
+    /// Same, in an arena with `walls`.
+    pub fn with_walls(spawns: Vec<Vec2>, walls: &[Wall]) -> Self {
         assert!(!spawns.is_empty(), "a server needs at least one spawn point");
         Self {
-            sim: Sim::new(),
+            sim: Sim::with_walls(walls),
             pipe: Pipeline::standard(),
             tel: Telemetry::new(),
             net: NetStats::default(),
@@ -130,14 +139,27 @@ impl Server {
             last_seen: BTreeMap::new(),
             last_id: 0,
             cookies: CookieJar::new(),
+            token_key: {
+                let mut k = [0u8; 16];
+                getrandom::fill(&mut k).expect("aegis-server: OS random source unavailable");
+                k
+            },
             spawns,
             pending: Vec::new(),
         }
     }
 
+    /// MAC tokens issued from now on under `key` — the link key a relay in
+    /// front holds, so it can drop a forged or guessed token at the edge.
+    /// Set it before anyone joins: a token issued earlier fails the relay's
+    /// check and its player is cut off there.
+    pub fn share_token_key(&mut self, key: LinkKey) {
+        self.token_key = key;
+    }
+
     /// Start tick `tick`: end idle sessions, advance respawn timers, then
-    /// return the world as the clients will see it while choosing this tick's
-    /// input.
+    /// return the whole world clients choose this tick's input in. Not what
+    /// they are sent: each gets its player's [`Sim::view`] of it.
     pub fn begin_tick(&mut self, tick: u32) -> Vec<PlayerState> {
         let idle: Vec<SocketAddr> = self
             .last_seen
@@ -226,7 +248,7 @@ impl Server {
             return None;
         };
         self.last_id = player_id;
-        let s = Session { player_id, token: session::new_token() };
+        let s = Session { player_id, token: session::new_token(&self.token_key, from) };
         self.sessions.insert(from, s);
         self.last_seen.insert(from, tick);
         self.sim.spawn(player_id, self.spawns[(player_id as usize - 1) % self.spawns.len()]);
@@ -331,6 +353,13 @@ impl Server {
     /// see it (see [`crate::net::OVERSIZE`]).
     pub(crate) fn count_drop(&mut self, label: &'static str) {
         self.net.drop(label);
+    }
+
+    /// `n` drops at once (see [`crate::net::BACKLOG_FULL`]).
+    pub(crate) fn count_drops(&mut self, label: &'static str, n: u64) {
+        if n > 0 {
+            *self.net.dropped.entry(label).or_insert(0) += n;
+        }
     }
 
     pub fn into_parts(self) -> (Telemetry, NetStats) {

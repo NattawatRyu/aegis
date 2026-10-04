@@ -1,0 +1,50 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo fmt --all -- --check
+
+  test:
+    # Linux: every 127.0.0.0/8 address is bindable, which the harness needs
+    # (one loopback IP per bot). Windows: where Aegis is developed, and whose
+    # UDP stack has already surfaced real bugs. macOS only binds 127.0.0.1,
+    # so the harness cannot run there.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        # Includes the network oracles: the UDP and relay runs must write
+        # telemetry byte-identical to the in-process run.
+        run: cargo test --workspace
+      - name: harness, three transports
+        run: |
+          cargo run -q -p aegis-harness
+          cargo run -q -p aegis-harness -- --udp
+          cargo run -q -p aegis-harness -- --relay
+      - name: telemetry identical across transports
+        run: |
+          cmp scenarios/out/standard.jsonl scenarios/out/standard.udp.jsonl
+          cmp scenarios/out/standard.jsonl scenarios/out/standard.relay.jsonl

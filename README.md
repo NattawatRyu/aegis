@@ -14,14 +14,20 @@ not by chasing individual cheats.
 > walls, and each client is sent only the players it can see, so a wallhack
 > has nothing to draw. The server can run as an origin behind a relay:
 > clients only ever hear from the relay's address, and the origin drops
-> anything not from the relay under the shared key. No encryption: an on-path attacker can still
-> read tokens. No latency margin on culling yet: an enemy appears the tick
-> it comes into sight. The relay-to-origin link is authenticated (a shared
-> key, a MAC per datagram) but not encrypted. The relay drops, statelessly,
+> anything not from the relay under the shared key. No latency margin on
+> culling: an enemy appears the tick it comes into sight. The
+> relay-to-origin link is sealed (XChaCha20-Poly1305 under subkeys HKDF'd
+> from one shared 32-byte secret): an observer of the link learns neither
+> client addresses, nor tokens, nor messages. The client-to-relay leg is
+> **not** encrypted: an on-path attacker there can still read a client's
+> token and act as it. The relay drops, statelessly,
 > any datagram whose session token was not issued for its source address
-> (tokens carry a MAC the relay can check) — 41% of the standard scenario's
-> client traffic never reaches the origin. Joins and per-IP budgets are
-> still judged at the origin.
+> (tokens carry a MAC the relay can check), and gives token-0 datagrams
+> (Joins, which the token check must let through) the origin's own per-IP
+> budget per tick. The relay also does the Join cookie round trip itself, so
+> no Join from a forged source address — one IP or thousands — ever reaches
+> the origin. 55% of the standard scenario's client traffic never reaches
+> the origin. Version and sessions per IP are still judged at the origin.
 > Nothing here is production-ready.
 
 ## Why

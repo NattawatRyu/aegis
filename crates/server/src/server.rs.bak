@@ -26,7 +26,7 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 
-use aegis_protocol::{split_frame, ClientMsg, LinkKey, NO_TOKEN, PlayerId, PlayerState, ServerMsg, Vec2, TICK_HZ};
+use aegis_protocol::{split_frame, ClientMsg, LinkKey, PlayerId, PlayerState, ServerMsg, Vec2, TICK_HZ};
 use aegis_telemetry::Telemetry;
 
 use crate::guards::cookie::CookieJar;
@@ -143,7 +143,11 @@ impl Server {
             last_id: 0,
             cookies: CookieJar::new(),
             edge_cookies: false,
-            token_key: LinkKey::random(),
+            token_key: {
+                let mut k = [0u8; 16];
+                getrandom::fill(&mut k).expect("aegis-server: OS random source unavailable");
+                k
+            },
             spawns,
             pending: Vec::new(),
         }
@@ -158,10 +162,9 @@ impl Server {
     }
 
     /// A relay in front issues and checks join cookies (its own, under the
-    /// link key), so a token-0 Join that reaches this server with a cookie
-    /// has already proven its address: admit it without checking the cookie
-    /// again. A Join with any other token was forwarded on its token's MAC
-    /// alone, so its cookie is still checked here (and an edge cookie fails). Only for a server that hears from nobody but that relay, over
+    /// link key), so a Join that reaches this server with a cookie has
+    /// already proven its address: admit it without checking the cookie
+    /// again. Only for a server that hears from nobody but that relay, over
     /// the MAC'd link (`NetServer::behind_relay` calls this) — anywhere
     /// else it would turn the cookie guard off.
     pub fn trust_edge_cookies(&mut self) {
@@ -229,16 +232,13 @@ impl Server {
                 return None;
             }
         };
-        // The relay proves only token-0 Joins: one with any other token is
-        // forwarded on its token's MAC alone, its cookie unseen.
-        let edge_proven = self.edge_cookies && framed.is_some_and(|(token, _)| token == NO_TOKEN);
         let refused = match (msg, known) {
             (ClientMsg::Join { protocol, cookie, .. }, known) => match (version::check_join(protocol), known, cookie) {
                 (Err(r), _, _) => r,
                 (Ok(()), Ok(s), _) => return Some(Reply::Joined(s)), // lost Joined: answer again
                 // Unproven address: a cookie to bring back, and nothing else.
                 (Ok(()), Err(_), None) => return Some(Reply::Challenge(self.cookies.issue(from, tick))),
-                (Ok(()), Err(_), Some(_)) if edge_proven => return self.admit(tick, from).map(Reply::Joined),
+                (Ok(()), Err(_), Some(_)) if self.edge_cookies => return self.admit(tick, from).map(Reply::Joined),
                 (Ok(()), Err(_), Some(c)) => match self.cookies.verify(from, tick, c) {
                     Ok(()) => return self.admit(tick, from).map(Reply::Joined),
                     Err(r) => r,
@@ -522,24 +522,6 @@ mod tests {
         assert_eq!(s.receive(0, SocketAddr::new(addr(1).ip(), 5000), &relayed), None);
         assert_eq!(s.net_stats().get("ip_sessions"), 1);
         assert_eq!(s.net_stats().get("bad_cookie"), 0);
-    }
-
-    /// The edge only proves token-0 Joins: the relay forwards a datagram
-    /// whose token passes its 32-bit MAC check without looking at the body.
-    /// So a cookie Join carrying a non-zero token — a lucky guess, or a
-    /// token left from a session that has ended — from an address with no
-    /// session is not trusted: its cookie is checked here, and refused.
-    #[test]
-    fn a_cookie_join_with_a_token_is_not_trusted_from_the_edge() {
-        let key = LinkKey::new([2; 32]);
-        let mut s = server();
-        s.trust_edge_cookies();
-        for token in [aegis_protocol::mint_token(&key, addr(1), 7), 0x5EED_5EED_5EED_5EED] {
-            let d = frame(token, &ClientMsg::Join { name: "t".into(), protocol: PROTOCOL_VERSION, cookie: Some(0x5EED) });
-            assert_eq!(s.receive(0, addr(1), &d), None, "token {token:#x} admitted without a proven cookie");
-        }
-        assert_eq!(s.net_stats().get("bad_cookie"), 2);
-        assert_eq!(s.peers().count(), 0);
     }
 
     /// A Join with a cookie but the wrong version is a version refusal — the

@@ -26,12 +26,12 @@ use aegis_client_sdk::{
     aimbot::AimbotBot, badversion::BadVersionBot, direct::DirectBot, esp::EspBot, flood::FloodBot, garbage::GarbageBot,
     honest::HonestBot, humanized::HumanizedAimbot, joinflood::JoinFloodBot, nan::NanBot,
     reflect::{ReflectBot, BYSTANDER}, replay::ReplayBot,
-    speedhack::SpeedhackBot, spoof::SpoofBot, Bot, BotCtx,
+    speedhack::SpeedhackBot, spoof::SpoofBot, zeroflood::ZeroFloodBot, Bot, BotCtx,
 };
 use aegis_detector::{Flag, Suite};
-use aegis_protocol::{decode, encode, frame, split_frame, ClientMsg, PlayerId, PlayerState, ServerMsg, Vec2, NO_TOKEN};
+use aegis_protocol::{decode, encode, frame, split_frame, ClientMsg, LinkKey, PlayerId, PlayerState, ServerMsg, Vec2, NO_TOKEN};
 use aegis_server::net::MAX_DATAGRAM;
-use aegis_relay::{Relay, RelayStats};
+use aegis_relay::{Clock, Relay, RelayStats};
 use aegis_server::{NetServer, NetStats, Reply, Server, Session, Sim, TickOutcome, ARENA_WALLS};
 use aegis_telemetry::{Telemetry, Totals};
 
@@ -70,6 +70,7 @@ impl Scenario {
                 Box::new(JoinFloodBot::new()),
                 Box::new(ReflectBot::new()),
                 Box::new(EspBot::new()),
+                Box::new(ZeroFloodBot::new()),
             ],
         }
     }
@@ -502,9 +503,9 @@ fn run_net(mut sc: Scenario, relayed: bool) -> io::Result<Report> {
     let origin = net.local_addr()?;
     let relay = if relayed {
         // A fresh link key per run, as a deployment would provision one.
-        let mut key = [0u8; 16];
-        getrandom::fill(&mut key).map_err(|e| io::Error::other(e.to_string()))?;
-        let r = Relay::spawn((Ipv4Addr::LOCALHOST, 0), (Ipv4Addr::LOCALHOST, 0), origin, key)?;
+        let key = LinkKey::random();
+        // Lockstep budget windows: one per origin tick, moved below.
+        let r = Relay::spawn_with((Ipv4Addr::LOCALHOST, 0), (Ipv4Addr::LOCALHOST, 0), origin, key, Clock::lockstep())?;
         net.behind_relay(r.upstream_addr(), key);
         Some(r)
     } else {
@@ -513,6 +514,9 @@ fn run_net(mut sc: Scenario, relayed: bool) -> io::Result<Report> {
     // The one server address bots are told; the only one they hear from.
     let to = relay.as_ref().map_or(origin, Relay::public_addr);
     let dest: Vec<SocketAddr> = sc.bots.iter().map(|b| if b.bypasses_relay() { origin } else { to }).collect();
+    // Behind a relay, which bots it answers: the relay, not the origin,
+    // challenges their Joins.
+    let edge: Option<Vec<bool>> = relayed.then(|| dest.iter().map(|&d| d != origin).collect());
     // socks[i][k]: bot slot i, source port index k, all on the bot's IP.
     let mut socks = sc
         .bots
@@ -561,11 +565,14 @@ fn run_net(mut sc: Scenario, relayed: bool) -> io::Result<Report> {
     }
     let (via, direct) = split(&sent);
     deliver(&mut net, rl, before, via, direct)?;
-    let retry = udp_challenges(&mut net, &socks, &owner, &sent, to)?;
+    let retry = udp_challenges(&mut net, edge.as_deref(), &socks, &owner, &sent, to)?;
     answer_udp(&mut net, rl, &socks, to, retry)?;
 
     for tick in 1..=sc.ticks {
         net.begin_tick()?;
+        if let Some(r) = rl {
+            r.next_window();
+        }
         let before = relay_stats(rl);
         let mut sent = Vec::new();
         for (i, bot) in sc.bots.iter_mut().enumerate() {
@@ -586,7 +593,7 @@ fn run_net(mut sc: Scenario, relayed: bool) -> io::Result<Report> {
         }
         let (via, direct) = split(&sent);
         deliver(&mut net, rl, before, via, direct)?;
-        let retry = udp_challenges(&mut net, &socks, &owner, &sent, to)?;
+        let retry = udp_challenges(&mut net, edge.as_deref(), &socks, &owner, &sent, to)?;
         answer_udp(&mut net, rl, &socks, to, retry)?;
         drain_extra_ports(&socks)?;
         lab.bystander.rx += drain_bytes(&socks[n][0], Duration::ZERO)?;
@@ -642,7 +649,7 @@ fn deliver(net: &mut NetServer, relay: Option<&Relay>, before: RelayStats, via: 
             let start = Instant::now();
             loop {
                 let s = r.stats();
-                let seen = (s.up + s.short + s.bad_token + s.oversize) - (before.up + before.short + before.bad_token + before.oversize);
+                let seen = edge_seen(&s) - edge_seen(&before);
                 if seen >= via as u64 {
                     break (s.up - before.up) as usize;
                 }
@@ -655,6 +662,16 @@ fn deliver(net: &mut NetServer, relay: Option<&Relay>, before: RelayStats, via: 
         }
     };
     pump(net, forwarded + direct)
+}
+
+/// Client datagrams the relay has accounted for: forwarded or dropped.
+pub fn edge_seen(s: &RelayStats) -> u64 {
+    s.up + s.challenged + edge_dropped(s)
+}
+
+/// Client datagrams the relay dropped at the edge.
+pub fn edge_dropped(s: &RelayStats) -> u64 {
+    s.short + s.bad_token + s.join_rate + s.bad_cookie + s.oversize
 }
 
 /// Relay counters now, or zeros without a relay.
@@ -678,15 +695,36 @@ fn pump(net: &mut NetServer, expected: usize) -> io::Result<()> {
 /// an answer only if that socket's own bot sent the cookieless Join (a
 /// forger's victim would not answer a challenge it never asked for). Same
 /// rule and order as the in-process run.
+///
+/// Behind a relay (`edge`: per bot, whether it sends via the relay) the relay
+/// does the challenging, so the origin must have sent none — one would mean
+/// an unproven Join crossed — and each cookieless Join a bot sent from its
+/// own address via the relay is answered, in send order, with the cookie
+/// read off that socket.
 #[allow(clippy::type_complexity)]
 fn udp_challenges(
     net: &mut NetServer,
+    edge: Option<&[bool]>,
     socks: &[Vec<UdpSocket>],
     owner: &HashMap<SocketAddr, (usize, u16)>,
     sent: &[(usize, usize, u16, Vec<u8>)],
     server: SocketAddr,
 ) -> io::Result<Vec<(usize, u16, Vec<u8>)>> {
     let mut retry = Vec::new();
+    if let Some(via_relay) = edge {
+        if net.take_replies().iter().any(|(_, m)| matches!(m, ServerMsg::Challenge { .. })) {
+            let msg = format!("tick {}: the origin challenged a join, so an unproven join crossed the relay", net.tick());
+            return Err(io::Error::other(msg));
+        }
+        for (i, slot, k, d) in sent {
+            if i != slot || !via_relay[*i] || with_cookie(d, 0).is_none() {
+                continue;
+            }
+            let cookie = read_challenge(&socks[*slot][*k as usize], server)?;
+            retry.extend(with_cookie(d, cookie).map(|r| (*slot, *k, r)));
+        }
+        return Ok(retry);
+    }
     for (dest, msg) in net.take_replies() {
         let ServerMsg::Challenge { cookie } = msg else { continue };
         let Some(&(slot, k)) = owner.get(&dest) else { continue };
@@ -727,6 +765,18 @@ fn recv_from_server(sock: &UdpSocket, server: SocketAddr, buf: &mut [u8]) -> io:
         return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
     }
     Ok(n)
+}
+
+/// Read from `sock` until a challenge arrives, skipping whatever was queued
+/// before it; its cookie.
+fn read_challenge(sock: &UdpSocket, server: SocketAddr) -> io::Result<u64> {
+    let mut buf = [0u8; MAX_DATAGRAM];
+    loop {
+        let n = recv_from_server(sock, server, &mut buf)?;
+        if let Ok(ServerMsg::Challenge { cookie }) = decode::<ServerMsg>(&buf[..n]) {
+            return Ok(cookie);
+        }
+    }
 }
 
 /// Read from `sock` until `want` arrives, skipping whatever was queued
@@ -796,7 +846,7 @@ fn read_snapshot(sock: &UdpSocket, server: SocketAddr, tick: u32, session: &mut 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aegis_client_sdk::{flood, garbage, spoof};
+    use aegis_client_sdk::{flood, garbage, spoof, zeroflood};
     use aegis_server::guards::source_rate::MAX_PER_TICK;
     use aegis_server::net::NOT_RELAY;
     use aegis_server::sim::MOVE_SPEED;
@@ -856,13 +906,25 @@ mod tests {
     }
 
     /// Every source-rate drop is accounted for: the flood's excess over its
-    /// own (player) budget, plus the spoof's excess over the victim IP's
-    /// unauthenticated budget. Nothing else in the scenario is over a cap.
+    /// own (player) budget, plus the spoof's and the zero-flood's excess over
+    /// their IPs' unauthenticated budgets. Nothing else in the scenario is
+    /// over a cap.
     #[test]
-    fn source_rate_drops_are_exactly_the_two_floods() {
+    fn source_rate_drops_are_exactly_the_three_floods() {
         let r = standard();
         let over = |per_tick: usize| u64::from((per_tick as u32 - MAX_PER_TICK) * r.ticks);
-        assert_eq!(r.net.get("source_rate"), over(flood::DEFAULT_PER_TICK) + over(spoof::PER_TICK));
+        assert_eq!(
+            r.net.get("source_rate"),
+            over(flood::DEFAULT_PER_TICK) + over(spoof::PER_TICK) + over(zeroflood::PER_TICK)
+        );
+    }
+
+    /// The relay's token-0 budget is the origin's unauthenticated budget:
+    /// if they differed, the relay would either drop what the origin admits
+    /// or let through what it is there to stop.
+    #[test]
+    fn the_edge_budget_is_the_origins() {
+        assert_eq!(aegis_relay::join_rate::MAX_PER_WINDOW, MAX_PER_TICK);
     }
 
     #[test]
@@ -1106,21 +1168,45 @@ mod tests {
         let (relay, mem) = (run_relay(Scenario::standard()).unwrap(), standard());
         assert_same_telemetry(&relay, &mem);
         let edge = relay.relay.expect("a relay run reports its relay");
-        let dropped = edge.short + edge.bad_token;
+        let dropped = edge_dropped(&edge);
         assert!(edge.bad_token > 0, "the relay dropped nothing at the edge");
+        // The token-0 budget at the edge drops exactly the zero-flood's
+        // excess — no honest join, and no more than the origin would have —
+        // and the origin's source-rate guard is left only the authenticated
+        // flood's excess, which the relay cannot judge.
+        let over = |per_tick: usize| u64::from((per_tick as u32 - MAX_PER_TICK) * relay.ticks);
+        assert_eq!(edge.join_rate, over(zeroflood::PER_TICK));
+        assert_eq!(relay.net.get("source_rate"), over(flood::DEFAULT_PER_TICK));
         let total = |n: &NetStats| n.dropped.values().sum::<u64>();
         assert_eq!(total(&mem.net) - total(&relay.net), dropped, "datagrams unaccounted for");
         // The origin saw less of every kind, never more; only what a forged
-        // token causes (the forgery itself, and the IP budget it used to
-        // burn) went down.
+        // token or an unproven Join causes (the forgery itself, and the IP
+        // budget it used to burn) went down.
         for (label, &n) in &mem.net.dropped {
             let at_origin = relay.net.get(label);
             assert!(at_origin <= n, "{label}: origin {at_origin} > in-process {n}");
-            if !matches!(*label, "bad_token" | "source_rate" | "malformed_packet") {
+            if !matches!(*label, "bad_token" | "source_rate" | "malformed_packet" | "bad_cookie") {
                 assert_eq!(at_origin, n, "{label} changed");
             }
         }
         assert_eq!(relay.net.get("bad_token"), 0, "a forged token crossed to the origin");
+        // Edge cookies: every guessed cookie the origin refused in-process is
+        // refused at the relay instead, and none crossed. (That the origin
+        // challenged nobody — no cookieless Join crossed — `run_net` already
+        // asserted every tick.) The bystander got exactly the bytes it got
+        // in-process (`assert_same_telemetry`): challenging at the edge made
+        // the relay no better a reflector than the origin was.
+        assert!(mem.net.get("bad_cookie") > 0, "no bot guessed a cookie");
+        assert_eq!(edge.bad_cookie, mem.net.get("bad_cookie"));
+        assert_eq!(relay.net.get("bad_cookie"), 0, "a guessed cookie crossed to the origin");
+        assert!(edge.challenged > 0);
+    }
+
+    /// The relay's cookie bucket is the origin's: the two clocks count the
+    /// same ticks, so a cookie lives as long either way.
+    #[test]
+    fn the_edge_cookie_bucket_is_the_origins() {
+        assert_eq!(aegis_relay::cookie::BUCKET_WINDOWS, aegis_server::guards::cookie::BUCKET_TICKS);
     }
 
     fn assert_same_run(net: &Report, mem: &Report) {

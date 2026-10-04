@@ -21,7 +21,7 @@
 use std::path::PathBuf;
 
 use aegis_detector::detectors::aim_exact::EXACT_RAD;
-use aegis_harness::{cull_sweep, honest_sweep, leak_by_step, run, run_relay, run_udp, Scenario};
+use aegis_harness::{cull_sweep, edge_dropped, edge_seen, honest_sweep, leak_by_step, run, run_relay, run_udp, Scenario};
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -75,12 +75,22 @@ fn main() -> std::io::Result<()> {
     let amp = if t.tx == 0 { 0.0 } else { t.rx as f64 / t.tx as f64 };
     println!("bystander (forged in its name): {} B sent as it, {} B sent to it, amplification {:.2}x", t.tx, t.rx, amp);
     if let Some(e) = r.relay {
-        let seen = e.up + e.short + e.bad_token + e.oversize;
-        let cut = e.short + e.bad_token + e.oversize;
+        let (seen, cut) = (edge_seen(&e), edge_dropped(&e));
         println!(
-            "relay edge: {} client datagrams in, {} forwarded, {} dropped ({:.0}%: bad_token {}, short {}, oversize {})",
-            seen, e.up, cut, 100.0 * cut as f64 / seen.max(1) as f64, e.bad_token, e.short, e.oversize
+            "relay edge: {} client datagrams in, {} forwarded, {} challenged, {} dropped ({:.0}%: bad_token {}, join_rate {}, bad_cookie {}, short {}, oversize {})",
+            seen,
+            e.up,
+            e.challenged,
+            cut,
+            100.0 * cut as f64 / seen.max(1) as f64,
+            e.bad_token,
+            e.join_rate,
+            e.bad_cookie,
+            e.short,
+            e.oversize
         );
+        let kept = seen - e.up;
+        println!("relay edge: {:.0}% of client datagrams never reached the origin", 100.0 * kept as f64 / seen.max(1) as f64);
     }
 
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scenarios/out");

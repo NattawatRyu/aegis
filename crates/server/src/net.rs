@@ -194,10 +194,15 @@ impl NetServer {
     ///
     /// Tokens issued from now on are MAC'd under `key` too, so the relay can
     /// drop a forged token before it crosses ([`Server::share_token_key`]):
-    /// call this before anyone joins.
+    /// call this before anyone joins. And the relay proves every Join's
+    /// address with its own cookie before the Join crosses, so this server
+    /// admits a Join with a cookie without re-checking it
+    /// ([`Server::trust_edge_cookies`]) — safe only because nothing but the
+    /// relay, under the key, is read.
     pub fn behind_relay(&mut self, relay: SocketAddr, key: LinkKey) {
         self.relay = Some((relay, key));
         self.server.share_token_key(key);
+        self.server.trust_edge_cookies();
     }
 
     /// Send `bytes` to client `to`: directly, or wrapped through the relay.
@@ -257,7 +262,7 @@ impl NetServer {
     pub fn recv_one(&mut self, wait: Duration) -> io::Result<bool> {
         let full = self.reader.full.swap(0, Ordering::Relaxed);
         self.server.count_drops(BACKLOG_FULL, full);
-        let (peer, datagram) = match self.reader.rx.recv_timeout(wait) {
+        let (peer, mut datagram) = match self.reader.rx.recv_timeout(wait) {
             Ok(Ok(Rx::Datagram(peer, d))) => (peer, d),
             Ok(Ok(Rx::Oversize)) => {
                 self.server.count_drop(OVERSIZE);
@@ -274,7 +279,7 @@ impl NetServer {
                 self.server.count_drop(NOT_RELAY);
                 return Ok(true);
             }
-            Some((_, key)) => match unwrap(key, Dir::Up, &datagram) {
+            Some((_, key)) => match unwrap(key, Dir::Up, &mut datagram) {
                 Ok(v) => v,
                 Err(e) => {
                     self.server.count_drop(if e == EnvelopeError::BadMac { BAD_MAC } else { BAD_ENVELOPE });
@@ -425,11 +430,11 @@ mod tests {
     fn read_wrapped(r: &UdpSocket) -> (SocketAddr, ServerMsg) {
         let mut buf = [0u8; MAX_DATAGRAM + ENVELOPE_MAX];
         let n = r.recv(&mut buf).expect("nothing came to the relay");
-        let (to, body) = unwrap(&KEY, Dir::Down, &buf[..n]).expect("origin sent the relay a bad envelope");
+        let (to, body) = unwrap(&KEY, Dir::Down, &mut buf[..n]).expect("origin sent the relay a bad envelope");
         (to, decode(body).unwrap())
     }
 
-    const KEY: LinkKey = [3; 16];
+    static KEY: std::sync::LazyLock<LinkKey> = std::sync::LazyLock::new(|| LinkKey::new([3; 32]));
 
     /// A datagram as the relay would forward it from client `c`.
     fn up(c: SocketAddr, d: &[u8]) -> Vec<u8> {
@@ -445,7 +450,7 @@ mod tests {
         let mut n = net();
         let to = n.local_addr().unwrap();
         let relay = client();
-        n.behind_relay(relay.local_addr().unwrap(), KEY);
+        n.behind_relay(relay.local_addr().unwrap(), *KEY);
         let c = client();
         c.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
 
@@ -477,7 +482,7 @@ mod tests {
         let mut n = net();
         let to = n.local_addr().unwrap();
         let relay = client();
-        n.behind_relay(relay.local_addr().unwrap(), KEY);
+        n.behind_relay(relay.local_addr().unwrap(), *KEY);
         relay.send_to(&[9, 1, 2], to).unwrap();
         assert!(n.recv_one(WAIT).unwrap());
         assert_eq!(n.server().net_stats().get(BAD_ENVELOPE), 1);
@@ -495,10 +500,10 @@ mod tests {
         let to = n.local_addr().unwrap();
         let relay = client();
         relay.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
-        n.behind_relay(relay.local_addr().unwrap(), KEY);
+        n.behind_relay(relay.local_addr().unwrap(), *KEY);
         let victim: SocketAddr = "10.9.9.9:4000".parse().unwrap();
 
-        relay.send_to(&wrap(&[4; 16], Dir::Up, victim, &join()), to).unwrap();
+        relay.send_to(&wrap(&LinkKey::new([4; 32]), Dir::Up, victim, &join()), to).unwrap();
         assert!(n.recv_one(WAIT).unwrap());
         assert_eq!(n.server().net_stats().get(BAD_MAC), 1);
         let mut buf = [0u8; MAX_DATAGRAM + ENVELOPE_MAX];
@@ -573,7 +578,7 @@ mod tests {
         const N: u64 = 20000;
         let mut n = net();
         let to = n.local_addr().unwrap();
-        n.behind_relay("127.0.0.1:9".parse().unwrap(), [0; 16]);
+        n.behind_relay("127.0.0.1:9".parse().unwrap(), LinkKey::new([0; 32]));
         let sender = std::thread::spawn(move || {
             let s = UdpSocket::bind("127.0.0.1:0").unwrap();
             for i in 0..N {

@@ -16,8 +16,10 @@
 //! rate budgets. A forgery is counted in [`crate::NetStats`], never on the
 //! victim's record.
 //!
-//! Does NOT stop an on-path attacker, who can read the token off the wire:
-//! that needs encryption, which Aegis does not do yet.
+//! Does NOT stop an on-path attacker between client and relay (or client
+//! and server, with no relay), who can read the token off the wire: that
+//! leg is not encrypted. Behind a relay, the relay-to-origin link is sealed,
+//! so the token is not readable there.
 
 use std::net::SocketAddr;
 
@@ -72,7 +74,7 @@ mod tests {
 
     #[test]
     fn tokens_are_never_zero_do_not_repeat_and_check_for_their_address() {
-        let key = [9; 16];
+        let key = aegis_protocol::LinkKey::new([9; 32]);
         let a: SocketAddr = "10.0.0.7:4000".parse().unwrap();
         let mut seen = std::collections::HashSet::new();
         for _ in 0..1000 {

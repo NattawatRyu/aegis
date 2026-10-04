@@ -24,6 +24,7 @@ pub mod reflect;
 pub mod replay;
 pub mod speedhack;
 pub mod spoof;
+pub mod zeroflood;
 
 /// What a bot sees before deciding this tick — the same information a real
 /// client has. `snapshot` is the server's view for this player (pillar D

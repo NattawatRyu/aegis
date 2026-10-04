@@ -24,31 +24,85 @@
 //!     origin MACs every token under the link key ([`token_valid`]), so the
 //!     relay checks it without remembering it.
 //!
-//! A token of 0 (a Join) passes: joins are judged at the origin (cookie,
-//! version, per-IP budget). Every guard still runs at the origin; the relay
-//! only takes away traffic the origin would certainly have refused — so what
-//! reaches the origin's guards, and the telemetry they write, is unchanged
-//! (the harness asserts it byte for byte).
+//! A token of 0 (a Join) passes the token check. But token 0 is free to send,
+//! so it is the one thing that check cannot thin — those datagrams get the
+//! origin's own unauthenticated budget here instead ([`join_rate`], the only
+//! state the relay keeps, cleared every window). Within it, a Join must
+//! prove its address before it crosses ([`cookie`], D5.4): a cookieless Join
+//! is answered here with a challenge and goes no further, and a Join whose
+//! cookie the relay did not issue to that address is dropped. So no Join
+//! from a forged source — from one IP or from thousands — reaches the
+//! origin. Version and sessions per IP are still judged at the origin, and
+//! every other guard still runs there; the relay only takes away traffic the
+//! origin would certainly have refused, and answers challenges the origin
+//! would have answered — so what reaches the origin's guards, and the
+//! telemetry they write, is unchanged (the harness asserts it byte for byte).
 //!
-//! The link is authenticated: relay and origin share a [`LinkKey`] and every
-//! envelope carries a MAC under it, each direction distinct. Forging the
-//! relay's source address toward the origin gets nobody admitted; forging the
-//! origin's toward the relay gets nothing reflected.
+//! The window is the origin's tick. A deployed relay keeps it by the wall
+//! clock ([`Clock::Wall`]), so its windows and the origin's ticks are not
+//! aligned: a burst across a boundary can be counted in one window here and
+//! two ticks there, and the relay is stricter than the origin by at most
+//! that. Only a sender past the budget is ever affected. The harness runs in
+//! lockstep ([`Clock::Lockstep`]) and moves the window with each tick.
 //!
-//! LIMITS: not encrypted — an on-path observer of the link reads client
-//! addresses and tokens, and can replay a captured envelope the way it went.
-//! And a relay only hides an origin that is otherwise unreachable: one with a
-//! public address and no firewall can still be found and flooded directly.
+//! The link is sealed: relay and origin share a [`LinkKey`] and every
+//! envelope is encrypted and authenticated under it (XChaCha20-Poly1305),
+//! each direction distinct. Forging the relay's source address toward the
+//! origin gets nobody admitted; forging the origin's toward the relay gets
+//! nothing reflected; watching the link shows no client address, token or
+//! message.
+//!
+//! LIMITS: an on-path observer of the link still sees sizes and timing, and
+//! can replay a captured envelope the way it went (the session token and
+//! replay guard judge that). The client-to-relay leg is not encrypted at
+//! all: tokens are readable there. A token-0 flood spread over many forged
+//! source IPs still costs the relay one MAC per datagram and a challenge per
+//! IP per window (never larger than the Join that asked), but none of it
+//! crosses. And a relay only hides an origin that is otherwise unreachable:
+//! one with a public address and no firewall can still be found and flooded
+//! directly.
+
+pub mod cookie;
+pub mod join_rate;
 
 use std::io::{self, ErrorKind};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use aegis_protocol::{
-    split_frame, token_valid, unwrap, wrap, Dir, EnvelopeError, LinkKey, ENVELOPE_MAX, MAX_DATAGRAM, NO_TOKEN,
+    decode, encode, split_frame, token_valid, unwrap, wrap, ClientMsg, Dir, EnvelopeError, LinkKey, ServerMsg, ENVELOPE_MAX,
+    MAX_DATAGRAM, NO_TOKEN, TICK_HZ,
 };
+use join_rate::JoinRate;
+
+/// What the relay's budget window follows.
+#[derive(Clone)]
+pub enum Clock {
+    /// One window per origin tick of wall-clock time, from spawn.
+    Wall(Instant),
+    /// Moved only by [`Relay::next_window`] — for a lockstep harness.
+    Lockstep(Arc<AtomicU32>),
+}
+
+impl Clock {
+    pub fn wall() -> Self {
+        Clock::Wall(Instant::now())
+    }
+
+    pub fn lockstep() -> Self {
+        Clock::Lockstep(Arc::new(AtomicU32::new(0)))
+    }
+
+    fn window(&self) -> u32 {
+        match self {
+            Clock::Wall(t0) => (t0.elapsed().as_nanos() * u128::from(TICK_HZ) / 1_000_000_000) as u32,
+            Clock::Lockstep(w) => w.load(Ordering::SeqCst),
+        }
+    }
+}
 
 /// WSAEMSGSIZE: the datagram was larger than the buffer, and is gone.
 const WSAEMSGSIZE: i32 = 10040;
@@ -66,6 +120,13 @@ pub struct RelayStats {
     pub short: u64,
     /// Client datagrams with a token not issued for their source, dropped.
     pub bad_token: u64,
+    /// Token-0 client datagrams past their IP's budget for the window, dropped.
+    pub join_rate: u64,
+    /// Cookieless Joins answered here with a challenge (not forwarded, and
+    /// not dropped either: the client was answered).
+    pub challenged: u64,
+    /// Joins with a cookie the relay did not issue to their source, dropped.
+    pub bad_cookie: u64,
     /// Datagrams at the upstream socket from anyone but the origin, dropped.
     pub foreign: u64,
     /// Datagrams from the origin's address whose MAC was wrong, dropped.
@@ -81,6 +142,9 @@ struct Counters {
     oversize: AtomicU64,
     short: AtomicU64,
     bad_token: AtomicU64,
+    join_rate: AtomicU64,
+    challenged: AtomicU64,
+    bad_cookie: AtomicU64,
     foreign: AtomicU64,
     bad_mac: AtomicU64,
     bad_envelope: AtomicU64,
@@ -94,6 +158,7 @@ pub struct Relay {
     public: SocketAddr,
     upstream: SocketAddr,
     counters: Arc<Counters>,
+    clock: Clock,
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<io::Result<()>>>,
 }
@@ -101,8 +166,19 @@ pub struct Relay {
 impl Relay {
     /// Bind the public socket (what clients are told) and the upstream socket
     /// (what the origin allowlists), and start forwarding to `origin`, with
-    /// whom this relay shares `key`.
+    /// whom this relay shares `key`. Budget windows follow the wall clock.
     pub fn spawn(public: impl ToSocketAddrs, upstream: impl ToSocketAddrs, origin: SocketAddr, key: LinkKey) -> io::Result<Self> {
+        Self::spawn_with(public, upstream, origin, key, Clock::wall())
+    }
+
+    /// The same, with budget windows following `clock`.
+    pub fn spawn_with(
+        public: impl ToSocketAddrs,
+        upstream: impl ToSocketAddrs,
+        origin: SocketAddr,
+        key: LinkKey,
+        clock: Clock,
+    ) -> io::Result<Self> {
         // Blocking reads, no timeout: on Windows a UDP read that times out
         // while a datagram is arriving can lose it (measured: 1 join in 13
         // vanished with a 10 ms poll under parallel load). Drop wakes the
@@ -115,14 +191,28 @@ impl Relay {
 
         let up = {
             let (public, upstream) = (public.try_clone()?, upstream.try_clone()?);
-            let (c, stop) = (counters.clone(), stop.clone());
-            std::thread::spawn(move || forward_up(&public, &upstream, origin, &key, &c, &stop))
+            let (c, stop, clock) = (counters.clone(), stop.clone(), clock.clone());
+            std::thread::spawn(move || forward_up(&public, &upstream, origin, &key, &clock, &c, &stop))
         };
         let down = {
             let (c, stop) = (counters.clone(), stop.clone());
             std::thread::spawn(move || forward_down(&upstream, &public, origin, &key, &c, &stop))
         };
-        Ok(Self { public: public_addr, upstream: upstream_addr, counters, stop, threads: vec![up, down] })
+        Ok(Self { public: public_addr, upstream: upstream_addr, counters, clock, stop, threads: vec![up, down] })
+    }
+
+    /// Start the next budget window. Lockstep only: call it when the origin
+    /// starts a tick, before any of that tick's datagrams are sent.
+    ///
+    /// # Panics
+    /// On a wall-clock relay, which moves its own windows.
+    pub fn next_window(&self) {
+        match &self.clock {
+            Clock::Lockstep(w) => {
+                w.fetch_add(1, Ordering::SeqCst);
+            }
+            Clock::Wall(_) => panic!("a wall-clock relay moves its own windows"),
+        }
     }
 
     /// The address clients send to — the only server address they know.
@@ -145,6 +235,9 @@ impl Relay {
             oversize: get(&c.oversize),
             short: get(&c.short),
             bad_token: get(&c.bad_token),
+            join_rate: get(&c.join_rate),
+            challenged: get(&c.challenged),
+            bad_cookie: get(&c.bad_cookie),
             foreign: get(&c.foreign),
             bad_mac: get(&c.bad_mac),
             bad_envelope: get(&c.bad_envelope),
@@ -187,10 +280,12 @@ fn forward_up(
     upstream: &UdpSocket,
     origin: SocketAddr,
     key: &LinkKey,
+    clock: &Clock,
     c: &Counters,
     stop: &AtomicBool,
 ) -> io::Result<()> {
     let mut buf = vec![0u8; MAX_DATAGRAM];
+    let mut joins = JoinRate::new();
     loop {
         let got = public.recv_from(&mut buf);
         if stop.load(Ordering::Relaxed) {
@@ -200,6 +295,29 @@ fn forward_up(
             Ok((n, client)) => match split_frame(&buf[..n]) {
                 None => bump(&c.short),
                 Some((token, _)) if token != NO_TOKEN && !token_valid(key, client, token) => bump(&c.bad_token),
+                Some((NO_TOKEN, body)) => {
+                    let window = clock.window();
+                    if !joins.allow(window, client.ip()) {
+                        bump(&c.join_rate);
+                        continue;
+                    }
+                    match decode::<ClientMsg>(body) {
+                        Ok(ClientMsg::Join { cookie: None, .. }) => {
+                            let challenge = ServerMsg::Challenge { cookie: cookie::issue(key, client, window) };
+                            let _ = public.send_to(&encode(&challenge), client);
+                            bump(&c.challenged);
+                        }
+                        Ok(ClientMsg::Join { cookie: Some(k), .. }) if !cookie::valid(key, client, window, k) => {
+                            bump(&c.bad_cookie)
+                        }
+                        // A proven Join, or anything else with token 0: the
+                        // origin judges it (and refuses all but the Join).
+                        _ => {
+                            let _ = upstream.send_to(&wrap(key, Dir::Up, client, &buf[..n]), origin);
+                            bump(&c.up);
+                        }
+                    }
+                }
                 Some(_) => {
                     let _ = upstream.send_to(&wrap(key, Dir::Up, client, &buf[..n]), origin);
                     bump(&c.up);
@@ -228,7 +346,7 @@ fn forward_down(
         }
         match got {
             Ok((_, from)) if from != origin => bump(&c.foreign),
-            Ok((n, _)) => match unwrap(key, Dir::Down, &buf[..n]) {
+            Ok((n, _)) => match unwrap(key, Dir::Down, &mut buf[..n]) {
                 Ok((client, payload)) => {
                     let _ = public.send_to(payload, client);
                     bump(&c.down);
@@ -249,7 +367,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const WAIT: Duration = Duration::from_secs(1);
-    const KEY: LinkKey = [5; 16];
+    static KEY: std::sync::LazyLock<LinkKey> = std::sync::LazyLock::new(|| LinkKey::new([5; 32]));
 
     fn sock() -> UdpSocket {
         let s = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -286,14 +404,14 @@ mod tests {
     #[test]
     fn forwards_both_ways_and_the_client_only_sees_the_relay() {
         let origin = sock();
-        let r = Relay::spawn("127.0.0.1:0", "127.0.0.1:0", origin.local_addr().unwrap(), KEY).unwrap();
+        let r = Relay::spawn("127.0.0.1:0", "127.0.0.1:0", origin.local_addr().unwrap(), *KEY).unwrap();
         let client = sock();
 
         let hello = tokened(NO_TOKEN, b"hello");
         client.send_to(&hello, r.public_addr()).unwrap();
         let (got, from) = recv(&origin);
         assert_eq!(from, r.upstream_addr());
-        assert_eq!(unwrap(&KEY, Dir::Up, &got), Ok((client.local_addr().unwrap(), &hello[..])));
+        assert_eq!(unwrap(&KEY, Dir::Up, &mut got.clone()), Ok((client.local_addr().unwrap(), &hello[..])));
 
         origin.send_to(&wrap(&KEY, Dir::Down, client.local_addr().unwrap(), b"back"), r.upstream_addr()).unwrap();
         let (got, from) = recv(&client);
@@ -303,13 +421,34 @@ mod tests {
         assert_eq!(settle(&r, |s| s.up == 1 && s.down == 1), RelayStats { up: 1, down: 1, ..Default::default() });
     }
 
+    /// What crosses the link, read raw off the wire as an on-path observer
+    /// would: the client's address, its session token and its message are
+    /// nowhere in it — and it still opens, under the key, to exactly what
+    /// the client sent.
+    #[test]
+    fn the_link_carries_nothing_in_the_clear() {
+        let origin = sock();
+        let r = Relay::spawn("127.0.0.1:0", "127.0.0.1:0", origin.local_addr().unwrap(), *KEY).unwrap();
+        let client = sock();
+        let me = client.local_addr().unwrap();
+        let token = mint_token(&KEY, me, 0xC0FF_EE11);
+        let sent = tokened(token, b"aim-at-player-7");
+        client.send_to(&sent, r.public_addr()).unwrap();
+        let (mut wire, _) = recv(&origin);
+        let has = |needle: &[u8]| wire.windows(needle.len()).any(|w| w == needle);
+        assert!(!has(&token.to_le_bytes()), "token in the clear");
+        assert!(!has(b"aim-at-player-7"), "message in the clear");
+        assert!(!has(&[127, 0, 0, 1]), "client IP in the clear");
+        assert_eq!(unwrap(&KEY, Dir::Up, &mut wire), Ok((me, &sent[..])));
+    }
+
     /// Only the origin can make the relay send to a client: anyone else
     /// writing to the upstream socket is dropped — otherwise the relay would
     /// reflect whatever a stranger wrapped at whatever address it named.
     #[test]
     fn upstream_ignores_everyone_but_the_origin() {
         let origin = sock();
-        let r = Relay::spawn("127.0.0.1:0", "127.0.0.1:0", origin.local_addr().unwrap(), KEY).unwrap();
+        let r = Relay::spawn("127.0.0.1:0", "127.0.0.1:0", origin.local_addr().unwrap(), *KEY).unwrap();
         let victim = sock();
         victim.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
         let stranger = sock();
@@ -323,7 +462,7 @@ mod tests {
     #[test]
     fn a_bad_envelope_from_the_origin_is_dropped() {
         let origin = sock();
-        let r = Relay::spawn("127.0.0.1:0", "127.0.0.1:0", origin.local_addr().unwrap(), KEY).unwrap();
+        let r = Relay::spawn("127.0.0.1:0", "127.0.0.1:0", origin.local_addr().unwrap(), *KEY).unwrap();
         origin.send_to(&[9, 9], r.upstream_addr()).unwrap();
         assert_eq!(settle(&r, |s| s.bad_envelope == 1), RelayStats { bad_envelope: 1, ..Default::default() });
     }
@@ -335,11 +474,11 @@ mod tests {
     #[test]
     fn the_origins_address_without_the_key_reflects_nothing() {
         let origin = sock();
-        let r = Relay::spawn("127.0.0.1:0", "127.0.0.1:0", origin.local_addr().unwrap(), KEY).unwrap();
+        let r = Relay::spawn("127.0.0.1:0", "127.0.0.1:0", origin.local_addr().unwrap(), *KEY).unwrap();
         let victim = sock();
         victim.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
         let v = victim.local_addr().unwrap();
-        origin.send_to(&wrap(&[6; 16], Dir::Down, v, b"flood"), r.upstream_addr()).unwrap();
+        origin.send_to(&wrap(&LinkKey::new([6; 32]), Dir::Down, v, b"flood"), r.upstream_addr()).unwrap();
         origin.send_to(&wrap(&KEY, Dir::Up, v, b"flood"), r.upstream_addr()).unwrap();
         assert_eq!(settle(&r, |s| s.bad_mac == 2), RelayStats { bad_mac: 2, ..Default::default() });
         let mut buf = [0u8; 16];
@@ -355,11 +494,11 @@ mod tests {
     #[test]
     fn max_datagram_goes_through_one_byte_more_does_not() {
         let origin = sock();
-        let r = Relay::spawn("127.0.0.1:0", "127.0.0.1:0", origin.local_addr().unwrap(), KEY).unwrap();
+        let r = Relay::spawn("127.0.0.1:0", "127.0.0.1:0", origin.local_addr().unwrap(), *KEY).unwrap();
         let client = sock();
         client.send_to(&tokened(NO_TOKEN, &[7u8; MAX_DATAGRAM - 8]), r.public_addr()).unwrap();
         let (got, _) = recv(&origin);
-        assert_eq!(unwrap(&KEY, Dir::Up, &got).unwrap().1.len(), MAX_DATAGRAM);
+        assert_eq!(unwrap(&KEY, Dir::Up, &mut got.clone()).unwrap().1.len(), MAX_DATAGRAM);
 
         client.send_to(&tokened(NO_TOKEN, &[7u8; MAX_DATAGRAM - 7]), r.public_addr()).unwrap();
         let s = settle(&r, |s| s.oversize + s.up >= 2);
@@ -375,7 +514,7 @@ mod tests {
     #[test]
     fn only_a_token_issued_for_this_address_crosses() {
         let origin = sock();
-        let r = Relay::spawn("127.0.0.1:0", "127.0.0.1:0", origin.local_addr().unwrap(), KEY).unwrap();
+        let r = Relay::spawn("127.0.0.1:0", "127.0.0.1:0", origin.local_addr().unwrap(), *KEY).unwrap();
         let client = sock();
         let me = client.local_addr().unwrap();
         let other_port = SocketAddr::new(me.ip(), me.port().wrapping_add(1));
@@ -384,28 +523,135 @@ mod tests {
         send(&[0u8; 7]); // 7 bytes: no token
         send(&tokened(mint_token(&KEY, other_port, 1), b"x"));
         send(&tokened(0x1234_5678_9ABC_DEF0, b"x"));
-        send(&tokened(mint_token(&[1; 16], me, 1), b"x"));
+        send(&tokened(mint_token(&LinkKey::new([1; 32]), me, 1), b"x"));
         let s = settle(&r, |s| s.short + s.bad_token == 4);
         assert_eq!((s.short, s.bad_token, s.up), (1, 3, 0));
 
         let good = tokened(mint_token(&KEY, me, 1), b"in");
         send(&good);
-        assert_eq!(unwrap(&KEY, Dir::Up, &recv(&origin).0), Ok((me, &good[..])));
+        assert_eq!(unwrap(&KEY, Dir::Up, &mut recv(&origin).0), Ok((me, &good[..])));
         let join = tokened(NO_TOKEN, b"join");
         send(&join);
-        assert_eq!(unwrap(&KEY, Dir::Up, &recv(&origin).0), Ok((me, &join[..])));
+        assert_eq!(unwrap(&KEY, Dir::Up, &mut recv(&origin).0), Ok((me, &join[..])));
         // Exactly 8 bytes is a token and an empty body: it crosses (the
         // origin's decoder refuses the body).
         send(&tokened(NO_TOKEN, b""));
-        assert_eq!(unwrap(&KEY, Dir::Up, &recv(&origin).0).unwrap().1.len(), 8);
+        assert_eq!(unwrap(&KEY, Dir::Up, &mut recv(&origin).0).unwrap().1.len(), 8);
         assert_eq!(settle(&r, |s| s.up == 3).up, 3);
+    }
+
+    /// The token-0 budget at its edge, over real sockets. In one window: the
+    /// cap crosses, cap + 1 is dropped, a datagram with a valid token still
+    /// crosses (it has its own budget at the origin), and another port on
+    /// the same IP gets nothing more. The next window crosses again.
+    #[test]
+    fn token_zero_gets_the_origins_budget_per_ip_per_window() {
+        use join_rate::MAX_PER_WINDOW;
+        let origin = sock();
+        let r = Relay::spawn_with("127.0.0.1:0", "127.0.0.1:0", origin.local_addr().unwrap(), *KEY, Clock::lockstep()).unwrap();
+        let (a, b) = (sock(), sock());
+        let join = tokened(NO_TOKEN, b"join");
+        for _ in 0..MAX_PER_WINDOW {
+            a.send_to(&join, r.public_addr()).unwrap();
+        }
+        b.send_to(&join, r.public_addr()).unwrap(); // same IP, other port
+        a.send_to(&tokened(mint_token(&KEY, a.local_addr().unwrap(), 1), b"in"), r.public_addr()).unwrap();
+        let s = settle(&r, |s| s.up + s.join_rate == u64::from(MAX_PER_WINDOW) + 2);
+        assert_eq!((s.up, s.join_rate), (u64::from(MAX_PER_WINDOW) + 1, 1));
+        for _ in 0..=MAX_PER_WINDOW {
+            recv(&origin);
+        }
+
+        r.next_window();
+        b.send_to(&join, r.public_addr()).unwrap();
+        assert_eq!(unwrap(&KEY, Dir::Up, &mut recv(&origin).0).unwrap().0, b.local_addr().unwrap());
+        assert_eq!(r.stats().join_rate, 1);
+    }
+
+    fn join(cookie: Option<u64>) -> Vec<u8> {
+        aegis_protocol::frame(NO_TOKEN, &ClientMsg::Join { name: "j".into(), protocol: aegis_protocol::PROTOCOL_VERSION, cookie })
+    }
+
+    /// The handshake at the edge: a cookieless Join is answered by the
+    /// relay, from its public address, and nothing crosses; the Join that
+    /// brings the cookie back crosses whole.
+    #[test]
+    fn a_cookieless_join_is_challenged_at_the_edge_and_the_answer_crosses() {
+        let origin = sock();
+        origin.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        let r = Relay::spawn_with("127.0.0.1:0", "127.0.0.1:0", origin.local_addr().unwrap(), *KEY, Clock::lockstep()).unwrap();
+        let client = sock();
+        client.send_to(&join(None), r.public_addr()).unwrap();
+        let (got, from) = recv(&client);
+        assert_eq!(from, r.public_addr());
+        let ServerMsg::Challenge { cookie: k } = decode::<ServerMsg>(&got).unwrap() else { panic!("not a challenge") };
+        assert_eq!(k, cookie::issue(&KEY, client.local_addr().unwrap(), 0));
+        let mut buf = [0u8; 64];
+        assert!(origin.recv(&mut buf).is_err(), "a cookieless join crossed");
+
+        let answer = join(Some(k));
+        client.send_to(&answer, r.public_addr()).unwrap();
+        assert_eq!(unwrap(&KEY, Dir::Up, &mut recv(&origin).0), Ok((client.local_addr().unwrap(), &answer[..])));
+        assert_eq!(r.stats(), RelayStats { up: 1, challenged: 1, ..Default::default() });
+    }
+
+    /// A Join whose cookie was not issued to its source — a guess, another
+    /// port's, another key's, or one two buckets old — is dropped at the
+    /// edge. One from the last bucket still crosses.
+    #[test]
+    fn a_cookie_not_issued_to_this_address_is_dropped() {
+        let origin = sock();
+        let r = Relay::spawn_with("127.0.0.1:0", "127.0.0.1:0", origin.local_addr().unwrap(), *KEY, Clock::lockstep()).unwrap();
+        let client = sock();
+        let me = client.local_addr().unwrap();
+        let other = SocketAddr::new(me.ip(), me.port().wrapping_add(1));
+        let old = cookie::issue(&KEY, me, 0);
+        for _ in 0..2 * cookie::BUCKET_WINDOWS {
+            r.next_window();
+        }
+        for k in [0x5EED, cookie::issue(&KEY, other, 2 * cookie::BUCKET_WINDOWS), cookie::issue(&LinkKey::new([1; 32]), me, 0), old] {
+            client.send_to(&join(Some(k)), r.public_addr()).unwrap();
+        }
+        assert_eq!(settle(&r, |s| s.bad_cookie == 4), RelayStats { bad_cookie: 4, ..Default::default() });
+        let last = cookie::issue(&KEY, me, cookie::BUCKET_WINDOWS);
+        client.send_to(&join(Some(last)), r.public_addr()).unwrap();
+        assert_eq!(unwrap(&KEY, Dir::Up, &mut recv(&origin).0).unwrap().0, me);
+    }
+
+    /// Joins forged from many source IPs — each with a fresh token-0 budget —
+    /// get a challenge each and none crosses. (Loopback is 127.0.0.0/8, so
+    /// these are real distinct source IPs.)
+    #[test]
+    fn joins_from_many_ips_never_cross_unproven() {
+        let origin = sock();
+        origin.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        let r = Relay::spawn_with("127.0.0.1:0", "127.0.0.1:0", origin.local_addr().unwrap(), *KEY, Clock::lockstep()).unwrap();
+        const IPS: u8 = 50;
+        for i in 0..IPS {
+            let s = UdpSocket::bind((Ipv4Addr::new(127, 0, 9, i + 1), 0)).unwrap();
+            for _ in 0..3 {
+                s.send_to(&join(None), r.public_addr()).unwrap();
+            }
+        }
+        let s = settle(&r, |s| s.challenged == 3 * u64::from(IPS));
+        assert_eq!(s, RelayStats { challenged: 3 * u64::from(IPS), ..Default::default() });
+        let mut buf = [0u8; 64];
+        assert!(origin.recv(&mut buf).is_err(), "an unproven join crossed");
+    }
+
+    #[test]
+    #[should_panic(expected = "moves its own windows")]
+    fn a_wall_clock_relay_cannot_be_stepped() {
+        let origin = sock();
+        let r = Relay::spawn("127.0.0.1:0", "127.0.0.1:0", origin.local_addr().unwrap(), *KEY).unwrap();
+        r.next_window();
     }
 
     /// Drop stops both threads promptly.
     #[test]
     fn drop_stops_the_threads() {
         let origin = sock();
-        let r = Relay::spawn("127.0.0.1:0", "127.0.0.1:0", origin.local_addr().unwrap(), KEY).unwrap();
+        let r = Relay::spawn("127.0.0.1:0", "127.0.0.1:0", origin.local_addr().unwrap(), *KEY).unwrap();
         let t = Instant::now();
         drop(r);
         assert!(t.elapsed() < WAIT);

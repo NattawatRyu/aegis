@@ -172,12 +172,15 @@ impl Server {
     /// return the whole world clients choose this tick's input in. Not what
     /// they are sent: each gets its player's [`Sim::view`] of it.
     pub fn begin_tick(&mut self, tick: u32) -> Vec<PlayerState> {
-        let idle: Vec<SocketAddr> = self
+        let mut idle: Vec<SocketAddr> = self
             .last_seen
             .iter()
             .filter(|&(_, &seen)| tick.saturating_sub(seen) > IDLE_TICKS)
             .map(|(&a, _)| a)
             .collect();
+        // In player-id order, not address order: source ports are the OS's
+        // choice, and the record must not depend on the transport.
+        idle.sort_by_key(|a| self.sessions.get(a).map(|s| s.player_id));
         for a in idle {
             self.last_seen.remove(&a);
             if let Some(s) = self.sessions.remove(&a) {
@@ -647,6 +650,23 @@ mod tests {
         assert_eq!((last.tick, last.player, &last.outcome), (IDLE_TICKS + 1, 1, &Outcome::Left));
         s.receive(IDLE_TICKS + 1, addr(1), &walk(t1, 1));
         assert_eq!(s.net_stats().get("not_joined"), 1);
+    }
+
+    /// Sessions that time out together are recorded `Left` in player-id
+    /// order, whatever their addresses sort as. Source ports are the OS's
+    /// choice (sequential on Windows, random on Linux), so ordering by
+    /// address would make the record depend on the transport.
+    #[test]
+    fn sessions_that_end_together_leave_in_player_id_order() {
+        let mut s = server();
+        let port = |p: u16| SocketAddr::new(addr(1).ip(), p);
+        for p in [5000, 4000, 4500] {
+            admit(&mut s, port(p)); // ids 1, 2, 3; addresses out of order
+        }
+        s.begin_tick(IDLE_TICKS + 1);
+        let left: Vec<_> =
+            s.telemetry().records().iter().filter(|r| r.outcome == Outcome::Left).map(|r| r.player).collect();
+        assert_eq!(left, vec![1, 2, 3]);
     }
 
     #[test]

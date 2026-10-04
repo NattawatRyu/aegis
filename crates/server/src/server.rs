@@ -26,7 +26,7 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 
-use aegis_protocol::{split_frame, ClientMsg, LinkKey, NO_TOKEN, PlayerId, PlayerState, ServerMsg, Vec2, TICK_HZ};
+use aegis_protocol::{split_frame, ClientMsg, LinkKey, PlayerId, PlayerState, ServerMsg, Vec2, NO_TOKEN, TICK_HZ};
 use aegis_telemetry::Telemetry;
 
 use crate::guards::cookie::CookieJar;
@@ -474,7 +474,9 @@ mod tests {
     #[test]
     fn first_join_is_only_challenged() {
         let mut s = server();
-        let Some(Reply::Challenge(c)) = s.receive(0, addr(1), &join(PROTOCOL_VERSION)) else { panic!("not challenged") };
+        let Some(Reply::Challenge(c)) = s.receive(0, addr(1), &join(PROTOCOL_VERSION)) else {
+            panic!("not challenged")
+        };
         assert_eq!(s.peers().count(), 0);
         assert!(s.sim().snapshot().is_empty());
         // the cookie from another address, or a wrong one, admits nobody
@@ -482,7 +484,9 @@ mod tests {
         assert_eq!(s.receive(0, addr(1), &join_with(PROTOCOL_VERSION, Some(c ^ 1))), None);
         assert_eq!(s.net_stats().get("bad_cookie"), 2);
         assert_eq!(s.peers().count(), 0);
-        let Some(Reply::Joined(x)) = s.receive(0, addr(1), &join_with(PROTOCOL_VERSION, Some(c))) else { panic!("not admitted") };
+        let Some(Reply::Joined(x)) = s.receive(0, addr(1), &join_with(PROTOCOL_VERSION, Some(c))) else {
+            panic!("not admitted")
+        };
         assert_eq!(x.player_id, 1);
     }
 
@@ -495,7 +499,10 @@ mod tests {
         let Some(Reply::Challenge(c)) = s.receive(0, addr(1), &join(PROTOCOL_VERSION)) else { panic!() };
         assert_eq!(s.receive(2 * BUCKET_TICKS, addr(1), &join_with(PROTOCOL_VERSION, Some(c))), None);
         assert_eq!(s.net_stats().get("bad_cookie"), 1);
-        assert!(matches!(s.receive(2 * BUCKET_TICKS - 1, addr(1), &join_with(PROTOCOL_VERSION, Some(c))), Some(Reply::Joined(_))));
+        assert!(matches!(
+            s.receive(2 * BUCKET_TICKS - 1, addr(1), &join_with(PROTOCOL_VERSION, Some(c))),
+            Some(Reply::Joined(_))
+        ));
     }
 
     /// Behind a relay that checks cookies at the edge, a Join that arrives
@@ -535,7 +542,8 @@ mod tests {
         let mut s = server();
         s.trust_edge_cookies();
         for token in [aegis_protocol::mint_token(&key, addr(1), 7), 0x5EED_5EED_5EED_5EED] {
-            let d = frame(token, &ClientMsg::Join { name: "t".into(), protocol: PROTOCOL_VERSION, cookie: Some(0x5EED) });
+            let d =
+                frame(token, &ClientMsg::Join { name: "t".into(), protocol: PROTOCOL_VERSION, cookie: Some(0x5EED) });
             assert_eq!(s.receive(0, addr(1), &d), None, "token {token:#x} admitted without a proven cookie");
         }
         assert_eq!(s.net_stats().get("bad_cookie"), 2);

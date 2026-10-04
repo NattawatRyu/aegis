@@ -121,7 +121,8 @@ impl Drop for Reader {
     /// before handling anything it reads.
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        let local: SocketAddr = if self.wake.is_ipv4() { (Ipv4Addr::LOCALHOST, 0).into() } else { (Ipv6Addr::LOCALHOST, 0).into() };
+        let local: SocketAddr =
+            if self.wake.is_ipv4() { (Ipv4Addr::LOCALHOST, 0).into() } else { (Ipv6Addr::LOCALHOST, 0).into() };
         if let Ok(w) = UdpSocket::bind(local) {
             let _ = w.send_to(&[], self.wake);
         }
@@ -358,7 +359,10 @@ mod tests {
     }
 
     fn input(token: u64, seq: u32) -> Vec<u8> {
-        frame(token, &ClientMsg::Input { seq, tick: seq, move_dir: Vec2::new(1.0, 0.0), aim: Vec2::new(1.0, 0.0), shoot: false })
+        frame(
+            token,
+            &ClientMsg::Input { seq, tick: seq, move_dir: Vec2::new(1.0, 0.0), aim: Vec2::new(1.0, 0.0), shoot: false },
+        )
     }
 
     fn read(c: &UdpSocket) -> ServerMsg {

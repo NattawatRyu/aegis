@@ -92,13 +92,7 @@ pub enum ClientMsg {
     },
     /// `seq`: client's monotonic counter, used for dup/replay detection.
     /// `tick`: the tick the client believes it is acting on (lag context).
-    Input {
-        seq: u32,
-        tick: u32,
-        move_dir: Vec2,
-        aim: Vec2,
-        shoot: bool,
-    },
+    Input { seq: u32, tick: u32, move_dir: Vec2, aim: Vec2, shoot: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -132,21 +126,10 @@ pub enum ServerMsg {
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum EventKind {
-    Hit {
-        shooter: PlayerId,
-        target: PlayerId,
-        damage: u8,
-    },
-    Death {
-        player: PlayerId,
-        by: PlayerId,
-    },
-    Join {
-        player: PlayerId,
-    },
-    Leave {
-        player: PlayerId,
-    },
+    Hit { shooter: PlayerId, target: PlayerId, damage: u8 },
+    Death { player: PlayerId, by: PlayerId },
+    Join { player: PlayerId },
+    Leave { player: PlayerId },
 }
 
 /// Serialize a message to bytes for the wire.
@@ -474,7 +457,14 @@ mod tests {
     fn envelope_hides_address_token_and_payload() {
         let client: SocketAddr = "10.11.12.13:47806".parse().unwrap();
         let token = 0xA1B2_C3D4_E5F6_0718u64;
-        let payload = frame(token, &ClientMsg::Join { name: "secret-name".into(), protocol: PROTOCOL_VERSION, cookie: Some(0x0123_4567_89AB_CDEF) });
+        let payload = frame(
+            token,
+            &ClientMsg::Join {
+                name: "secret-name".into(),
+                protocol: PROTOCOL_VERSION,
+                cookie: Some(0x0123_4567_89AB_CDEF),
+            },
+        );
         let w = wrap(&KEY, Dir::Up, client, &payload);
         let contains = |needle: &[u8]| w.windows(needle.len()).any(|win| win == needle);
         assert!(!contains(&[10, 11, 12, 13]), "client IP in the clear");

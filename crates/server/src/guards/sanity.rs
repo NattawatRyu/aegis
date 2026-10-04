@@ -46,13 +46,19 @@ mod tests {
     fn nan_move_rejected() {
         let mut g = SanityGuard;
         let mut i = ClientInput { move_dir: Vec2::new(f32::NAN, 0.0), ..base() };
-        assert_eq!(g.check(&GuardCtx { tick: 1, player: 1 }, &mut i), GuardVerdict::Rejected(RejectReason::MalformedInput));
+        assert_eq!(
+            g.check(&GuardCtx { tick: 1, player: 1 }, &mut i),
+            GuardVerdict::Rejected(RejectReason::MalformedInput)
+        );
     }
 
     #[test]
     fn infinite_aim_rejected() {
         let mut g = SanityGuard;
         let mut i = ClientInput { aim: Vec2::new(f32::INFINITY, 0.0), ..base() };
-        assert_eq!(g.check(&GuardCtx { tick: 1, player: 1 }, &mut i), GuardVerdict::Rejected(RejectReason::MalformedInput));
+        assert_eq!(
+            g.check(&GuardCtx { tick: 1, player: 1 }, &mut i),
+            GuardVerdict::Rejected(RejectReason::MalformedInput)
+        );
     }
 }

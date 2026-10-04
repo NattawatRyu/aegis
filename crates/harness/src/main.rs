@@ -21,7 +21,9 @@
 use std::path::PathBuf;
 
 use aegis_detector::detectors::aim_exact::EXACT_RAD;
-use aegis_harness::{cull_sweep, edge_dropped, edge_seen, honest_sweep, leak_by_step, run, run_relay, run_udp, Scenario};
+use aegis_harness::{
+    cull_sweep, edge_dropped, edge_seen, honest_sweep, leak_by_step, run, run_relay, run_udp, Scenario,
+};
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -65,8 +67,18 @@ fn main() -> std::io::Result<()> {
         };
         println!(
             "{:<11} {:>6} {:>8} {:>7}  {:<32} {:>5} {:>5} {:>5.2} {:>5} {:>8.3} {:>11}  {}",
-            b.name, b.joined(), b.totals.accepted, b.totals.anomalies, rejected,
-            b.shots, b.hits, b.accuracy(), b.kills, b.max_step, format!("{}/{}", b.hidden, b.walled), flags
+            b.name,
+            b.joined(),
+            b.totals.accepted,
+            b.totals.anomalies,
+            rejected,
+            b.shots,
+            b.hits,
+            b.accuracy(),
+            b.kills,
+            b.max_step,
+            format!("{}/{}", b.hidden, b.walled),
+            flags
         );
     }
     let net = r.net.dropped.iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(", ");
@@ -90,7 +102,10 @@ fn main() -> std::io::Result<()> {
             e.oversize
         );
         let kept = seen - e.up;
-        println!("relay edge: {:.0}% of client datagrams never reached the origin", 100.0 * kept as f64 / seen.max(1) as f64);
+        println!(
+            "relay edge: {:.0}% of client datagrams never reached the origin",
+            100.0 * kept as f64 / seen.max(1) as f64
+        );
     }
 
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scenarios/out");
@@ -142,7 +157,11 @@ fn sweep(lobbies: u32) {
     };
     let acc = col(&|s| if s.shots() == 0 { 0.0 } else { s.hits as f32 / s.shots() as f32 });
     let exact = col(&|s| {
-        if s.shots() == 0 { 0.0 } else { s.aim_errs.iter().filter(|&&e| e < EXACT_RAD).count() as f32 / s.shots() as f32 }
+        if s.shots() == 0 {
+            0.0
+        } else {
+            s.aim_errs.iter().filter(|&&e| e < EXACT_RAD).count() as f32 / s.shots() as f32
+        }
     });
     let anom = col(&|s| if s.accepted == 0 { 0.0 } else { s.anomalies as f32 / s.accepted as f32 });
     let shots = col(&|s| s.shots() as f32);

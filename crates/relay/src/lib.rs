@@ -73,8 +73,8 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use aegis_protocol::{
-    decode, encode, split_frame, token_valid, unwrap, wrap, ClientMsg, Dir, EnvelopeError, LinkKey, ServerMsg, ENVELOPE_MAX,
-    MAX_DATAGRAM, NO_TOKEN, TICK_HZ,
+    decode, encode, split_frame, token_valid, unwrap, wrap, ClientMsg, Dir, EnvelopeError, LinkKey, ServerMsg,
+    ENVELOPE_MAX, MAX_DATAGRAM, NO_TOKEN, TICK_HZ,
 };
 use join_rate::JoinRate;
 
@@ -167,7 +167,12 @@ impl Relay {
     /// Bind the public socket (what clients are told) and the upstream socket
     /// (what the origin allowlists), and start forwarding to `origin`, with
     /// whom this relay shares `key`. Budget windows follow the wall clock.
-    pub fn spawn(public: impl ToSocketAddrs, upstream: impl ToSocketAddrs, origin: SocketAddr, key: LinkKey) -> io::Result<Self> {
+    pub fn spawn(
+        public: impl ToSocketAddrs,
+        upstream: impl ToSocketAddrs,
+        origin: SocketAddr,
+        key: LinkKey,
+    ) -> io::Result<Self> {
         Self::spawn_with(public, upstream, origin, key, Clock::wall())
     }
 
@@ -258,7 +263,8 @@ impl Drop for Relay {
         };
         for a in [self.public, self.upstream] {
             let to = reach(a);
-            let local: SocketAddr = if to.is_ipv4() { (Ipv4Addr::LOCALHOST, 0).into() } else { (Ipv6Addr::LOCALHOST, 0).into() };
+            let local: SocketAddr =
+                if to.is_ipv4() { (Ipv4Addr::LOCALHOST, 0).into() } else { (Ipv6Addr::LOCALHOST, 0).into() };
             if let Ok(w) = UdpSocket::bind(local) {
                 let _ = w.send_to(&[], to);
             }
@@ -548,7 +554,8 @@ mod tests {
     fn token_zero_gets_the_origins_budget_per_ip_per_window() {
         use join_rate::MAX_PER_WINDOW;
         let origin = sock();
-        let r = Relay::spawn_with("127.0.0.1:0", "127.0.0.1:0", origin.local_addr().unwrap(), *KEY, Clock::lockstep()).unwrap();
+        let r = Relay::spawn_with("127.0.0.1:0", "127.0.0.1:0", origin.local_addr().unwrap(), *KEY, Clock::lockstep())
+            .unwrap();
         let (a, b) = (sock(), sock());
         let join = tokened(NO_TOKEN, b"join");
         for _ in 0..MAX_PER_WINDOW {
@@ -569,7 +576,10 @@ mod tests {
     }
 
     fn join(cookie: Option<u64>) -> Vec<u8> {
-        aegis_protocol::frame(NO_TOKEN, &ClientMsg::Join { name: "j".into(), protocol: aegis_protocol::PROTOCOL_VERSION, cookie })
+        aegis_protocol::frame(
+            NO_TOKEN,
+            &ClientMsg::Join { name: "j".into(), protocol: aegis_protocol::PROTOCOL_VERSION, cookie },
+        )
     }
 
     /// The handshake at the edge: a cookieless Join is answered by the
@@ -579,7 +589,8 @@ mod tests {
     fn a_cookieless_join_is_challenged_at_the_edge_and_the_answer_crosses() {
         let origin = sock();
         origin.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
-        let r = Relay::spawn_with("127.0.0.1:0", "127.0.0.1:0", origin.local_addr().unwrap(), *KEY, Clock::lockstep()).unwrap();
+        let r = Relay::spawn_with("127.0.0.1:0", "127.0.0.1:0", origin.local_addr().unwrap(), *KEY, Clock::lockstep())
+            .unwrap();
         let client = sock();
         client.send_to(&join(None), r.public_addr()).unwrap();
         let (got, from) = recv(&client);
@@ -601,7 +612,8 @@ mod tests {
     #[test]
     fn a_cookie_not_issued_to_this_address_is_dropped() {
         let origin = sock();
-        let r = Relay::spawn_with("127.0.0.1:0", "127.0.0.1:0", origin.local_addr().unwrap(), *KEY, Clock::lockstep()).unwrap();
+        let r = Relay::spawn_with("127.0.0.1:0", "127.0.0.1:0", origin.local_addr().unwrap(), *KEY, Clock::lockstep())
+            .unwrap();
         let client = sock();
         let me = client.local_addr().unwrap();
         let other = SocketAddr::new(me.ip(), me.port().wrapping_add(1));
@@ -609,7 +621,12 @@ mod tests {
         for _ in 0..2 * cookie::BUCKET_WINDOWS {
             r.next_window();
         }
-        for k in [0x5EED, cookie::issue(&KEY, other, 2 * cookie::BUCKET_WINDOWS), cookie::issue(&LinkKey::new([1; 32]), me, 0), old] {
+        for k in [
+            0x5EED,
+            cookie::issue(&KEY, other, 2 * cookie::BUCKET_WINDOWS),
+            cookie::issue(&LinkKey::new([1; 32]), me, 0),
+            old,
+        ] {
             client.send_to(&join(Some(k)), r.public_addr()).unwrap();
         }
         assert_eq!(settle(&r, |s| s.bad_cookie == 4), RelayStats { bad_cookie: 4, ..Default::default() });
@@ -625,7 +642,8 @@ mod tests {
     fn joins_from_many_ips_never_cross_unproven() {
         let origin = sock();
         origin.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
-        let r = Relay::spawn_with("127.0.0.1:0", "127.0.0.1:0", origin.local_addr().unwrap(), *KEY, Clock::lockstep()).unwrap();
+        let r = Relay::spawn_with("127.0.0.1:0", "127.0.0.1:0", origin.local_addr().unwrap(), *KEY, Clock::lockstep())
+            .unwrap();
         const IPS: u8 = 50;
         for i in 0..IPS {
             let s = UdpSocket::bind((Ipv4Addr::new(127, 0, 9, i + 1), 0)).unwrap();

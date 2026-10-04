@@ -23,16 +23,16 @@
 use aegis_protocol::{PlayerId, Vec2};
 
 pub mod cookie;
+pub mod input_rate;
 pub mod ip_sessions;
+pub mod joined;
+pub mod move_speed;
+pub mod packet;
+pub mod replay;
+pub mod sanity;
 pub mod session;
 pub mod source_rate;
 pub mod version;
-pub mod packet;
-pub mod joined;
-pub mod sanity;
-pub mod input_rate;
-pub mod replay;
-pub mod move_speed;
 
 /// Per-input context handed to every guard.
 #[derive(Debug, Clone, Copy)]
@@ -180,13 +180,7 @@ mod tests {
     use super::*;
 
     fn input() -> ClientInput {
-        ClientInput {
-            seq: 1,
-            tick: 1,
-            move_dir: Vec2::new(0.3, 0.4),
-            aim: Vec2::new(1.0, 0.0),
-            shoot: false,
-        }
+        ClientInput { seq: 1, tick: 1, move_dir: Vec2::new(0.3, 0.4), aim: Vec2::new(1.0, 0.0), shoot: false }
     }
 
     #[test]

@@ -142,10 +142,11 @@ mod tests {
     #[test]
     fn different_seeds_aim_differently() {
         let snap = [state(1, Vec2::ZERO), state(2, Vec2::new(1.0, 0.0))];
-        let aim = |seed| match HonestBot::with_seed(seed).act(&BotCtx { tick: 1, my_id: 1, token: 0, snapshot: &snap })[0] {
-            ClientMsg::Input { aim, .. } => aim,
-            _ => panic!("expected Input"),
-        };
+        let aim =
+            |seed| match HonestBot::with_seed(seed).act(&BotCtx { tick: 1, my_id: 1, token: 0, snapshot: &snap })[0] {
+                ClientMsg::Input { aim, .. } => aim,
+                _ => panic!("expected Input"),
+            };
         assert_ne!(aim(1), aim(2));
     }
 
@@ -162,10 +163,22 @@ mod tests {
     fn turns_when_a_step_goes_nowhere() {
         let mut b = HonestBot::new();
         let at = |x| [state(1, Vec2::new(x, 0.0))];
-        assert_eq!(walk_of(&b.act(&BotCtx { tick: 1, my_id: 1, token: 0, snapshot: &at(0.0) })[0]), Vec2::new(1.0, 0.0));
-        assert_eq!(walk_of(&b.act(&BotCtx { tick: 2, my_id: 1, token: 0, snapshot: &at(5.0) })[0]), Vec2::new(1.0, 0.0));
-        assert_eq!(walk_of(&b.act(&BotCtx { tick: 3, my_id: 1, token: 0, snapshot: &at(5.0) })[0]), Vec2::new(-0.0, 1.0));
-        assert_eq!(walk_of(&b.act(&BotCtx { tick: 4, my_id: 1, token: 0, snapshot: &at(5.0) })[0]), Vec2::new(-1.0, -0.0));
+        assert_eq!(
+            walk_of(&b.act(&BotCtx { tick: 1, my_id: 1, token: 0, snapshot: &at(0.0) })[0]),
+            Vec2::new(1.0, 0.0)
+        );
+        assert_eq!(
+            walk_of(&b.act(&BotCtx { tick: 2, my_id: 1, token: 0, snapshot: &at(5.0) })[0]),
+            Vec2::new(1.0, 0.0)
+        );
+        assert_eq!(
+            walk_of(&b.act(&BotCtx { tick: 3, my_id: 1, token: 0, snapshot: &at(5.0) })[0]),
+            Vec2::new(-0.0, 1.0)
+        );
+        assert_eq!(
+            walk_of(&b.act(&BotCtx { tick: 4, my_id: 1, token: 0, snapshot: &at(5.0) })[0]),
+            Vec2::new(-1.0, -0.0)
+        );
     }
 
     #[test]

@@ -16,11 +16,11 @@ pub mod net;
 pub mod server;
 pub mod sim;
 
+pub use cull::{Cull, MAX_MARGIN_TICKS};
 pub use guards::session::Session;
 pub use guards::{ClientInput, GuardCtx, GuardVerdict, Pipeline, RejectReason};
 pub use net::NetServer;
 pub use server::{NetStats, Reply, Server, TickOutcome};
-pub use cull::{Cull, MAX_MARGIN_TICKS};
 pub use sim::{ShotResult, Sim, Wall, ARENA_WALLS};
 
 #[cfg(test)]
@@ -38,16 +38,14 @@ mod integration {
         sim.spawn(1, Vec2::ZERO); // honest
         sim.spawn(2, Vec2::ZERO); // cheater
 
-        let mut honest = ClientInput {
-            seq: 1, tick: 1, move_dir: Vec2::new(1.0, 0.0), aim: Vec2::new(1.0, 0.0), shoot: false,
-        };
+        let mut honest =
+            ClientInput { seq: 1, tick: 1, move_dir: Vec2::new(1.0, 0.0), aim: Vec2::new(1.0, 0.0), shoot: false };
         let v1 = pipe.run(&GuardCtx { tick: 1, player: 1 }, &mut honest);
         assert_eq!(v1, GuardVerdict::Ok { anomaly: false });
         sim.apply_move(1, honest.move_dir);
 
-        let mut cheat = ClientInput {
-            seq: 1, tick: 1, move_dir: Vec2::new(10.0, 0.0), aim: Vec2::new(1.0, 0.0), shoot: false,
-        };
+        let mut cheat =
+            ClientInput { seq: 1, tick: 1, move_dir: Vec2::new(10.0, 0.0), aim: Vec2::new(1.0, 0.0), shoot: false };
         let v2 = pipe.run(&GuardCtx { tick: 1, player: 2 }, &mut cheat);
         assert_eq!(v2, GuardVerdict::Ok { anomaly: true }); // clamp flagged for the detector
         sim.apply_move(2, cheat.move_dir);
@@ -66,9 +64,7 @@ mod integration {
         let ctx = GuardCtx { tick: 1, player: 1 };
         let mut accepted = 0;
         for seq in 1..=100 {
-            let mut i = ClientInput {
-                seq, tick: 1, move_dir: Vec2::new(1.0, 0.0), aim: Vec2::ZERO, shoot: false,
-            };
+            let mut i = ClientInput { seq, tick: 1, move_dir: Vec2::new(1.0, 0.0), aim: Vec2::ZERO, shoot: false };
             if let GuardVerdict::Ok { .. } = pipe.run(&ctx, &mut i) {
                 sim.apply_move(1, i.move_dir);
                 accepted += 1;

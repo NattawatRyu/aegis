@@ -1,5 +1,7 @@
 # Aegis
 
+[![ci](https://github.com/NattawatRyu/aegis/actions/workflows/ci.yml/badge.svg)](https://github.com/NattawatRyu/aegis/actions/workflows/ci.yml)
+
 Open-source toolkit that helps game developers build multiplayer games that
 resist **cheating** and **DDoS** from day one — by fixing the *architecture*,
 not by chasing individual cheats.

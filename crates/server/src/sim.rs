@@ -133,9 +133,7 @@ impl Sim {
             return self.clear(from, to);
         }
         let (px, py) = (-dy / l * HIT_RADIUS, dx / l * HIT_RADIUS);
-        [to, Vec2::new(to.x + px, to.y + py), Vec2::new(to.x - px, to.y - py)]
-            .into_iter()
-            .any(|t| self.clear(from, t))
+        [to, Vec2::new(to.x + px, to.y + py), Vec2::new(to.x - px, to.y - py)].into_iter().any(|t| self.clear(from, t))
     }
 
     /// Could a player at `from` see a player at `to` at some moment in the
@@ -368,7 +366,11 @@ impl Sim {
     /// [`Sim::view_within`] at another step size ([`Sim::sees_within_step`]).
     pub fn view_within_step(&self, id: PlayerId, ticks: u32, step: f32) -> Vec<PlayerState> {
         let Some(me) = self.player(id) else { return Vec::new() };
-        self.players.iter().filter(|p| p.id == id || self.sees_within_step(me.pos, p.pos, ticks, step)).copied().collect()
+        self.players
+            .iter()
+            .filter(|p| p.id == id || self.sees_within_step(me.pos, p.pos, ticks, step))
+            .copied()
+            .collect()
     }
 }
 
@@ -515,7 +517,8 @@ mod tests {
         let mut sim = Sim::new();
         sim.spawn(1, Vec2::ZERO);
         sim.spawn(2, Vec2::new(10.0, 0.0));
-        for aim in [Vec2::ZERO, Vec2::new(f32::NAN, 0.0), Vec2::new(f32::INFINITY, 0.0), Vec2::new(f32::MAX, f32::MAX)] {
+        for aim in [Vec2::ZERO, Vec2::new(f32::NAN, 0.0), Vec2::new(f32::INFINITY, 0.0), Vec2::new(f32::MAX, f32::MAX)]
+        {
             assert_eq!(sim.apply_shot(1, aim), None, "{aim:?} hit");
             assert_eq!(sim.aim_error(1, aim), None, "{aim:?} scored");
         }

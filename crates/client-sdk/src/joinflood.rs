@@ -53,7 +53,8 @@ impl Bot for JoinFloodBot {
     }
 
     fn routed(&mut self, _ctx: &BotCtx) -> Vec<(u16, Vec<u8>)> {
-        let join = frame(NO_TOKEN, &ClientMsg::Join { name: self.name().into(), protocol: PROTOCOL_VERSION, cookie: None });
+        let join =
+            frame(NO_TOKEN, &ClientMsg::Join { name: self.name().into(), protocol: PROTOCOL_VERSION, cookie: None });
         (0..JOINS_PER_TICK)
             .map(|_| {
                 self.next = self.next % SOURCES + 1; // 1..=SOURCES, then around again

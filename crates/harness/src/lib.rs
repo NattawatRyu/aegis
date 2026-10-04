@@ -23,15 +23,29 @@ use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 use aegis_client_sdk::{
-    aimbot::AimbotBot, badversion::BadVersionBot, direct::DirectBot, esp::EspBot, flood::FloodBot, garbage::GarbageBot,
-    honest::HonestBot, humanized::HumanizedAimbot, joinflood::JoinFloodBot, nan::NanBot,
-    reflect::{ReflectBot, BYSTANDER}, replay::ReplayBot,
-    speedhack::SpeedhackBot, spoof::SpoofBot, zeroflood::ZeroFloodBot, Bot, BotCtx,
+    aimbot::AimbotBot,
+    badversion::BadVersionBot,
+    direct::DirectBot,
+    esp::EspBot,
+    flood::FloodBot,
+    garbage::GarbageBot,
+    honest::HonestBot,
+    humanized::HumanizedAimbot,
+    joinflood::JoinFloodBot,
+    nan::NanBot,
+    reflect::{ReflectBot, BYSTANDER},
+    replay::ReplayBot,
+    speedhack::SpeedhackBot,
+    spoof::SpoofBot,
+    zeroflood::ZeroFloodBot,
+    Bot, BotCtx,
 };
 use aegis_detector::{Flag, Suite};
-use aegis_protocol::{decode, encode, frame, split_frame, ClientMsg, LinkKey, PlayerId, PlayerState, ServerMsg, Vec2, NO_TOKEN};
-use aegis_server::net::MAX_DATAGRAM;
+use aegis_protocol::{
+    decode, encode, frame, split_frame, ClientMsg, LinkKey, PlayerId, PlayerState, ServerMsg, Vec2, NO_TOKEN,
+};
 use aegis_relay::{Clock, Relay, RelayStats};
+use aegis_server::net::MAX_DATAGRAM;
 use aegis_server::{NetServer, NetStats, Reply, Server, Session, Sim, TickOutcome, ARENA_WALLS};
 use aegis_telemetry::{Telemetry, Totals};
 
@@ -85,7 +99,9 @@ impl Scenario {
             .map(|(i, b)| match b.impersonates() {
                 None => i,
                 Some(BYSTANDER) => self.bystander(),
-                Some(v) => self.bots.iter().position(|o| o.name() == v).unwrap_or_else(|| panic!("no victim named {v}")),
+                Some(v) => {
+                    self.bots.iter().position(|o| o.name() == v).unwrap_or_else(|| panic!("no victim named {v}"))
+                }
             })
             .collect()
     }
@@ -102,7 +118,9 @@ impl Scenario {
             name: "honest_lobby",
             ticks: 300,
             bots: (0..LOBBY_SIZE)
-                .map(|k| Box::new(HonestBot::with_seed(seed.wrapping_mul(LOBBY_SIZE).wrapping_add(k + 1))) as Box<dyn Bot>)
+                .map(|k| {
+                    Box::new(HonestBot::with_seed(seed.wrapping_mul(LOBBY_SIZE).wrapping_add(k + 1))) as Box<dyn Bot>
+                })
                 .collect(),
         }
     }
@@ -246,7 +264,9 @@ pub fn cull_sweep(lobbies: u32, max_lag: u32) -> CullSweep {
                 worlds
                     .iter()
                     .zip(&frames)
-                    .map(|(w, f)| f.iter().map(|v| (v.id, w.view_within(v.id, k).iter().map(|p| p.id).collect())).collect())
+                    .map(|(w, f)| {
+                        f.iter().map(|v| (v.id, w.view_within(v.id, k).iter().map(|p| p.id).collect())).collect()
+                    })
                     .collect()
             })
             .collect();
@@ -348,7 +368,8 @@ impl Lab {
     /// (every client's before D4) would have handed it.
     fn count_hidden(&mut self, i: usize, sim: &Sim, seen: &[PlayerState]) {
         let Some(me) = self.id(i).and_then(|p| seen.iter().find(|s| s.id == p)) else { return };
-        let behind = |ps: &[PlayerState]| ps.iter().filter(|p| p.id != me.id && !sim.sees(me.pos, p.pos)).count() as u32;
+        let behind =
+            |ps: &[PlayerState]| ps.iter().filter(|p| p.id != me.id && !sim.sees(me.pos, p.pos)).count() as u32;
         self.hidden[i] += behind(seen);
         self.walled[i] += behind(&sim.snapshot());
     }
@@ -642,7 +663,13 @@ fn with_cookie(datagram: &[u8], cookie: u64) -> Option<Vec<u8>> {
 /// forwarded will ever arrive. First waits until the relay has accounted for
 /// every one of the `via` (forwarded or dropped, by its counters since
 /// `before`), so the count is exact, never a guess against the clock.
-fn deliver(net: &mut NetServer, relay: Option<&Relay>, before: RelayStats, via: usize, direct: usize) -> io::Result<()> {
+fn deliver(
+    net: &mut NetServer,
+    relay: Option<&Relay>,
+    before: RelayStats,
+    via: usize,
+    direct: usize,
+) -> io::Result<()> {
     let forwarded = match relay {
         None => via,
         Some(r) => {
@@ -713,7 +740,8 @@ fn udp_challenges(
     let mut retry = Vec::new();
     if let Some(via_relay) = edge {
         if net.take_replies().iter().any(|(_, m)| matches!(m, ServerMsg::Challenge { .. })) {
-            let msg = format!("tick {}: the origin challenged a join, so an unproven join crossed the relay", net.tick());
+            let msg =
+                format!("tick {}: the origin challenged a join, so an unproven join crossed the relay", net.tick());
             return Err(io::Error::other(msg));
         }
         for (i, slot, k, d) in sent {
@@ -828,7 +856,12 @@ fn drain_bytes(sock: &UdpSocket, settle: Duration) -> io::Result<u64> {
 }
 
 /// Read this tick's snapshot, taking any `Joined` that arrives first.
-fn read_snapshot(sock: &UdpSocket, server: SocketAddr, tick: u32, session: &mut Option<Session>) -> io::Result<Vec<PlayerState>> {
+fn read_snapshot(
+    sock: &UdpSocket,
+    server: SocketAddr,
+    tick: u32,
+    session: &mut Option<Session>,
+) -> io::Result<Vec<PlayerState>> {
     let mut buf = [0u8; MAX_DATAGRAM];
     loop {
         let n = recv_from_server(sock, server, &mut buf)?;
@@ -847,11 +880,11 @@ fn read_snapshot(sock: &UdpSocket, server: SocketAddr, tick: u32, session: &mut 
 mod tests {
     use super::*;
     use aegis_client_sdk::{flood, garbage, spoof, zeroflood};
+    use aegis_detector::detectors::{accuracy, aim_exact, anomaly_rate};
+    use aegis_detector::FlagReason;
     use aegis_server::guards::source_rate::MAX_PER_TICK;
     use aegis_server::net::NOT_RELAY;
     use aegis_server::sim::MOVE_SPEED;
-    use aegis_detector::detectors::{accuracy, aim_exact, anomaly_rate};
-    use aegis_detector::FlagReason;
     use aegis_server::RejectReason;
 
     fn standard() -> Report {
@@ -949,8 +982,8 @@ mod tests {
         let s = r.bot("spoof");
         assert!(s.joined());
         assert_eq!(s.totals, Totals::default()); // it never sent as itself
-        // Up to the victim IP's unauthenticated budget, each forgery is
-        // decoded and refused for its token; the rest never get that far.
+                                                 // Up to the victim IP's unauthenticated budget, each forgery is
+                                                 // decoded and refused for its token; the rest never get that far.
         assert_eq!(r.net.get("bad_token"), u64::from(MAX_PER_TICK * r.ticks));
     }
 

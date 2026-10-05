@@ -7,21 +7,33 @@
 //! The blunt instrument: no human hits almost everything. It cannot tell a
 //! great player from a subtle aimbot near the line — that is aim_exact's job,
 //! and why the threshold sits well above the best honest run (see THRESHOLD).
+//!
+//! Weakest of the three signals, because hit rate is not only aim: range and
+//! a still target matter as much. An honest rusher in a full arena hits more
+//! than 0.8 of 30 shots; only a larger sample separates it from an aimbot.
 
 use crate::{Detector, Flag, FlagReason, PlayerStats};
 
 /// Fewer shots than this and hit rate is noise, not evidence.
-pub const MIN_SHOTS: u32 = 30;
+///
+/// 60, not 30: at 30 shots an honest rusher's online peak reached 0.914
+/// (`aegis-harness sweep`, 63 crowds of 16 = 1008 honest players, walkers,
+/// campers and rushers, 2026-10-05); at 60 its max is 0.700. The cost: 46% of
+/// that crowd fired fewer than 60 aim-evidence shots and gets no accuracy
+/// verdict — aim_exact (30) still judges them.
+pub const MIN_SHOTS: u32 = 60;
 
 /// Flag strictly above this hit rate.
 ///
-/// Measured (`aegis-harness sweep 250`, 1000 honest bots, 2026-10-02, walled
-/// arena + culled snapshots): p50 0.112, p99 0.199, max 0.231. Both aimbots:
-/// 0.96-0.99. (Open arena, 2026-09-30: max 0.438.) The line sits ~1.8x the
-/// open-arena best honest run, because a real player population has a fatter
-/// top tail than one seeded bot — re-measure on real telemetry before
-/// trusting it on a live game.
-pub const THRESHOLD: f32 = 0.8;
+/// Measured on the same crowd, over every view the online monitor judges
+/// (running lifetime and window, from MIN_SHOTS): honest max 0.700; the esp
+/// bot (an honest rusher, culled) 0.778 in the standard scenario. Humanized
+/// aimbot 0.968, snap aimbot 0.992. The line splits the 0.778-0.968 gap.
+/// History: 0.8 at MIN 30, set 2026-10-02 from 4-player walker lobbies (max
+/// 0.231), was wrong for a full arena — an honest whole-run rate reached
+/// 0.865 there. Re-measure on real telemetry before trusting it on a live
+/// game.
+pub const THRESHOLD: f32 = 0.85;
 
 pub struct AccuracyDetector;
 
@@ -31,7 +43,7 @@ impl Detector for AccuracyDetector {
     }
 
     fn check(&self, s: &PlayerStats) -> Option<Flag> {
-        let shots = s.shots();
+        let shots = s.shots;
         if shots < MIN_SHOTS {
             return None;
         }
@@ -51,7 +63,7 @@ mod tests {
     use super::*;
 
     fn player(shots: u32, hits: u32) -> PlayerStats {
-        PlayerStats { player: 7, hits, aim_errs: vec![0.1; shots as usize], ..Default::default() }
+        PlayerStats { player: 7, shots, hits, ..Default::default() }
     }
 
     #[test]

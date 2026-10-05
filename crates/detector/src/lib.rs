@@ -24,45 +24,58 @@ use aegis_telemetry::{Outcome, Record};
 
 pub mod detectors;
 
+pub mod monitor;
+pub use monitor::{Alert, Monitor};
+
 /// Everything the detectors know about one player, folded from telemetry.
-#[derive(Debug, Default, Clone, PartialEq)]
+/// Counts only, so a player who plays for hours costs the same memory as one
+/// who played a minute.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PlayerStats {
     pub player: u8,
     /// Inputs that reached the sim.
     pub accepted: u32,
     /// Accepted inputs a guard flagged as suspicious (e.g. a clamped move).
     pub anomalies: u32,
+    pub shots: u32,
     pub hits: u32,
-    /// One entry per shot, radians off the bearing to the nearest enemy.
-    pub aim_errs: Vec<f32>,
+    /// Shots whose aim landed within `aim_exact::EXACT_RAD` of the bearing to
+    /// the nearest enemy.
+    pub exact: u32,
 }
 
 impl PlayerStats {
-    pub fn shots(&self) -> u32 {
-        self.aim_errs.len() as u32
+    pub fn new(player: u8) -> Self {
+        Self { player, ..Default::default() }
+    }
+
+    /// Count one outcome. `Rejected` and `Left` change nothing here: what
+    /// `Left` means is up to the caller (see [`stats`] and [`Monitor`]).
+    pub fn record(&mut self, o: &Outcome) {
+        match *o {
+            Outcome::Accepted { anomaly } => {
+                self.accepted += 1;
+                self.anomalies += anomaly as u32;
+            }
+            Outcome::Shot { hit, aim_err } => {
+                self.shots += 1;
+                self.hits += hit as u32;
+                self.exact += detectors::aim_exact::is_exact(aim_err) as u32;
+            }
+            Outcome::Rejected { .. } | Outcome::Left => {}
+        }
     }
 }
 
-/// Fold a telemetry stream into per-player stats, ordered by player id.
+/// Offline v0: fold a whole telemetry stream into per-player stats, ordered by
+/// player id. Judges a whole run per id and ignores `Left`, so two people who
+/// held the same id are merged — fine for the lab's scenarios, where no id is
+/// reused, and wrong on a live server. [`Monitor`] is the online form; this
+/// stays as its oracle.
 pub fn stats(records: &[Record]) -> BTreeMap<u8, PlayerStats> {
     let mut m: BTreeMap<u8, PlayerStats> = BTreeMap::new();
     for r in records {
-        let s = m.entry(r.player).or_insert_with(|| PlayerStats { player: r.player, ..Default::default() });
-        match r.outcome {
-            Outcome::Accepted { anomaly } => {
-                s.accepted += 1;
-                s.anomalies += anomaly as u32;
-            }
-            Outcome::Rejected { .. } => {}
-            Outcome::Shot { hit, aim_err } => {
-                s.hits += hit as u32;
-                s.aim_errs.push(aim_err);
-            }
-            // Offline v0 judges a whole run per id. Ids are reused only after
-            // the server has cycled through all 255, which no scenario does;
-            // an online detector must split its window here.
-            Outcome::Left => {}
-        }
+        m.entry(r.player).or_insert_with(|| PlayerStats::new(r.player)).record(&r.outcome);
     }
     m
 }
@@ -149,9 +162,8 @@ mod tests {
         t.accept(1, 2, false);
         let m = stats(t.records());
         let p1 = &m[&1];
-        assert_eq!((p1.accepted, p1.anomalies, p1.hits, p1.shots()), (2, 1, 1, 2));
-        assert_eq!(p1.aim_errs, vec![0.0, 0.2]);
-        assert_eq!(m[&2].shots(), 0);
+        assert_eq!((p1.accepted, p1.anomalies, p1.shots, p1.hits, p1.exact), (2, 1, 2, 1, 1));
+        assert_eq!(m[&2].shots, 0);
     }
 
     #[test]

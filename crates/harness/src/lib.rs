@@ -17,7 +17,7 @@
 //! All server behaviour lives in [`aegis_server`]; this crate only drives bots
 //! against it and keeps the lab's measurements (kills, largest step).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
@@ -25,6 +25,8 @@ use std::time::{Duration, Instant};
 use aegis_client_sdk::{
     aimbot::AimbotBot,
     badversion::BadVersionBot,
+    burst::BurstBot,
+    camper::CamperBot,
     direct::DirectBot,
     esp::EspBot,
     flood::FloodBot,
@@ -35,12 +37,13 @@ use aegis_client_sdk::{
     nan::NanBot,
     reflect::{ReflectBot, BYSTANDER},
     replay::ReplayBot,
+    rusher::RusherBot,
     speedhack::SpeedhackBot,
     spoof::SpoofBot,
     zeroflood::ZeroFloodBot,
     Bot, BotCtx,
 };
-use aegis_detector::{Flag, Suite};
+use aegis_detector::{Alert, Monitor, PlayerStats};
 use aegis_protocol::{
     decode, encode, frame, split_frame, ClientMsg, LinkKey, PlayerId, PlayerState, ServerMsg, Vec2, NO_TOKEN,
 };
@@ -85,6 +88,7 @@ impl Scenario {
                 Box::new(ReflectBot::new()),
                 Box::new(EspBot::new()),
                 Box::new(ZeroFloodBot::new()),
+                Box::new(BurstBot::new()),
             ],
         }
     }
@@ -110,9 +114,8 @@ impl Scenario {
         self.bots.len()
     }
 
-    /// A lobby of `LOBBY_SIZE` honest players, each with its own aim seed
-    /// derived from `seed`. Nobody here cheats, so any flag the detector
-    /// raises in it is a false positive.
+    /// A lobby of `LOBBY_SIZE` honest walkers, each with its own aim seed
+    /// derived from `seed` — the world the culling measurements replay.
     pub fn honest_lobby(seed: u32) -> Self {
         Self {
             name: "honest_lobby",
@@ -124,7 +127,41 @@ impl Scenario {
                 .collect(),
         }
     }
+
+    /// A full arena of `CROWD_SIZE` honest players — the population the
+    /// detector's false-positive bound is measured on. Each has its own aim
+    /// seed derived from `seed`; per four: a walker, a camper, two rushers.
+    ///
+    /// Hit rate depends on more than aim. A rusher closing on a player who
+    /// holds still has the easiest honest shots there are, and how often that
+    /// happens grows with how full the arena is: one rusher among 3 campers
+    /// peaked at ~0.4, among 14 at ~0.77. A sweep of 4-player walker lobbies
+    /// (the old population) never saw either, and the esp bot — culled, an
+    /// honest rusher — tripped the accuracy line in the 15-player standard
+    /// scenario. Nobody here cheats, so any flag raised in it is a false
+    /// positive.
+    pub fn honest_crowd(seed: u32) -> Self {
+        Self {
+            name: "honest_crowd",
+            ticks: 300,
+            bots: (0..CROWD_SIZE)
+                .map(|k| {
+                    let s = seed.wrapping_mul(CROWD_SIZE).wrapping_add(k + 1);
+                    match k % 4 {
+                        0 => Box::new(HonestBot::with_seed(s)) as Box<dyn Bot>,
+                        2 => Box::new(CamperBot::with_seed(s)),
+                        _ => Box::new(RusherBot::with_seed(s)),
+                    }
+                })
+                .collect(),
+        }
+    }
 }
+
+/// Players per [`Scenario::honest_crowd`]: at least the standard scenario's
+/// head count, so the honest population is never measured in an emptier
+/// arena than the cheaters are.
+pub const CROWD_SIZE: u32 = 16;
 
 impl Scenario {
     /// An honest player and one that sends to the origin's own address. Run
@@ -160,8 +197,10 @@ pub struct BotReport {
     /// ticks — what an uncull'd snapshot would have leaked. `hidden` of
     /// `walled` is how much of it got out.
     pub walled: u32,
-    /// What the detector suite raised on this player's telemetry.
-    pub flags: Vec<Flag>,
+    /// What the online detector raised on this player, fed the run's telemetry
+    /// one record at a time in stream order (what a live server would feed
+    /// it), each with the tick it fired.
+    pub alerts: Vec<Alert>,
 }
 
 pub struct Report {
@@ -224,11 +263,71 @@ pub fn bot_ip(i: usize) -> Ipv4Addr {
     Ipv4Addr::new(127, 0, 0, u8::try_from(i + 2).expect("at most 254 bots"))
 }
 
-/// Detector stats for every player across `lobbies` honest lobbies (seeds
-/// 0..lobbies) — the honest population the thresholds are measured against.
-pub fn honest_sweep(lobbies: u32) -> Vec<aegis_detector::PlayerStats> {
-    (0..lobbies)
-        .flat_map(|seed| aegis_detector::stats(run(Scenario::honest_lobby(seed)).telemetry.records()).into_values())
+/// One honest player as the detector saw them.
+#[derive(Debug)]
+pub struct HonestPlayer {
+    /// How it plays: the bot's name (`honest` walks, `rusher` closes in).
+    pub style: &'static str,
+    /// Whole-run stats — what offline v0 judges.
+    pub life: PlayerStats,
+    /// The highest each signal reached at any record, over every view the
+    /// online monitor judged (running lifetime and window, each only once it
+    /// had its detector's minimum samples). A line below this would have
+    /// fired on an honest player somewhere mid-run.
+    pub peak: Peak,
+    /// What the online monitor raised.
+    pub alerts: Vec<Alert>,
+}
+
+/// Per-signal maxima; see [`HonestPlayer::peak`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Peak {
+    pub accuracy: f32,
+    pub aim_exact: f32,
+    pub anomaly_rate: f32,
+}
+
+impl Peak {
+    fn raise(&mut self, s: &PlayerStats) {
+        use aegis_detector::detectors::{accuracy, aim_exact, anomaly_rate};
+        if s.shots >= accuracy::MIN_SHOTS {
+            self.accuracy = self.accuracy.max(s.hits as f32 / s.shots as f32);
+        }
+        if s.shots >= aim_exact::MIN_SHOTS {
+            self.aim_exact = self.aim_exact.max(s.exact as f32 / s.shots as f32);
+        }
+        if s.accepted >= anomaly_rate::MIN_INPUTS {
+            self.anomaly_rate = self.anomaly_rate.max(s.anomalies as f32 / s.accepted as f32);
+        }
+    }
+}
+
+/// Every player across `crowds` honest crowds (seeds 0..crowds) — the honest
+/// population the thresholds are measured against.
+pub fn honest_sweep(crowds: u32) -> Vec<HonestPlayer> {
+    (0..crowds)
+        .flat_map(|seed| {
+            let r = run(Scenario::honest_crowd(seed));
+            let style = |p: PlayerId| r.bots.iter().find(|b| b.id == Some(p)).expect("a bot per player").name;
+            let tel = &r.telemetry;
+            let mut m = Monitor::standard();
+            let mut peaks: BTreeMap<PlayerId, Peak> = BTreeMap::new();
+            let mut alerts = Vec::new();
+            for r in tel.records() {
+                alerts.extend(m.observe(r));
+                let peak = peaks.entry(r.player).or_default();
+                m.stats(r.player).into_iter().chain(m.window(r.player)).for_each(|s| peak.raise(s));
+            }
+            aegis_detector::stats(tel.records())
+                .into_values()
+                .map(|life| HonestPlayer {
+                    style: style(life.player),
+                    peak: peaks[&life.player],
+                    alerts: alerts.iter().filter(|a| a.flag.player == life.player).cloned().collect(),
+                    life,
+                })
+                .collect::<Vec<_>>()
+        })
         .collect()
 }
 
@@ -400,8 +499,7 @@ impl Lab {
     }
 
     fn report(self, sc: &Scenario, tel: Telemetry, net: NetStats) -> Report {
-        let stats = aegis_detector::stats(tel.records());
-        let suite = Suite::standard();
+        let alerts = Monitor::standard().run(tel.records());
         let bots = sc
             .bots
             .iter()
@@ -409,7 +507,7 @@ impl Lab {
             .map(|(i, bot)| {
                 let id = self.id(i);
                 let totals = id.map(|p| tel.per_player(p)).unwrap_or_default();
-                let flags = id.and_then(|p| stats.get(&p)).map(|s| suite.check(s)).unwrap_or_default();
+                let alerts = alerts.iter().filter(|a| Some(a.flag.player) == id).cloned().collect();
                 BotReport {
                     name: bot.name(),
                     id,
@@ -420,7 +518,7 @@ impl Lab {
                     max_step: self.max_step[i],
                     hidden: self.hidden[i],
                     walled: self.walled[i],
-                    flags,
+                    alerts,
                 }
             })
             .collect();
@@ -879,9 +977,10 @@ fn read_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aegis_client_sdk::{flood, garbage, spoof, zeroflood};
+    use aegis_client_sdk::{burst, flood, garbage, spoof, zeroflood};
     use aegis_detector::detectors::{accuracy, aim_exact, anomaly_rate};
-    use aegis_detector::FlagReason;
+    use aegis_detector::monitor::WINDOW;
+    use aegis_detector::{FlagReason, Suite};
     use aegis_server::guards::source_rate::MAX_PER_TICK;
     use aegis_server::net::NOT_RELAY;
     use aegis_server::sim::MOVE_SPEED;
@@ -978,7 +1077,7 @@ mod tests {
         assert_eq!(v.totals.accepted, r.ticks);
         assert_eq!(v.totals.total_rejected(), 0, "victim's record: {:?}", v.totals.rejected);
         assert_eq!(v.totals.anomalies, 0);
-        assert!(v.flags.is_empty());
+        assert!(v.alerts.is_empty());
         let s = r.bot("spoof");
         assert!(s.joined());
         assert_eq!(s.totals, Totals::default()); // it never sent as itself
@@ -1072,8 +1171,12 @@ mod tests {
         assert!(h.accuracy() < 0.6, "honest accuracy {}", h.accuracy());
     }
 
+    /// The reasons raised on a bot, sorted — the order they fired in is the
+    /// alerts' business, not this list's.
     fn flagged(b: &BotReport) -> Vec<FlagReason> {
-        b.flags.iter().map(|f| f.reason).collect()
+        let mut r: Vec<FlagReason> = b.alerts.iter().map(|a| a.flag.reason).collect();
+        r.sort();
+        r
     }
 
     /// Coverage, pillar C: every detector is tripped by some bot. A detector
@@ -1091,8 +1194,9 @@ mod tests {
         let r = standard();
         assert_eq!(flagged(r.bot("aimbot")), vec![FlagReason::Accuracy, FlagReason::AimExact]);
         assert_eq!(flagged(r.bot("speedhack")), vec![FlagReason::AnomalyRate]);
-        for b in r.bots.iter().filter(|b| !["aimbot", "humanized", "speedhack"].contains(&b.name)) {
-            assert!(b.flags.is_empty(), "{} flagged {:?}", b.name, b.flags);
+        assert_eq!(flagged(r.bot("burst")), vec![FlagReason::AimExact]);
+        for b in r.bots.iter().filter(|b| !["aimbot", "humanized", "speedhack", "burst"].contains(&b.name)) {
+            assert!(b.alerts.is_empty(), "{} flagged {:?}", b.name, b.alerts);
         }
     }
 
@@ -1112,7 +1216,7 @@ mod tests {
         assert!(r.bot("honest").walled > 0);
         assert_eq!(esp.totals.total_rejected(), 0);
         assert_eq!(esp.totals.anomalies, 0);
-        assert!(esp.flags.is_empty(), "esp flagged {:?}", esp.flags);
+        assert!(esp.alerts.is_empty(), "esp flagged {:?}", esp.alerts);
     }
 
     /// Why there are two aim detectors: jitter hides the humanized aimbot from
@@ -1126,20 +1230,73 @@ mod tests {
         assert_eq!(flagged(b), vec![FlagReason::Accuracy]);
     }
 
-    /// The false-positive bound: 1000 honest players (250 lobbies of 4, each
-    /// with its own aim seed), zero flags. Every one of them must also have
-    /// enough shots to be judged, or "no flags" would only mean "no verdict".
+    /// Why the online monitor has a window: the toggle cheater's snapped
+    /// shots, averaged over the whole match, stay under the line — offline v0
+    /// never flags it. The window does, while the burst is still on, on the
+    /// last WINDOW shots rather than the lifetime.
+    #[test]
+    fn burst_aimbot_escapes_the_match_average_but_not_the_window() {
+        let r = standard();
+        let b = r.bot("burst");
+        let id = b.id.expect("burst joined");
+        let v0 = Suite::standard().run(r.telemetry.records());
+        assert!(v0.iter().all(|f| f.player != id), "v0 flagged burst: {v0:?}");
+        assert_eq!(flagged(b), vec![FlagReason::AimExact]);
+        let a = &b.alerts[0];
+        assert_eq!(a.flag.samples as usize, WINDOW, "raised by the lifetime, not the window: {a:?}");
+        assert!(
+            (burst::ON..burst::OFF).contains(&a.tick),
+            "raised at tick {}, burst is {}..{}",
+            a.tick,
+            burst::ON,
+            burst::OFF
+        );
+    }
+
+    /// The false-positive bound: 1008 honest players (63 full arenas of 16 —
+    /// walkers, campers, rushers — each with its own aim seed), zero flags:
+    /// offline over the whole run, and online at every record, lifetime and
+    /// window. "No flags" must not just mean "no verdict": every player is
+    /// judged by aim_exact and anomaly_rate, enough of every style reach
+    /// accuracy's larger minimum, and enough outlast a window that it slid.
     #[test]
     fn honest_population_is_never_flagged() {
-        let players = honest_sweep(250);
-        assert_eq!(players.len(), 1000);
+        let players = honest_sweep(63);
+        assert_eq!(players.len(), 1008);
         let suite = Suite::standard();
-        for s in &players {
-            assert!(s.shots() >= accuracy::MIN_SHOTS, "player {} only {} shots: no verdict", s.player, s.shots());
+        for p in &players {
+            let s = &p.life;
+            assert!(s.shots >= aim_exact::MIN_SHOTS, "player {} only {} shots: no verdict", s.player, s.shots);
             assert!(s.accepted >= anomaly_rate::MIN_INPUTS);
             let f = suite.check(s);
-            assert!(f.is_empty(), "honest player {} flagged {:?}", s.player, f);
+            assert!(f.is_empty(), "honest player {} flagged offline {:?}", s.player, f);
+            assert!(p.alerts.is_empty(), "honest player {} flagged online {:?}", s.player, p.alerts);
         }
+        for style in ["honest", "camper", "rusher"] {
+            let judged = players.iter().filter(|p| p.style == style && p.life.shots >= accuracy::MIN_SHOTS).count();
+            assert!(judged >= 50, "only {judged} {style}s reached accuracy's {} shots", accuracy::MIN_SHOTS);
+        }
+        let slid = players.iter().filter(|p| p.life.shots as usize > WINDOW).count();
+        assert!(slid >= 150, "only {slid} honest players outlasted a {WINDOW}-shot window");
+    }
+
+    /// The honest population is never measured in an emptier arena than the
+    /// cheaters play in: hit rate grows with how full the arena is.
+    #[test]
+    fn the_honest_crowd_is_at_least_as_full_as_the_standard_scenario() {
+        assert!(CROWD_SIZE as usize >= Scenario::standard().bots.len());
+    }
+
+    /// Why the honest population is a full arena of mixed styles: the esp bot,
+    /// culled, is an honest rusher, and in the 15-player standard scenario it
+    /// is the honest player most likely to trip accuracy. It does not.
+    #[test]
+    fn an_honest_rusher_in_a_full_arena_is_not_an_aimbot() {
+        let r = standard();
+        let esp = r.bot("esp");
+        assert!(esp.shots >= accuracy::MIN_SHOTS, "esp only {} shots: no accuracy verdict", esp.shots);
+        assert!(esp.accuracy() > 0.6, "esp hit {:.2}: no longer the high honest tail", esp.accuracy());
+        assert!(esp.alerts.is_empty(), "esp flagged {:?}", esp.alerts);
     }
 
     #[test]
@@ -1257,7 +1414,11 @@ mod tests {
         assert_eq!(net.bystander, mem.bystander);
         for (u, m) in net.bots.iter().zip(&mem.bots) {
             assert_eq!((u.name, u.id, u.kills, u.max_step), (m.name, m.id, m.kills, m.max_step));
+            // Same records -> same alerts at the same ticks. Asserted anyway:
+            // a detector verdict is what a reviewer acts on.
+            assert_eq!(u.alerts, m.alerts, "{} alerts differ", u.name);
         }
+        assert!(mem.bots.iter().any(|b| !b.alerts.is_empty()), "no alerts: the comparison proves nothing");
     }
 
     /// The before/after of hiding the origin. Without a relay, a client

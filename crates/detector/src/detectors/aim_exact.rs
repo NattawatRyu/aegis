@@ -22,13 +22,22 @@ pub const MIN_SHOTS: u32 = 30;
 /// hand.
 pub const EXACT_RAD: f32 = 1e-3;
 
+/// Does one shot count as exact? Applied once, when the shot is counted
+/// (`PlayerStats::record`), so the stats keep a count instead of every angle.
+pub fn is_exact(aim_err: f32) -> bool {
+    aim_err < EXACT_RAD
+}
+
 /// Flag strictly above this share of exact shots.
 ///
-/// Measured (`aegis-harness sweep 250`, 1000 honest bots, 2026-10-02, walled
-/// arena + culled snapshots): p50 0.006, p99 0.025, max 0.040. Snap aimbot:
-/// 0.99. (Open arena, 2026-09-30: max 0.037.) At 0.25 the line is
-/// ~7x the best honest run and still catches an aimbot switched on for only
-/// a third of its shots (a "toggle" cheater).
+/// Measured (`aegis-harness sweep`, 63 crowds of 16 = 1008 honest players —
+/// walkers, campers, rushers — 2026-10-05, walled arena + culled snapshots):
+/// whole run p99 0.048, max 0.077; online peak (running lifetime or
+/// 100-shot window, from MIN_SHOTS) p99 0.067, max 0.100. Snap aimbot: 0.99.
+/// (4-player walker lobbies, 2026-10-02: max 0.040.) At 0.25 the line is
+/// 2.5x the worst honest moment and still catches an aimbot switched on for
+/// only a third of its shots — or, through the window, one snapping on more
+/// than a quarter of its last 100.
 pub const THRESHOLD: f32 = 0.25;
 
 pub struct AimExactDetector;
@@ -39,12 +48,11 @@ impl Detector for AimExactDetector {
     }
 
     fn check(&self, s: &PlayerStats) -> Option<Flag> {
-        let shots = s.shots();
+        let shots = s.shots;
         if shots < MIN_SHOTS {
             return None;
         }
-        let exact = s.aim_errs.iter().filter(|&&e| e < EXACT_RAD).count();
-        let share = exact as f32 / shots as f32;
+        let share = s.exact as f32 / shots as f32;
         (share > THRESHOLD).then_some(Flag {
             player: s.player,
             reason: FlagReason::AimExact,
@@ -58,12 +66,15 @@ impl Detector for AimExactDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aegis_telemetry::Outcome;
 
-    /// `exact` shots dead-on, the rest `off` radians away.
+    /// `exact` shots dead-on, the rest `off` radians away — counted the way
+    /// the server's telemetry would be.
     fn player(exact: usize, rest: usize, off: f32) -> PlayerStats {
-        let mut aim_errs = vec![0.0; exact];
-        aim_errs.extend(std::iter::repeat_n(off, rest));
-        PlayerStats { player: 3, aim_errs, ..Default::default() }
+        let mut s = PlayerStats::new(3);
+        let shots = std::iter::repeat_n(0.0, exact).chain(std::iter::repeat_n(off, rest));
+        shots.for_each(|aim_err| s.record(&Outcome::Shot { hit: false, aim_err }));
+        s
     }
 
     #[test]
@@ -93,7 +104,8 @@ mod tests {
     #[test]
     fn perfect_hits_with_jitter_are_invisible_here() {
         // The documented blind spot: 100% "accuracy" but never exact.
-        let s = PlayerStats { player: 3, hits: 100, aim_errs: vec![0.02; 100], ..Default::default() };
+        let mut s = player(0, 100, 0.02);
+        s.hits = 100;
         assert_eq!(AimExactDetector.check(&s), None);
     }
 }

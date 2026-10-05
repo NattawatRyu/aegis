@@ -1,0 +1,368 @@
+//! Online detection: judge each player while they play, not after the run.
+//!
+//! [`Monitor::observe`] takes one telemetry [`Record`] at a time, in stream
+//! order, and returns the flags that record caused. Per player it keeps two
+//! views, both checked by the same [`Suite`] after every counted record:
+//!
+//!   - **lifetime** — everything since the player's session began. Same
+//!     numbers the offline [`crate::stats`] fold produces, so at the end of a
+//!     run [`Monitor::verdict`] equals [`Suite::run`] (when no id was reused).
+//!   - **window** — the last [`WINDOW`] shots and the last [`WINDOW`] accepted
+//!     inputs. A lifetime ratio is diluted by everything honest that came
+//!     before: 300 honest shots then 60 snapped ones is 17% exact over the
+//!     life (under the 25% line) and 60% over the last 100.
+//!
+//! A flag is raised once per (session, reason): the first record that crosses
+//! a line, by either view, becomes an [`Alert`] carrying its tick. After that
+//! the reviewer has the evidence; repeating it every tick adds nothing.
+//!
+//! `Left` ends a session: its state is dropped, so whoever is issued the id
+//! next starts from zero — the offline fold merges them.
+//!
+//! Both views use each detector's own `MIN_*` and `THRESHOLD`, set from the
+//! online peak: `aegis-harness sweep` reports, per honest player, the highest
+//! value any view reached at any record once judged — judging at every record
+//! from the minimum sample on is noisier than judging one whole run, and the
+//! thresholds must hold against that, not against the run's final figure.
+
+use std::collections::{BTreeMap, VecDeque};
+
+use aegis_telemetry::{Outcome, Record};
+
+use crate::{detectors::aim_exact::is_exact, Flag, FlagReason, PlayerStats, Suite};
+
+/// Samples per window: shots for the shot detectors, accepted inputs for the
+/// input detectors. Large enough that every `MIN_*` (at most 60) is reachable
+/// inside it; small enough that a burst of cheating is not drowned.
+pub const WINDOW: usize = 100;
+
+/// A flag, and the tick of the record that raised it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Alert {
+    pub tick: u32,
+    pub flag: Flag,
+}
+
+/// The last [`WINDOW`] shots and accepted inputs, with running counts kept in
+/// a [`PlayerStats`] so the detectors read it like any other.
+#[derive(Debug)]
+struct Window {
+    /// (hit, exact) per shot, oldest first.
+    shots: VecDeque<(bool, bool)>,
+    /// anomaly per accepted input, oldest first.
+    inputs: VecDeque<bool>,
+    stats: PlayerStats,
+}
+
+impl Window {
+    fn new(player: u8) -> Self {
+        Self {
+            shots: VecDeque::with_capacity(WINDOW),
+            inputs: VecDeque::with_capacity(WINDOW),
+            stats: PlayerStats::new(player),
+        }
+    }
+
+    fn record(&mut self, o: &Outcome) {
+        let s = &mut self.stats;
+        match *o {
+            Outcome::Accepted { anomaly } => {
+                if self.inputs.len() == WINDOW {
+                    let old = self.inputs.pop_front().expect("full window");
+                    s.accepted -= 1;
+                    s.anomalies -= old as u32;
+                }
+                self.inputs.push_back(anomaly);
+                s.accepted += 1;
+                s.anomalies += anomaly as u32;
+            }
+            Outcome::Shot { hit, aim_err } => {
+                if self.shots.len() == WINDOW {
+                    let (h, e) = self.shots.pop_front().expect("full window");
+                    s.shots -= 1;
+                    s.hits -= h as u32;
+                    s.exact -= e as u32;
+                }
+                let e = is_exact(aim_err);
+                self.shots.push_back((hit, e));
+                s.shots += 1;
+                s.hits += hit as u32;
+                s.exact += e as u32;
+            }
+            Outcome::Rejected { .. } | Outcome::Left => {}
+        }
+    }
+}
+
+/// One player's session as the monitor sees it.
+#[derive(Debug)]
+struct Live {
+    life: PlayerStats,
+    window: Window,
+    /// Reasons already raised this session.
+    raised: Vec<FlagReason>,
+}
+
+pub struct Monitor {
+    suite: Suite,
+    live: BTreeMap<u8, Live>,
+}
+
+impl Monitor {
+    pub fn new(suite: Suite) -> Self {
+        Self { suite, live: BTreeMap::new() }
+    }
+
+    pub fn standard() -> Self {
+        Self::new(Suite::standard())
+    }
+
+    /// Feed one record, in stream order. Returns the alerts it raised — empty
+    /// for almost every record.
+    pub fn observe(&mut self, r: &Record) -> Vec<Alert> {
+        let counted = match r.outcome {
+            Outcome::Left => {
+                self.live.remove(&r.player);
+                return Vec::new();
+            }
+            Outcome::Rejected { .. } => false,
+            Outcome::Accepted { .. } | Outcome::Shot { .. } => true,
+        };
+        let l = self.live.entry(r.player).or_insert_with(|| Live {
+            life: PlayerStats::new(r.player),
+            window: Window::new(r.player),
+            raised: Vec::new(),
+        });
+        if !counted {
+            return Vec::new();
+        }
+        l.life.record(&r.outcome);
+        l.window.record(&r.outcome);
+        let mut out = Vec::new();
+        for flag in self.suite.check(&l.life).into_iter().chain(self.suite.check(&l.window.stats)) {
+            if !l.raised.contains(&flag.reason) {
+                l.raised.push(flag.reason);
+                out.push(Alert { tick: r.tick, flag });
+            }
+        }
+        out
+    }
+
+    /// Feed a whole stream; every alert it raised, in order.
+    pub fn run(&mut self, records: &[Record]) -> Vec<Alert> {
+        records.iter().flat_map(|r| self.observe(r)).collect()
+    }
+
+    /// Lifetime stats of the player's current session, if one is live.
+    pub fn stats(&self, player: u8) -> Option<&PlayerStats> {
+        self.live.get(&player).map(|l| &l.life)
+    }
+
+    /// Window stats of the player's current session, if one is live.
+    pub fn window(&self, player: u8) -> Option<&PlayerStats> {
+        self.live.get(&player).map(|l| &l.window.stats)
+    }
+
+    /// The lifetime verdict on every live session right now — what the
+    /// offline [`Suite::run`] would say if the stream ended here.
+    pub fn verdict(&self) -> Vec<Flag> {
+        self.live.values().flat_map(|l| self.suite.check(&l.life)).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::detectors::{accuracy, aim_exact};
+    use crate::stats;
+    use aegis_telemetry::Telemetry;
+
+    const EXACT: f32 = 0.0;
+    const WIDE: f32 = 0.1;
+
+    fn reasons(alerts: &[Alert]) -> Vec<FlagReason> {
+        alerts.iter().map(|a| a.flag.reason).collect()
+    }
+
+    /// `n` misses from `player` at `aim_err`, one per tick from `*tick`.
+    fn shoot(t: &mut Telemetry, tick: &mut u32, player: u8, n: u32, aim_err: f32) {
+        for _ in 0..n {
+            t.shot(*tick, player, false, aim_err);
+            *tick += 1;
+        }
+    }
+
+    #[test]
+    fn left_starts_a_new_person_where_the_offline_fold_merges_them() {
+        // An aimbot holds id 1, leaves; an honest player is issued id 1 next.
+        let mut t = Telemetry::new();
+        let mut tick = 1;
+        shoot(&mut t, &mut tick, 1, 40, EXACT);
+        t.left(tick, 1);
+        shoot(&mut t, &mut tick, 1, 40, WIDE);
+
+        // v0 (offline) blames the newcomer for the predecessor's aim: 50% exact.
+        let v0 = Suite::standard().run(t.records());
+        assert_eq!(v0.iter().map(|f| f.reason).collect::<Vec<_>>(), vec![FlagReason::AimExact]);
+
+        let mut m = Monitor::standard();
+        let alerts = m.run(t.records());
+        // The aimbot was caught while it played, at its MIN_SHOTS-th shot ...
+        assert_eq!(reasons(&alerts), vec![FlagReason::AimExact]);
+        assert_eq!(alerts[0].tick, aim_exact::MIN_SHOTS);
+        // ... and the newcomer is judged on their own 40 shots: clean.
+        assert_eq!(m.stats(1).map(|s| (s.shots, s.exact)), Some((40, 0)));
+        assert_eq!(m.verdict(), vec![]);
+    }
+
+    #[test]
+    fn a_flag_is_raised_once_per_session_at_the_crossing_record() {
+        let mut t = Telemetry::new();
+        let mut tick = 1;
+        shoot(&mut t, &mut tick, 4, 500, EXACT);
+        let mut m = Monitor::standard();
+        let alerts = m.run(t.records());
+        assert_eq!(reasons(&alerts), vec![FlagReason::AimExact]);
+        assert_eq!((alerts[0].tick, alerts[0].flag.samples), (aim_exact::MIN_SHOTS, aim_exact::MIN_SHOTS));
+
+        // A new session under the same id is judged — and flagged — afresh.
+        let mut t2 = Telemetry::new();
+        t2.left(tick, 4);
+        shoot(&mut t2, &mut tick, 4, aim_exact::MIN_SHOTS, EXACT);
+        assert_eq!(reasons(&m.run(t2.records())), vec![FlagReason::AimExact]);
+    }
+
+    #[test]
+    fn rejected_inputs_are_not_counted_and_raise_nothing() {
+        let mut t = Telemetry::new();
+        for tick in 0..200 {
+            t.reject(tick, 2, "rate_exceeded");
+        }
+        let mut m = Monitor::standard();
+        assert_eq!(m.run(t.records()), vec![]);
+        assert_eq!(m.stats(2), Some(&PlayerStats::new(2)));
+    }
+
+    #[test]
+    fn a_burst_the_lifetime_dilutes_is_caught_by_the_window() {
+        // 300 honest-looking shots, then the aimbot is switched on for 60.
+        let mut t = Telemetry::new();
+        let mut tick = 1;
+        shoot(&mut t, &mut tick, 9, 300, WIDE);
+        shoot(&mut t, &mut tick, 9, 60, EXACT);
+
+        // Lifetime: 60/360 = 17% exact, under the line. v0 never flags it.
+        assert_eq!(Suite::standard().run(t.records()), vec![]);
+
+        let mut m = Monitor::standard();
+        let alerts = m.run(t.records());
+        assert_eq!(m.verdict(), vec![]); // the lifetime view agrees with v0
+        assert_eq!(reasons(&alerts), vec![FlagReason::AimExact]);
+        let a = &alerts[0];
+        // The window catches it at the first snapped shot that takes the last
+        // 100 strictly over the line.
+        let needed = (aim_exact::THRESHOLD * WINDOW as f32) as u32 + 1;
+        assert_eq!(a.tick, 1 + 300 + needed - 1);
+        assert_eq!((a.flag.samples, a.flag.value), (WINDOW as u32, needed as f32 / WINDOW as f32));
+    }
+
+    #[test]
+    fn lifetime_matches_the_offline_fold_record_for_record() {
+        // Oracle: on a stream with no reused id, the monitor's lifetime stats
+        // after every record equal v0's fold of the prefix, and its final
+        // verdict equals v0's.
+        let recs = random_stream(7, 3000, false);
+        let mut m = Monitor::standard();
+        for (i, r) in recs.iter().enumerate() {
+            m.observe(r);
+            if i % 97 == 0 || i + 1 == recs.len() {
+                for (p, s) in stats(&recs[..=i]) {
+                    assert_eq!(m.stats(p), Some(&s), "player {p} after record {i}");
+                }
+            }
+        }
+        assert_eq!(m.verdict(), Suite::standard().run(&recs));
+    }
+
+    #[test]
+    fn window_matches_a_naive_recount_of_the_last_samples() {
+        // Oracle: recount the window from scratch — the last WINDOW shots and
+        // inputs since the player's last Left — after every record.
+        for seed in 1..=5 {
+            let recs = random_stream(seed, 4000, true);
+            let mut m = Monitor::standard();
+            for (i, r) in recs.iter().enumerate() {
+                m.observe(r);
+                let p = r.player;
+                let naive = naive_window(&recs[..=i], p);
+                assert_eq!(m.window(p).cloned(), naive, "seed {seed}, player {p}, record {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_view_judges_below_its_detectors_minimum() {
+        // Every shot a hit, none exact: accuracy alone is judged, at exactly
+        // its MIN_SHOTS-th shot and not one before.
+        let mut m = Monitor::standard();
+        for n in 1..=accuracy::MIN_SHOTS {
+            let a = m.observe(&Record { tick: n, player: 5, outcome: Outcome::Shot { hit: true, aim_err: WIDE } });
+            assert_eq!(
+                reasons(&a),
+                if n == accuracy::MIN_SHOTS { vec![FlagReason::Accuracy] } else { vec![] },
+                "shot {n}"
+            );
+        }
+        // Every shot exact, none a hit: aim_exact alone, at its own minimum.
+        let mut m = Monitor::standard();
+        for n in 1..=aim_exact::MIN_SHOTS {
+            let a = m.observe(&Record { tick: n, player: 5, outcome: Outcome::Shot { hit: false, aim_err: EXACT } });
+            assert_eq!(
+                reasons(&a),
+                if n == aim_exact::MIN_SHOTS { vec![FlagReason::AimExact] } else { vec![] },
+                "shot {n}"
+            );
+        }
+    }
+
+    fn naive_window(recs: &[Record], p: u8) -> Option<PlayerStats> {
+        let start = recs.iter().rposition(|r| r.player == p && r.outcome == Outcome::Left).map_or(0, |i| i + 1);
+        let mine: Vec<&Record> = recs[start..].iter().filter(|r| r.player == p).collect();
+        if mine.is_empty() {
+            return None;
+        }
+        let shots: Vec<&Record> = mine.iter().copied().filter(|r| matches!(r.outcome, Outcome::Shot { .. })).collect();
+        let inputs: Vec<&Record> =
+            mine.iter().copied().filter(|r| matches!(r.outcome, Outcome::Accepted { .. })).collect();
+        let mut s = PlayerStats::new(p);
+        for r in shots.iter().rev().take(WINDOW).chain(inputs.iter().rev().take(WINDOW)) {
+            s.record(&r.outcome);
+        }
+        Some(s)
+    }
+
+    /// A deterministic mixed stream over 4 players: accepts (some anomalous),
+    /// rejects, shots (some exact, some hits), and — if `leaves` — the odd
+    /// `Left`.
+    fn random_stream(seed: u64, n: usize, leaves: bool) -> Vec<Record> {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut t = Telemetry::new();
+        for i in 0..n {
+            let tick = i as u32 / 4;
+            let p = (next() % 4) as u8 + 1;
+            match next() % 100 {
+                0 if leaves => t.left(tick, p),
+                0..=39 => t.accept(tick, p, next() % 5 == 0),
+                40..=49 => t.reject(tick, p, "replay"),
+                _ => t.shot(tick, p, next() % 3 == 0, if next() % 4 == 0 { 0.0 } else { 0.05 }),
+            }
+        }
+        t.records().to_vec()
+    }
+}

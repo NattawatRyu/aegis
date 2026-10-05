@@ -12,6 +12,8 @@ use aegis_protocol::{frame, ClientMsg, PlayerId, PlayerState, Vec2, PROTOCOL_VER
 
 pub mod aimbot;
 pub mod badversion;
+pub mod burst;
+pub mod camper;
 pub mod direct;
 pub mod esp;
 pub mod flood;
@@ -22,6 +24,7 @@ pub mod joinflood;
 pub mod nan;
 pub mod reflect;
 pub mod replay;
+pub mod rusher;
 pub mod speedhack;
 pub mod spoof;
 pub mod zeroflood;

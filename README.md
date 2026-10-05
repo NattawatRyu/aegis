@@ -28,8 +28,14 @@ not by chasing individual cheats.
 > (Joins, which the token check must let through) the origin's own per-IP
 > budget per tick. The relay also does the Join cookie round trip itself, so
 > no Join from a forged source address — one IP or thousands — ever reaches
-> the origin. 55% of the standard scenario's client traffic never reaches
+> the origin. 54% of the standard scenario's client traffic never reaches
 > the origin. Version and sessions per IP are still judged at the origin.
+> Pillar D's patterns are done; detector v1 (pillar C) judges players
+> online, one telemetry record at a time: per session (an id reused after a
+> player leaves starts clean), over the lifetime and over the last 100
+> shots, so an aimbot switched on for a burst is caught while the burst is
+> on. Its false-positive bound is measured on 1008 honest players in full
+> arenas — walkers, campers and rushers — with zero flagged.
 > Nothing here is production-ready.
 
 ## Why

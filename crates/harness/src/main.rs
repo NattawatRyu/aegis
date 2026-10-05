@@ -8,9 +8,10 @@
 //! server as an origin behind a relay and writes `<scenario>.relay.jsonl` —
 //! also byte-identical.
 //!
-//! `aegis-harness sweep [lobbies]` instead runs that many honest lobbies and
-//! prints how the honest population scores on every detector signal — the
-//! measurement the detector thresholds are set from.
+//! `aegis-harness sweep [crowds]` instead runs that many honest crowds (16 players) and
+//! prints how the honest population scores on every detector signal, over the
+//! whole run and at its online peak — the measurement the detector thresholds
+//! are set from.
 //!
 //! `aegis-harness cull [lobbies] [max_lag]` replays honest lobbies and prints,
 //! per culling margin, what it leaks and how late a lagging client sees an
@@ -20,16 +21,15 @@
 
 use std::path::PathBuf;
 
-use aegis_detector::detectors::aim_exact::EXACT_RAD;
 use aegis_harness::{
-    cull_sweep, edge_dropped, edge_seen, honest_sweep, leak_by_step, run, run_relay, run_udp, Scenario,
+    cull_sweep, edge_dropped, edge_seen, honest_sweep, leak_by_step, run, run_relay, run_udp, HonestPlayer, Scenario,
 };
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("sweep") {
-        let lobbies = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(250);
-        sweep(lobbies);
+        let crowds = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(63);
+        sweep(crowds);
         return Ok(());
     }
     if args.get(1).map(String::as_str) == Some("cull") {
@@ -60,10 +60,13 @@ fn main() -> std::io::Result<()> {
         } else {
             b.totals.rejected.iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(", ")
         };
-        let flags = if b.flags.is_empty() {
+        let flags = if b.alerts.is_empty() {
             "-".to_string()
         } else {
-            b.flags.iter().map(|f| format!("{} {:.2}", f.reason.label(), f.value)).collect::<Vec<_>>().join(", ")
+            let f = |a: &aegis_detector::Alert| {
+                format!("{} {:.2}/{} @{}", a.flag.reason.label(), a.flag.value, a.flag.samples, a.tick)
+            };
+            b.alerts.iter().map(f).collect::<Vec<_>>().join(", ")
         };
         println!(
             "{:<11} {:>6} {:>8} {:>7}  {:<32} {:>5} {:>5} {:>5.2} {:>5} {:>8.3} {:>11}  {}",
@@ -147,28 +150,34 @@ fn cull_scale(lobbies: u32) {
     }
 }
 
-fn sweep(lobbies: u32) {
-    let players = honest_sweep(lobbies);
-    let col = |f: &dyn Fn(&aegis_detector::PlayerStats) -> f32| {
-        let mut v: Vec<f32> = players.iter().map(f).collect();
-        v.sort_by(f32::total_cmp);
-        let q = |p: f32| v[((v.len() - 1) as f32 * p).round() as usize];
-        (q(0.0), q(0.5), q(0.99), q(1.0))
-    };
-    let acc = col(&|s| if s.shots() == 0 { 0.0 } else { s.hits as f32 / s.shots() as f32 });
-    let exact = col(&|s| {
-        if s.shots() == 0 {
-            0.0
-        } else {
-            s.aim_errs.iter().filter(|&&e| e < EXACT_RAD).count() as f32 / s.shots() as f32
-        }
-    });
-    let anom = col(&|s| if s.accepted == 0 { 0.0 } else { s.anomalies as f32 / s.accepted as f32 });
-    let shots = col(&|s| s.shots() as f32);
+fn sweep(crowds: u32) {
+    let all = honest_sweep(crowds);
+    println!("honest players: {} ({} crowds of {})", all.len(), crowds, aegis_harness::CROWD_SIZE);
+    for style in [None, Some("honest"), Some("camper"), Some("rusher")] {
+        let players: Vec<&HonestPlayer> = all.iter().filter(|p| style.is_none_or(|s| p.style == s)).collect();
+        let col = |f: &dyn Fn(&HonestPlayer) -> f32| {
+            let mut v: Vec<f32> = players.iter().map(|p| f(p)).collect();
+            v.sort_by(f32::total_cmp);
+            let q = |p: f32| v[((v.len() - 1) as f32 * p).round() as usize];
+            (q(0.0), q(0.5), q(0.99), q(1.0))
+        };
+        let ratio = |n: u32, d: u32| if d == 0 { 0.0 } else { n as f32 / d as f32 };
+        let rows = [
+            ("shots", col(&|p| p.life.shots as f32)),
+            ("accuracy", col(&|p| ratio(p.life.hits, p.life.shots))),
+            ("aim_exact", col(&|p| ratio(p.life.exact, p.life.shots))),
+            ("anomaly_rate", col(&|p| ratio(p.life.anomalies, p.life.accepted))),
+            ("accuracy*", col(&|p| p.peak.accuracy)),
+            ("aim_exact*", col(&|p| p.peak.aim_exact)),
+            ("anomaly_rate*", col(&|p| p.peak.anomaly_rate)),
+        ];
+        let flagged = players.iter().filter(|p| !p.alerts.is_empty()).count();
 
-    println!("honest players: {} ({} lobbies)\n", players.len(), lobbies);
-    println!("{:<14} {:>8} {:>8} {:>8} {:>8}", "signal", "min", "p50", "p99", "max");
-    for (name, (a, b, c, d)) in [("shots", shots), ("accuracy", acc), ("aim_exact", exact), ("anomaly_rate", anom)] {
-        println!("{:<14} {:>8.3} {:>8.3} {:>8.3} {:>8.3}", name, a, b, c, d);
+        println!("\n{} ({} players, {flagged} flagged online)", style.unwrap_or("all"), players.len());
+        println!("{:<14} {:>8} {:>8} {:>8} {:>8}", "signal", "min", "p50", "p99", "max");
+        for (name, (a, b, c, d)) in rows {
+            println!("{:<14} {:>8.3} {:>8.3} {:>8.3} {:>8.3}", name, a, b, c, d);
+        }
     }
+    println!("\n* = online peak: highest value at any record, running lifetime or window, once judged");
 }

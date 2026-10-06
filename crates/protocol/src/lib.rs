@@ -25,7 +25,9 @@ use siphasher::sip::SipHasher24;
 /// v1: session token header on every client datagram.
 /// v2: two-step join — a cookie challenge proves the client receives at its
 ///     source address before the server admits it.
-pub const PROTOCOL_VERSION: u16 = 2;
+/// v3: through a relay, every datagram is sealed per session ([`seal_up`],
+///     [`seal_down`]) under keys the game's backend issued ([`mint_connect`]).
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Bytes of session token in front of every client datagram.
 pub const TOKEN_LEN: usize = 8;
@@ -168,8 +170,8 @@ pub const NONCE_LEN: usize = 24;
 pub const TAG_LEN: usize = 16;
 
 /// Largest [`wrap`] overhead: nonce, tag, and the sealed header — address
-/// tag, an IPv6 address, a port.
-pub const ENVELOPE_MAX: usize = NONCE_LEN + TAG_LEN + 1 + 16 + 2;
+/// tag, an IPv6 address, a port, the client's session id.
+pub const ENVELOPE_MAX: usize = NONCE_LEN + TAG_LEN + 1 + 16 + 2 + 16;
 
 /// The secret a relay and its origin share. Whoever holds it can speak for
 /// any client to the origin and read the link, so it never leaves those two
@@ -296,14 +298,16 @@ pub fn edge_cookie(key: &LinkKey, client: SocketAddr, bucket: u32) -> u64 {
 
 /// Relay <-> origin only — never seen by a client, so not part of
 /// `PROTOCOL_VERSION`. The address of the client a datagram came from (going
-/// up) or is for (coming down), then the datagram untouched. Lets the origin
-/// run every guard against the client's real address while only ever talking
-/// to the relay.
+/// up) or is for (coming down), its session id, then the datagram (opened,
+/// going up; to be sealed for the client by the relay, coming down). Lets
+/// the origin run every guard against the client's real address while only
+/// ever talking to the relay, and tell the relay whose keys a reply goes
+/// under — the relay remembers no session.
 ///
 /// Layout: a random 24-byte nonce, then — sealed with XChaCha20-Poly1305
 /// under the key's `seal` subkey, with `dir` as associated data — the
-/// address tag `4`/`6`, the IP's octets, the port LE and the payload, then
-/// the 16-byte tag. Without the key no one who forges the relay's source
+/// address tag `4`/`6`, the IP's octets, the port LE, the sid and the
+/// payload, then the 16-byte tag. Without the key no one who forges the relay's source
 /// address can claim to be a client, the origin cannot be made to address a
 /// reply, and an on-path observer of the link learns neither the client
 /// addresses, nor their session tokens, nor what they sent — only sizes and
@@ -314,7 +318,7 @@ pub fn edge_cookie(key: &LinkKey, client: SocketAddr, bucket: u32) -> u64 {
 /// Not covered: an on-path attacker can replay a captured envelope the same
 /// way. Up, that is a client datagram replayed — what the session token and
 /// replay guard already judge; down, a stale snapshot resent.
-pub fn wrap(key: &LinkKey, dir: Dir, client: SocketAddr, payload: &[u8]) -> Vec<u8> {
+pub fn wrap(key: &LinkKey, dir: Dir, client: SocketAddr, sid: &Sid, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(ENVELOPE_MAX + payload.len());
     out.extend([0u8; NONCE_LEN]);
     match client.ip() {
@@ -328,40 +332,57 @@ pub fn wrap(key: &LinkKey, dir: Dir, client: SocketAddr, payload: &[u8]) -> Vec<
         }
     }
     out.extend(client.port().to_le_bytes());
+    out.extend(sid.0);
     out.extend(payload);
     seal(key, dir, out)
 }
 
 /// Seal `out` in place: its first `NONCE_LEN` bytes are overwritten with a
 /// fresh random nonce, the rest is encrypted, and the tag is appended.
-fn seal(key: &LinkKey, dir: Dir, mut out: Vec<u8>) -> Vec<u8> {
-    let (nonce, body) = out.split_at_mut(NONCE_LEN);
+fn seal(key: &LinkKey, dir: Dir, out: Vec<u8>) -> Vec<u8> {
+    seal_with(&key.seal, &[dir as u8], out, 0)
+}
+
+/// Seal `out` in place under `key` with associated data `ad`: bytes
+/// `skip..skip + NONCE_LEN` become a fresh random nonce, everything after it
+/// is encrypted, and the tag is appended. The first `skip` bytes are left as
+/// they are (a clear header the receiver needs before it can open).
+fn seal_with(key: &[u8; 32], ad: &[u8], mut out: Vec<u8>, skip: usize) -> Vec<u8> {
+    let (nonce, body) = out[skip..].split_at_mut(NONCE_LEN);
     getrandom::fill(nonce).expect("aegis-protocol: OS random source unavailable");
-    let tag = XChaCha20Poly1305::new(&key.seal.into())
-        .encrypt_in_place_detached((&*nonce).into(), &[dir as u8], body)
-        .expect("aegis-protocol: envelope too large to seal");
+    let tag = XChaCha20Poly1305::new(key.into())
+        .encrypt_in_place_detached((&*nonce).into(), ad, body)
+        .expect("aegis-protocol: datagram too large to seal");
     out.extend(tag);
     out
 }
 
-/// The inverse of [`wrap`], in place: the tag is verified before anything is
-/// decrypted for use, and `bytes` holds the plaintext afterwards (on an
-/// error its contents are unspecified). Returns the client's address and the
-/// payload, borrowed from `bytes`.
-pub fn unwrap<'a>(key: &LinkKey, dir: Dir, bytes: &'a mut [u8]) -> Result<(SocketAddr, &'a [u8]), EnvelopeError> {
+/// Open `bytes` (nonce, ciphertext, tag) in place under `key` with `ad`: the
+/// tag is verified before anything is decrypted for use. The plaintext,
+/// borrowed from `bytes`; `None` if it does not verify or is too short.
+fn open_with<'a>(key: &[u8; 32], ad: &[u8], bytes: &'a mut [u8]) -> Option<&'a [u8]> {
     if bytes.len() < NONCE_LEN + TAG_LEN {
-        return Err(EnvelopeError::Short);
+        return None;
     }
     let (nonce, rest) = bytes.split_at_mut(NONCE_LEN);
     let (body, tag) = rest.split_at_mut(rest.len() - TAG_LEN);
-    XChaCha20Poly1305::new(&key.seal.into())
-        .decrypt_in_place_detached((&*nonce).into(), &[dir as u8], body, (&*tag).into())
-        .map_err(|_| EnvelopeError::BadMac)?;
-    let body: &'a [u8] = body;
+    XChaCha20Poly1305::new(key.into()).decrypt_in_place_detached((&*nonce).into(), ad, body, (&*tag).into()).ok()?;
+    Some(body)
+}
+
+/// The inverse of [`wrap`], in place: the tag is verified before anything is
+/// decrypted for use, and `bytes` holds the plaintext afterwards (on an
+/// error its contents are unspecified). Returns the client's address, its
+/// session id and the payload, borrowed from `bytes`.
+pub fn unwrap<'a>(key: &LinkKey, dir: Dir, bytes: &'a mut [u8]) -> Result<(SocketAddr, Sid, &'a [u8]), EnvelopeError> {
+    if bytes.len() < NONCE_LEN + TAG_LEN {
+        return Err(EnvelopeError::Short);
+    }
+    let body = open_with(&key.seal, &[dir as u8], bytes).ok_or(EnvelopeError::BadMac)?;
     parse_header(body).ok_or(EnvelopeError::Malformed)
 }
 
-fn parse_header(bytes: &[u8]) -> Option<(SocketAddr, &[u8])> {
+fn parse_header(bytes: &[u8]) -> Option<(SocketAddr, Sid, &[u8])> {
     let (&tag, rest) = bytes.split_first()?;
     let (ip, rest): (IpAddr, &[u8]) = match tag {
         4 => {
@@ -374,8 +395,187 @@ fn parse_header(bytes: &[u8]) -> Option<(SocketAddr, &[u8])> {
         }
         _ => return None,
     };
-    let (port, payload) = rest.split_first_chunk::<2>()?;
-    Some((SocketAddr::new(ip, u16::from_le_bytes(*port)), payload))
+    let (port, rest) = rest.split_first_chunk::<2>()?;
+    let (sid, payload) = rest.split_first_chunk::<SID_LEN>()?;
+    Some((SocketAddr::new(ip, u16::from_le_bytes(*port)), Sid(*sid), payload))
+}
+
+/// Bytes of session id in front of every client datagram to a relay.
+pub const SID_LEN: usize = 16;
+
+/// Overhead of [`seal_up`]: the session id in the clear, a nonce, a tag.
+pub const EDGE_UP_MAX: usize = SID_LEN + NONCE_LEN + TAG_LEN;
+
+/// Overhead of [`seal_down`]: a nonce and a tag (the client knows its sid).
+pub const EDGE_DOWN_MAX: usize = NONCE_LEN + TAG_LEN;
+
+/// A client's session id at the relay: when its connect token stops
+/// admitting new Joins (unix seconds, little-endian), then 8 random bytes.
+/// Sent in the clear in front of every client datagram; both of the
+/// client's keys are derived from it, so it names them without the relay
+/// remembering anything — and altering any byte of it (the expiry included)
+/// names keys nobody holds.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct Sid([u8; SID_LEN]);
+
+impl Sid {
+    pub const fn from_bytes(b: [u8; SID_LEN]) -> Self {
+        Self(b)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; SID_LEN] {
+        &self.0
+    }
+
+    /// Unix seconds after which this sid no longer admits a Join.
+    pub fn expires(&self) -> u64 {
+        u64::from_le_bytes(self.0[..8].try_into().expect("8 bytes"))
+    }
+}
+
+/// The secret a relay shares with the game's backend (login, matchmaking) —
+/// never with clients, and not with the origin, which needs none of it.
+///
+/// The backend hands each client, over HTTPS, a session id and two keys
+/// derived from this secret ([`mint_connect`]); the relay re-derives the
+/// keys from the session id in each datagram. No public-key operation ever
+/// runs at the relay, and it keeps no table: the netcode.io model (Glenn
+/// Fiedler, `STANDARD.md`, 2017-) with its server-side connection table
+/// replaced by derivation. HTTPS does the part that needs certificates.
+#[derive(Clone, Copy)]
+pub struct EdgeKey {
+    prk: [u8; 32],
+}
+
+impl EdgeKey {
+    pub fn new(secret: [u8; 32]) -> Self {
+        let (prk, _) = Hkdf::<Sha256>::extract(Some(b"aegis edge v1"), &secret);
+        Self { prk: prk.into() }
+    }
+
+    /// A fresh secret from the OS CSPRNG.
+    pub fn random() -> Self {
+        let mut secret = [0u8; 32];
+        getrandom::fill(&mut secret).expect("aegis-protocol: OS random source unavailable");
+        Self::new(secret)
+    }
+
+    /// The key for `sid`'s traffic going `dir`: up = client to relay, down =
+    /// relay to client. Distinct per direction, so nothing sealed one way
+    /// opens the other.
+    fn key(&self, dir: Dir, sid: &Sid) -> [u8; 32] {
+        let hk = Hkdf::<Sha256>::from_prk(&self.prk).expect("32-byte PRK");
+        let mut info = [0u8; 1 + SID_LEN];
+        info[0] = dir as u8;
+        info[1..].copy_from_slice(&sid.0);
+        let mut k = [0u8; 32];
+        hk.expand(&info, &mut k).expect("32 bytes is a valid HKDF-SHA256 length");
+        k
+    }
+}
+
+/// Never prints key material.
+impl std::fmt::Debug for EdgeKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EdgeKey(..)")
+    }
+}
+
+/// What a client holds to talk to a relay: its session id and both of its
+/// keys. Delivered by the backend over HTTPS ([`ClientKeys::to_bytes`]), as
+/// netcode.io delivers a connect token.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ClientKeys {
+    pub sid: Sid,
+    up: [u8; 32],
+    down: [u8; 32],
+}
+
+/// Bytes of [`ClientKeys::to_bytes`].
+pub const CLIENT_KEYS_LEN: usize = SID_LEN + 64;
+
+impl ClientKeys {
+    pub fn to_bytes(&self) -> [u8; CLIENT_KEYS_LEN] {
+        let mut b = [0u8; CLIENT_KEYS_LEN];
+        b[..SID_LEN].copy_from_slice(&self.sid.0);
+        b[SID_LEN..SID_LEN + 32].copy_from_slice(&self.up);
+        b[SID_LEN + 32..].copy_from_slice(&self.down);
+        b
+    }
+
+    pub fn from_bytes(b: &[u8; CLIENT_KEYS_LEN]) -> Self {
+        let mut s = Self { sid: Sid::default(), up: [0; 32], down: [0; 32] };
+        s.sid.0.copy_from_slice(&b[..SID_LEN]);
+        s.up.copy_from_slice(&b[SID_LEN..SID_LEN + 32]);
+        s.down.copy_from_slice(&b[SID_LEN + 32..]);
+        s
+    }
+}
+
+/// Never prints key material.
+impl std::fmt::Debug for ClientKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ClientKeys {{ sid: {:?}, .. }}", self.sid)
+    }
+}
+
+/// The backend's half: a fresh session for one client, admitting Joins until
+/// `expires` (unix seconds). Hand the result to the client over HTTPS.
+pub fn mint_connect(edge: &EdgeKey, expires: u64) -> ClientKeys {
+    let mut sid = [0u8; SID_LEN];
+    sid[..8].copy_from_slice(&expires.to_le_bytes());
+    getrandom::fill(&mut sid[8..]).expect("aegis-protocol: OS random source unavailable");
+    let sid = Sid(sid);
+    ClientKeys { sid, up: edge.key(Dir::Up, &sid), down: edge.key(Dir::Down, &sid) }
+}
+
+/// Why a client datagram, or a datagram for a client, did not open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeError {
+    /// Too short to carry a sid (up), a nonce and a tag.
+    Short,
+    /// The tag does not verify: not sealed under this session's key for this
+    /// direction, or altered, or the sid was.
+    BadSeal,
+}
+
+/// Client side: seal a client datagram ([`frame`]) for the relay. Layout:
+/// the sid in the clear, a random nonce, the frame encrypted, the tag; the
+/// sid is associated data, so a datagram cannot be moved under another sid.
+pub fn seal_up(keys: &ClientKeys, frame: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(EDGE_UP_MAX + frame.len());
+    out.extend(keys.sid.0);
+    out.extend([0u8; NONCE_LEN]);
+    out.extend(frame);
+    seal_with(&keys.up, &keys.sid.0, out, SID_LEN)
+}
+
+/// Relay side: open a client datagram in place. The sid it came under, and
+/// the frame, borrowed from `bytes`.
+pub fn open_up<'a>(edge: &EdgeKey, bytes: &'a mut [u8]) -> Result<(Sid, &'a [u8]), EdgeError> {
+    if bytes.len() < EDGE_UP_MAX {
+        return Err(EdgeError::Short);
+    }
+    let (head, rest) = bytes.split_at_mut(SID_LEN);
+    let sid = Sid(head.try_into().expect("SID_LEN bytes"));
+    let frame = open_with(&edge.key(Dir::Up, &sid), &sid.0, rest).ok_or(EdgeError::BadSeal)?;
+    Ok((sid, frame))
+}
+
+/// Relay side: seal a datagram for the client holding `sid`.
+pub fn seal_down(edge: &EdgeKey, sid: &Sid, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(EDGE_DOWN_MAX + payload.len());
+    out.extend([0u8; NONCE_LEN]);
+    out.extend(payload);
+    seal_with(&edge.key(Dir::Down, sid), &sid.0, out, 0)
+}
+
+/// Client side: open a datagram from the relay in place.
+pub fn open_down<'a>(keys: &ClientKeys, bytes: &'a mut [u8]) -> Result<&'a [u8], EdgeError> {
+    if bytes.len() < EDGE_DOWN_MAX {
+        return Err(EdgeError::Short);
+    }
+    open_with(&keys.down, &keys.sid.0, bytes).ok_or(EdgeError::BadSeal)
 }
 
 #[cfg(test)]
@@ -415,6 +615,7 @@ mod tests {
     }
 
     static KEY: std::sync::LazyLock<LinkKey> = std::sync::LazyLock::new(|| LinkKey::new([7; 32]));
+    const SID: Sid = Sid([9; SID_LEN]);
 
     fn other_key() -> LinkKey {
         LinkKey::new([8; 32])
@@ -426,9 +627,9 @@ mod tests {
             let client: SocketAddr = client.parse().unwrap();
             for payload in [&b""[..], &[1, 2, 3][..], &[0u8; 2048][..]] {
                 for dir in [Dir::Up, Dir::Down] {
-                    let mut w = wrap(&KEY, dir, client, payload);
+                    let mut w = wrap(&KEY, dir, client, &SID, payload);
                     assert!(w.len() <= ENVELOPE_MAX + payload.len());
-                    assert_eq!(unwrap(&KEY, dir, &mut w), Ok((client, payload)));
+                    assert_eq!(unwrap(&KEY, dir, &mut w), Ok((client, SID, payload)));
                 }
             }
         }
@@ -440,7 +641,7 @@ mod tests {
     #[test]
     fn envelope_refuses_a_forgery() {
         let client: SocketAddr = "10.0.0.7:9".parse().unwrap();
-        let w = wrap(&KEY, Dir::Up, client, b"input");
+        let w = wrap(&KEY, Dir::Up, client, &SID, b"input");
         assert_eq!(unwrap(&other_key(), Dir::Up, &mut w.clone()), Err(EnvelopeError::BadMac));
         assert_eq!(unwrap(&KEY, Dir::Down, &mut w.clone()), Err(EnvelopeError::BadMac));
         for i in 0..w.len() {
@@ -465,13 +666,13 @@ mod tests {
                 cookie: Some(0x0123_4567_89AB_CDEF),
             },
         );
-        let w = wrap(&KEY, Dir::Up, client, &payload);
+        let w = wrap(&KEY, Dir::Up, client, &SID, &payload);
         let contains = |needle: &[u8]| w.windows(needle.len()).any(|win| win == needle);
         assert!(!contains(&[10, 11, 12, 13]), "client IP in the clear");
         assert!(!contains(&token.to_le_bytes()), "session token in the clear");
         assert!(!contains(b"secret-name"), "payload in the clear");
         assert!(!contains(&0x0123_4567_89AB_CDEFu64.to_le_bytes()), "cookie in the clear");
-        assert_ne!(w, wrap(&KEY, Dir::Up, client, &payload), "two seals of one datagram match");
+        assert_ne!(w, wrap(&KEY, Dir::Up, client, &SID, &payload), "two seals of one datagram match");
     }
 
     /// A minted token checks for its own address only: another port, another
@@ -522,9 +723,9 @@ mod tests {
     /// unknown headers are `Malformed`, never read past.
     #[test]
     fn envelope_refuses_a_cut_header() {
-        let mut w4 = wrap(&KEY, Dir::Up, "10.0.0.7:9".parse().unwrap(), &[]);
-        assert_eq!(w4.len(), NONCE_LEN + 7 + TAG_LEN);
-        let w6 = wrap(&KEY, Dir::Up, "[::1]:9".parse().unwrap(), &[]);
+        let mut w4 = wrap(&KEY, Dir::Up, "10.0.0.7:9".parse().unwrap(), &SID, &[]);
+        assert_eq!(w4.len(), NONCE_LEN + 7 + SID_LEN + TAG_LEN);
+        let w6 = wrap(&KEY, Dir::Up, "[::1]:9".parse().unwrap(), &SID, &[]);
         assert_eq!(w6.len(), ENVELOPE_MAX);
         assert_eq!(unwrap(&KEY, Dir::Up, &mut w4[..NONCE_LEN + TAG_LEN - 1]), Err(EnvelopeError::Short));
         assert_eq!(unwrap(&KEY, Dir::Up, &mut []), Err(EnvelopeError::Short));
@@ -537,8 +738,121 @@ mod tests {
         };
         assert_eq!(unwrap(&KEY, Dir::Up, &mut sealed(&[4, 10, 0, 0, 7, 9])), Err(EnvelopeError::Malformed));
         assert_eq!(unwrap(&KEY, Dir::Up, &mut sealed(&[5, 0, 0, 0, 0, 0, 0])), Err(EnvelopeError::Malformed));
+        // An address and a port, then one byte short of a sid.
+        let mut cut = vec![4, 10, 0, 0, 7, 9, 0];
+        cut.extend([1u8; SID_LEN - 1]);
+        assert_eq!(unwrap(&KEY, Dir::Up, &mut sealed(&cut)), Err(EnvelopeError::Malformed));
+        cut.push(1);
+        assert_eq!(
+            unwrap(&KEY, Dir::Up, &mut sealed(&cut)),
+            Ok(("10.0.0.7:9".parse().unwrap(), Sid([1; SID_LEN]), &[][..]))
+        );
         // Exactly a nonce and a tag around nothing: authentic, but empty.
         assert_eq!(unwrap(&KEY, Dir::Up, &mut sealed(&[])), Err(EnvelopeError::Malformed));
+    }
+
+    static EDGE: std::sync::LazyLock<EdgeKey> = std::sync::LazyLock::new(|| EdgeKey::new([11; 32]));
+
+    /// A client and its relay, both ways: what the client seals the relay
+    /// opens, under the sid it came with; what the relay seals for that sid
+    /// the client opens — including after the keys made the trip from the
+    /// backend as bytes.
+    #[test]
+    fn edge_roundtrip_both_ways() {
+        let minted = mint_connect(&EDGE, 1_900_000_000);
+        let keys = ClientKeys::from_bytes(&minted.to_bytes());
+        assert_eq!(keys, minted);
+        assert_eq!(keys.sid.expires(), 1_900_000_000);
+        for payload in [&b""[..], &b"input"[..], &[0u8; MAX_DATAGRAM][..]] {
+            let mut up = seal_up(&keys, payload);
+            assert_eq!(up.len(), EDGE_UP_MAX + payload.len());
+            assert_eq!(open_up(&EDGE, &mut up), Ok((keys.sid, payload)));
+            let mut down = seal_down(&EDGE, &keys.sid, payload);
+            assert_eq!(down.len(), EDGE_DOWN_MAX + payload.len());
+            assert_eq!(open_down(&keys, &mut down), Ok(payload));
+        }
+    }
+
+    /// The seal at its edges. Up: another relay's key, one flipped bit
+    /// anywhere (the sid's expiry and random half included — a sid nobody
+    /// was issued names keys nobody holds), and a datagram sealed down sent
+    /// back up are all refused. Down: another session's keys and a datagram
+    /// sealed up are refused.
+    #[test]
+    fn edge_refuses_a_forgery() {
+        let keys = mint_connect(&EDGE, 1_900_000_000);
+        let up = seal_up(&keys, b"input");
+        assert_eq!(open_up(&EdgeKey::new([12; 32]), &mut up.clone()), Err(EdgeError::BadSeal));
+        for i in 0..up.len() {
+            let mut bad = up.clone();
+            bad[i] ^= 1;
+            assert_eq!(open_up(&EDGE, &mut bad), Err(EdgeError::BadSeal), "bit flip at byte {i} accepted");
+        }
+        let mut reversed = keys.sid.0.to_vec();
+        reversed.extend(seal_down(&EDGE, &keys.sid, b"input"));
+        assert_eq!(open_up(&EDGE, &mut reversed), Err(EdgeError::BadSeal));
+
+        let down = seal_down(&EDGE, &keys.sid, b"snapshot");
+        let other = mint_connect(&EDGE, 1_900_000_000);
+        assert_eq!(open_down(&other, &mut down.clone()), Err(EdgeError::BadSeal));
+        assert_eq!(open_down(&keys, &mut up[SID_LEN..].to_vec()), Err(EdgeError::BadSeal));
+        assert_eq!(open_down(&keys, &mut down.clone()), Ok(&b"snapshot"[..]));
+    }
+
+    /// Edge: one byte short of the overhead is `Short`, never read past;
+    /// exactly the overhead is an empty datagram.
+    #[test]
+    fn edge_short_at_the_overhead() {
+        let keys = mint_connect(&EDGE, 1);
+        let up = seal_up(&keys, b"");
+        assert_eq!(open_up(&EDGE, &mut up[..EDGE_UP_MAX - 1].to_vec()), Err(EdgeError::Short));
+        assert_eq!(open_up(&EDGE, &mut up.clone()), Ok((keys.sid, &[][..])));
+        let down = seal_down(&EDGE, &keys.sid, b"");
+        assert_eq!(open_down(&keys, &mut down[..EDGE_DOWN_MAX - 1].to_vec()), Err(EdgeError::Short));
+        assert_eq!(open_down(&keys, &mut down.clone()), Ok(&[][..]));
+    }
+
+    /// What an on-path observer of the client's leg sees: the sid, and
+    /// nothing of the token, the message or the cookie; the same datagram
+    /// sealed twice is not the same bytes.
+    #[test]
+    fn edge_hides_token_and_message() {
+        let keys = mint_connect(&EDGE, 1_900_000_000);
+        let token = 0xA1B2_C3D4_E5F6_0718u64;
+        let msg = ClientMsg::Join { name: "secret-name".into(), protocol: PROTOCOL_VERSION, cookie: Some(0x0123_4567) };
+        let d = seal_up(&keys, &frame(token, &msg));
+        let has = |needle: &[u8]| d.windows(needle.len()).any(|w| w == needle);
+        assert!(!has(&token.to_le_bytes()), "token in the clear");
+        assert!(!has(b"secret-name"), "message in the clear");
+        assert!(!has(&0x0123_4567u64.to_le_bytes()), "cookie in the clear");
+        assert_ne!(d, seal_up(&keys, &frame(token, &msg)));
+        let down = seal_down(&EDGE, &keys.sid, &encode(&ServerMsg::Joined { player_id: 7, token, tick: 1 }));
+        assert!(!down.windows(8).any(|w| w == token.to_le_bytes()), "issued token in the clear");
+    }
+
+    /// No amplification through the relay either: the seal adds less going
+    /// down than up, so the challenge a sealed Join earns is still smaller.
+    #[test]
+    fn a_sealed_challenge_is_never_larger_than_a_sealed_join() {
+        const { assert!(EDGE_DOWN_MAX < EDGE_UP_MAX) };
+        let keys = mint_connect(&EDGE, 1);
+        let join =
+            seal_up(&keys, &frame(NO_TOKEN, &ClientMsg::Join { name: String::new(), protocol: 0, cookie: None }));
+        let challenge = seal_down(&EDGE, &keys.sid, &encode(&ServerMsg::Challenge { cookie: u64::MAX }));
+        assert!(challenge.len() < join.len(), "{} >= {}", challenge.len(), join.len());
+    }
+
+    /// Two sessions minted at the same expiry never share a sid or a key, and
+    /// a key is never the edge secret's PRK.
+    #[test]
+    fn sessions_are_distinct() {
+        let (a, b) = (mint_connect(&EDGE, 5), mint_connect(&EDGE, 5));
+        assert_ne!(a.sid, b.sid);
+        assert_ne!(a.up, b.up);
+        assert_ne!(a.up, a.down);
+        assert_ne!(a.up, EDGE.prk);
+        assert_eq!(format!("{:?}", *EDGE), "EdgeKey(..)");
+        assert!(!format!("{a:?}").contains(&format!("{:?}", a.up)));
     }
 
     #[test]

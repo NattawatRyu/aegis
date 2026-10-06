@@ -21,8 +21,14 @@ not by chasing individual cheats.
 > relay-to-origin link is sealed (XChaCha20-Poly1305 under subkeys HKDF'd
 > from one shared 32-byte secret): an observer of the link learns neither
 > client addresses, nor tokens, nor messages. The client-to-relay leg is
-> **not** encrypted: an on-path attacker there can still read a client's
-> token and act as it. The relay drops, statelessly,
+> sealed too (protocol v3, the netcode.io model): the game's backend hands
+> each client a session id and two keys over HTTPS, the relay re-derives
+> the keys from the session id in each datagram — no table, no public-key
+> operation — and an on-path attacker who could take a player over a plain
+> leg (`sniff` bot: 59 of 59 forgeries accepted) gets nothing through a
+> relay (0). The origin binds each player to the session it was admitted
+> under. Direct, relay-less runs are still plaintext: lab only. The relay
+> drops, statelessly,
 > any datagram whose session token was not issued for its source address
 > (tokens carry a MAC the relay can check), and gives token-0 datagrams
 > (Joins, which the token check must let through) the origin's own per-IP

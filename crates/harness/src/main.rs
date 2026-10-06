@@ -92,12 +92,14 @@ fn main() -> std::io::Result<()> {
     if let Some(e) = r.relay {
         let (seen, cut) = (edge_seen(&e), edge_dropped(&e));
         println!(
-            "relay edge: {} client datagrams in, {} forwarded, {} challenged, {} dropped ({:.0}%: bad_token {}, join_rate {}, bad_cookie {}, short {}, oversize {})",
+            "relay edge: {} client datagrams in, {} forwarded, {} challenged, {} dropped ({:.0}%: bad_seal {}, expired {}, bad_token {}, join_rate {}, bad_cookie {}, short {}, oversize {})",
             seen,
             e.up,
             e.challenged,
             cut,
             100.0 * cut as f64 / seen.max(1) as f64,
+            e.bad_seal,
+            e.expired,
             e.bad_token,
             e.join_rate,
             e.bad_cookie,

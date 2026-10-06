@@ -33,9 +33,11 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use aegis_protocol::{encode, unwrap, wrap, Dir, EnvelopeError, LinkKey, ServerMsg, ENVELOPE_MAX, TICK_HZ};
+use std::collections::HashMap;
 
-use crate::{Server, TickOutcome};
+use aegis_protocol::{encode, unwrap, wrap, Dir, EnvelopeError, LinkKey, ServerMsg, Sid, ENVELOPE_MAX, TICK_HZ};
+
+use crate::{Reply, Server, TickOutcome};
 
 /// One tick of wall-clock time at [`TICK_HZ`].
 pub const TICK: Duration = Duration::from_nanos(1_000_000_000 / TICK_HZ as u64);
@@ -58,6 +60,13 @@ pub const BAD_ENVELOPE: &str = "bad_envelope";
 /// address whose MAC is wrong — someone forging the relay's source address
 /// without the link key.
 pub const BAD_MAC: &str = "bad_mac";
+
+/// [`crate::NetStats`] label, behind a relay: a datagram from an admitted
+/// player's address under a session id that is not the one it was admitted
+/// under. Someone holding keys of their own, forging that player's address:
+/// were it read, a re-Join would move the player's replies to the forger's
+/// keys.
+pub const SID_MISMATCH: &str = "sid_mismatch";
 
 /// [`crate::NetStats`] label: a datagram read off the socket while
 /// [`BACKLOG`] were already waiting for the tick loop, dropped.
@@ -172,13 +181,17 @@ pub struct NetServer {
     reply_log: Option<Vec<(SocketAddr, ServerMsg)>>,
     /// The relay this server is the origin behind, and the key they share.
     relay: Option<(SocketAddr, LinkKey)>,
+    /// Behind a relay: the session id each admitted address was admitted
+    /// under — whose keys the relay seals its replies with. Bound at the
+    /// `Joined`, never moved while the player stays; dropped when it leaves.
+    sids: HashMap<SocketAddr, Sid>,
 }
 
 impl NetServer {
     pub fn bind(addr: impl ToSocketAddrs, server: Server) -> io::Result<Self> {
         let sock = UdpSocket::bind(addr)?;
         let reader = Reader::spawn(sock.try_clone()?, BACKLOG)?;
-        Ok(Self { server, sock, reader, tick: 0, reply_log: None, relay: None })
+        Ok(Self { server, sock, reader, tick: 0, reply_log: None, relay: None, sids: HashMap::new() })
     }
 
     /// Become the origin behind the relay whose upstream socket is `relay`,
@@ -200,17 +213,28 @@ impl NetServer {
     /// admits a Join with a cookie without re-checking it
     /// ([`Server::trust_edge_cookies`]) — safe only because nothing but the
     /// relay, under the key, is read.
+    ///
+    /// Each envelope also names the client's session id at the relay (whose
+    /// keys seal its leg). A player is bound to the sid it was admitted
+    /// under: from its address, any other sid is dropped ([`SID_MISMATCH`]),
+    /// and its replies go out under its own. Without that, any player — who
+    /// holds keys of their own — could forge a victim's address and re-Join
+    /// in its name, moving the victim's replies, token and all, to keys the
+    /// forger can open.
     pub fn behind_relay(&mut self, relay: SocketAddr, key: LinkKey) {
         self.relay = Some((relay, key));
         self.server.share_token_key(key);
         self.server.trust_edge_cookies();
     }
 
-    /// Send `bytes` to client `to`: directly, or wrapped through the relay.
-    fn send(&self, to: SocketAddr, bytes: &[u8]) {
-        let _ = match &self.relay {
-            Some((r, key)) => self.sock.send_to(&wrap(key, Dir::Down, to, bytes), r),
-            None => self.sock.send_to(bytes, to),
+    /// Send `bytes` to client `to`: directly, or wrapped through the relay
+    /// for the session `sid`. Behind a relay with no sid, nothing is sent:
+    /// the relay could not seal it for anyone.
+    fn send(&self, to: SocketAddr, sid: Option<&Sid>, bytes: &[u8]) {
+        let _ = match (&self.relay, sid) {
+            (Some((r, key)), Some(sid)) => self.sock.send_to(&wrap(key, Dir::Down, to, sid, bytes), r),
+            (Some(_), None) => return,
+            (None, _) => self.sock.send_to(bytes, to),
         };
     }
 
@@ -250,9 +274,12 @@ impl NetServer {
     pub fn begin_tick(&mut self) -> io::Result<()> {
         self.tick += 1;
         self.server.begin_tick(self.tick);
+        // A player who left frees its address for a new session.
+        let server = &self.server;
+        self.sids.retain(|a, _| server.player_id(*a).is_some());
         for (to, id) in self.server.peers() {
             let snap = encode(&ServerMsg::Snapshot { tick: self.tick, players: self.server.sim().view(id) });
-            self.send(to, &snap);
+            self.send(to, self.sids.get(&to), &snap);
         }
         Ok(())
     }
@@ -274,23 +301,34 @@ impl NetServer {
             Err(RecvTimeoutError::Disconnected) => return Err(io::Error::other("aegis-server: socket reader stopped")),
         };
         // Behind a relay: only the relay, and only an envelope.
-        let (from, bytes) = match &self.relay {
-            None => (peer, &datagram[..]),
+        let (from, sid, bytes) = match &self.relay {
+            None => (peer, None, &datagram[..]),
             Some((r, _)) if peer != *r => {
                 self.server.count_drop(NOT_RELAY);
                 return Ok(true);
             }
             Some((_, key)) => match unwrap(key, Dir::Up, &mut datagram) {
-                Ok(v) => v,
+                Ok((from, sid, bytes)) => (from, Some(sid), bytes),
                 Err(e) => {
                     self.server.count_drop(if e == EnvelopeError::BadMac { BAD_MAC } else { BAD_ENVELOPE });
                     return Ok(true);
                 }
             },
         };
+        // An admitted address speaks under the sid it was admitted under, or
+        // not at all.
+        if let (Some(sid), Some(bound)) = (sid, self.sids.get(&from)) {
+            if sid != *bound {
+                self.server.count_drop(SID_MISMATCH);
+                return Ok(true);
+            }
+        }
         if let Some(reply) = self.server.receive(self.tick, from, bytes) {
+            if let (Reply::Joined(_), Some(sid)) = (reply, sid) {
+                self.sids.insert(from, sid);
+            }
             let msg = reply.to_msg(self.tick);
-            self.send(from, &encode(&msg));
+            self.send(from, sid.as_ref(), &encode(&msg));
             if let Some(log) = &mut self.reply_log {
                 log.push((from, msg));
             }
@@ -434,7 +472,8 @@ mod tests {
     fn read_wrapped(r: &UdpSocket) -> (SocketAddr, ServerMsg) {
         let mut buf = [0u8; MAX_DATAGRAM + ENVELOPE_MAX];
         let n = r.recv(&mut buf).expect("nothing came to the relay");
-        let (to, body) = unwrap(&KEY, Dir::Down, &mut buf[..n]).expect("origin sent the relay a bad envelope");
+        let (to, sid, body) = unwrap(&KEY, Dir::Down, &mut buf[..n]).expect("origin sent the relay a bad envelope");
+        assert_eq!(sid, SID, "a reply sealed for the wrong session");
         (to, decode(body).unwrap())
     }
 
@@ -442,8 +481,15 @@ mod tests {
 
     /// A datagram as the relay would forward it from client `c`.
     fn up(c: SocketAddr, d: &[u8]) -> Vec<u8> {
-        wrap(&KEY, Dir::Up, c, d)
+        up_as(c, &SID, d)
     }
+
+    /// The same, under session `sid`.
+    fn up_as(c: SocketAddr, sid: &Sid, d: &[u8]) -> Vec<u8> {
+        wrap(&KEY, Dir::Up, c, sid, d)
+    }
+
+    const SID: Sid = Sid::from_bytes([1; 16]);
 
     /// Behind a relay, the origin talks to the relay alone. A client that
     /// found the origin's address gets nothing back, and nothing it sends is
@@ -479,6 +525,56 @@ mod tests {
         assert!(c.recv(&mut buf).is_err(), "the origin sent a client a datagram");
     }
 
+    /// The session binding at its edges. A player admitted under one sid:
+    /// someone with keys of their own (another sid) forging its address can
+    /// neither re-Join in its name — which would move its replies to the
+    /// forger's keys — nor send as it; nothing is answered. The player's own
+    /// sid still plays. Once the player has left, its address is free and a
+    /// new session binds.
+    #[test]
+    fn an_admitted_address_speaks_only_under_its_own_sid() {
+        let mut n = net();
+        let to = n.local_addr().unwrap();
+        let relay = client();
+        relay.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        n.behind_relay(relay.local_addr().unwrap(), *KEY);
+        let me: SocketAddr = "10.1.2.3:4000".parse().unwrap();
+        let forger = Sid::from_bytes([2; 16]);
+
+        relay.send_to(&up(me, &join_with(Some(1))), to).unwrap();
+        assert!(n.recv_one(WAIT).unwrap());
+        let (_, msg) = read_wrapped(&relay);
+        let ServerMsg::Joined { token, .. } = msg else { panic!("expected Joined, got {msg:?}") };
+
+        relay.send_to(&up_as(me, &forger, &join_with(Some(1))), to).unwrap();
+        relay.send_to(&up_as(me, &forger, &input(token, 1)), to).unwrap();
+        assert!(n.recv_one(WAIT).unwrap() && n.recv_one(WAIT).unwrap());
+        assert_eq!(n.server().net_stats().get(SID_MISMATCH), 2);
+        let mut buf = [0u8; MAX_DATAGRAM + ENVELOPE_MAX];
+        assert!(relay.recv(&mut buf).is_err(), "a forged re-Join was answered");
+
+        relay.send_to(&up(me, &input(token, 1)), to).unwrap();
+        assert!(n.recv_one(WAIT).unwrap());
+        n.begin_tick().unwrap();
+        assert!(
+            matches!(read_wrapped(&relay), (d, ServerMsg::Snapshot { .. }) if d == me),
+            "the player lost its replies"
+        );
+
+        // Idle past the timeout: the player leaves and the address is free.
+        for _ in 0..=crate::server::IDLE_TICKS + 1 {
+            n.begin_tick().unwrap();
+        }
+        assert_eq!(n.server().player_id(me), None);
+        while relay.recv(&mut buf).is_ok() {} // the snapshots it was sent until then
+        relay.send_to(&up_as(me, &forger, &join_with(Some(1))), to).unwrap();
+        assert!(n.recv_one(WAIT).unwrap());
+        let n2 = relay.recv(&mut buf).expect("the new session was not answered");
+        let (dest, sid, _) = unwrap(&KEY, Dir::Down, &mut buf[..n2]).unwrap();
+        assert_eq!((dest, sid), (me, forger));
+        assert_eq!(n.server().net_stats().get(SID_MISMATCH), 2);
+    }
+
     /// Edge: from the relay's own address, a datagram that is not an
     /// envelope is counted and dropped, not read as a client's.
     #[test]
@@ -507,13 +603,13 @@ mod tests {
         n.behind_relay(relay.local_addr().unwrap(), *KEY);
         let victim: SocketAddr = "10.9.9.9:4000".parse().unwrap();
 
-        relay.send_to(&wrap(&LinkKey::new([4; 32]), Dir::Up, victim, &join()), to).unwrap();
+        relay.send_to(&wrap(&LinkKey::new([4; 32]), Dir::Up, victim, &SID, &join()), to).unwrap();
         assert!(n.recv_one(WAIT).unwrap());
         assert_eq!(n.server().net_stats().get(BAD_MAC), 1);
         let mut buf = [0u8; MAX_DATAGRAM + ENVELOPE_MAX];
         assert!(relay.recv(&mut buf).is_err(), "a forged envelope was answered");
 
-        relay.send_to(&wrap(&KEY, Dir::Down, victim, &join()), to).unwrap();
+        relay.send_to(&wrap(&KEY, Dir::Down, victim, &SID, &join()), to).unwrap();
         assert!(n.recv_one(WAIT).unwrap());
         assert_eq!(n.server().net_stats().get(BAD_MAC), 2);
         assert!(relay.recv(&mut buf).is_err(), "a reversed envelope was answered");

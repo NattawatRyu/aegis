@@ -38,6 +38,7 @@ use aegis_client_sdk::{
     reflect::{ReflectBot, BYSTANDER},
     replay::ReplayBot,
     rusher::RusherBot,
+    sniff::SniffBot,
     speedhack::SpeedhackBot,
     spoof::SpoofBot,
     zeroflood::ZeroFloodBot,
@@ -45,8 +46,14 @@ use aegis_client_sdk::{
 };
 use aegis_detector::{Alert, Monitor, PlayerStats};
 use aegis_protocol::{
-    decode, encode, frame, split_frame, ClientMsg, LinkKey, PlayerId, PlayerState, ServerMsg, Vec2, NO_TOKEN,
+    decode, encode, frame, mint_connect, open_down, seal_up, split_frame, ClientKeys, ClientMsg, EdgeKey, LinkKey,
+    PlayerId, PlayerState, ServerMsg, Vec2, EDGE_DOWN_MAX, NO_TOKEN,
 };
+
+/// Unix seconds now: when the lab's backend stamps a session's expiry.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
 use aegis_relay::{Clock, Relay, RelayStats};
 use aegis_server::net::MAX_DATAGRAM;
 use aegis_server::{NetServer, NetStats, Reply, Server, Session, Sim, TickOutcome, ARENA_WALLS};
@@ -168,6 +175,21 @@ impl Scenario {
     /// with and without a relay: the before/after of hiding the origin.
     pub fn relay_probe() -> Self {
         Self { name: "relay_probe", ticks: 60, bots: vec![Box::new(HonestBot::new()), Box::new(DirectBot::new())] }
+    }
+
+    /// An honest player and an on-path attacker reading its datagrams, who
+    /// gets each tick's forgery in first. Run without and with a relay: the
+    /// before/after of sealing the client's leg. Not in the standard
+    /// scenario on purpose — it is meant to come out differently on the two
+    /// transports.
+    pub fn sniff_probe() -> Self {
+        Self { name: "sniff_probe", ticks: 60, bots: vec![Box::new(SniffBot::new()), Box::new(HonestBot::new())] }
+    }
+
+    /// For each bot, the slot of the bot whose wire it taps.
+    fn taps(&self) -> Vec<Option<usize>> {
+        let at = |v: &str| self.bots.iter().position(|o| o.name() == v).unwrap_or_else(|| panic!("no bot named {v}"));
+        self.bots.iter().map(|b| b.taps().map(at)).collect()
     }
 }
 
@@ -540,6 +562,7 @@ impl Lab {
 pub fn run(mut sc: Scenario) -> Report {
     let n = sc.bots.len();
     let route = sc.routes();
+    let taps = sc.taps();
     let mut server = Server::with_walls(spawns(n), &ARENA_WALLS);
     let mut lab = Lab::new(n);
 
@@ -557,6 +580,8 @@ pub fn run(mut sc: Scenario) -> Report {
 
     let bystander = mem_addr(sc.bystander(), 0);
     let mut frames = Vec::with_capacity(sc.ticks as usize);
+    // What each bot put on the wire, for whoever taps it.
+    let mut wire: Vec<Vec<Vec<u8>>> = vec![Vec::new(); n];
     for tick in 1..=sc.ticks {
         server.begin_tick(tick);
         frames.push(server.sim().snapshot());
@@ -569,10 +594,17 @@ pub fn run(mut sc: Scenario) -> Report {
             lab.bystander.rx += encode(&ServerMsg::Snapshot { tick, players: server.sim().view(p) }).len() as u64;
         }
         let mut retry = Vec::new();
+        // A tap has heard last tick's wire by now; this tick's is kept for
+        // the next. (So a tap may act before the bot it listens to.)
+        let heard = std::mem::replace(&mut wire, vec![Vec::new(); n]);
         for (i, bot) in sc.bots.iter_mut().enumerate() {
+            if let Some(v) = taps[i] {
+                heard[v].iter().for_each(|w| bot.overheard(w));
+            }
             let seen = &views[i];
             lab.count_hidden(i, server.sim(), seen);
             for (k, d) in bot.routed(&lab.ctx(i, tick, seen)) {
+                wire[i].push(d.clone());
                 // A reply goes to the address the datagram came from. Only
                 // port 0's Joined is read back (the UDP run reads only that
                 // one), and only a bot's own address gets to answer a
@@ -620,11 +652,14 @@ fn run_net(mut sc: Scenario, relayed: bool) -> io::Result<Report> {
     let n = sc.bots.len();
     let mut net = NetServer::bind((Ipv4Addr::LOCALHOST, 0), Server::with_walls(spawns(n), &ARENA_WALLS))?;
     let origin = net.local_addr()?;
+    // The secret the relay shares with the game's backend, fresh per run.
+    let backend = EdgeKey::random();
     let relay = if relayed {
         // A fresh link key per run, as a deployment would provision one.
         let key = LinkKey::random();
         // Lockstep budget windows: one per origin tick, moved below.
-        let r = Relay::spawn_with((Ipv4Addr::LOCALHOST, 0), (Ipv4Addr::LOCALHOST, 0), origin, key, Clock::lockstep())?;
+        let (any, clock) = ((Ipv4Addr::LOCALHOST, 0), Clock::lockstep());
+        let r = Relay::spawn_with(any, any, origin, key, backend, clock)?;
         net.behind_relay(r.upstream_addr(), key);
         Some(r)
     } else {
@@ -633,6 +668,16 @@ fn run_net(mut sc: Scenario, relayed: bool) -> io::Result<Report> {
     // The one server address bots are told; the only one they hear from.
     let to = relay.as_ref().map_or(origin, Relay::public_addr);
     let dest: Vec<SocketAddr> = sc.bots.iter().map(|b| if b.bypasses_relay() { origin } else { to }).collect();
+    // The backend's part: every bot that talks to the relay logged in and
+    // was issued a session — cheaters included, as any player can be. A bot
+    // forging another's address still seals under its own keys.
+    let keys: Vec<Option<ClientKeys>> =
+        dest.iter().map(|&d| (relayed && d != origin).then(|| mint_connect(&backend, unix_now() + 3600))).collect();
+    let keys = &keys[..];
+    // What bot `i` puts on the wire for client datagram `d`.
+    let seal = |i: usize, d: &[u8]| keys[i].as_ref().map_or_else(|| d.to_vec(), |k| seal_up(k, d));
+    // Bytes of seal on each datagram the relay sends a client.
+    let down_seal = if relayed { EDGE_DOWN_MAX as u64 } else { 0 };
     // Behind a relay, which bots it answers: the relay, not the origin,
     // challenges their Joins.
     let edge: Option<Vec<bool>> = relayed.then(|| dest.iter().map(|&d| d != origin).collect());
@@ -652,6 +697,7 @@ fn run_net(mut sc: Scenario, relayed: bool) -> io::Result<Report> {
         })
         .collect::<io::Result<Vec<_>>>()?;
     let route = sc.routes();
+    let taps = sc.taps();
     let mut lab = Lab::new(n);
     // Which bot socket an address belongs to: where a reply to it lands.
     let mut owner = HashMap::new();
@@ -668,6 +714,8 @@ fn run_net(mut sc: Scenario, relayed: bool) -> io::Result<Report> {
     net.log_replies();
 
     let rl = relay.as_ref();
+    // What each bot put on the wire (sealed, via a relay), for a tap.
+    let mut wire: Vec<Vec<Vec<u8>>> = vec![Vec::new(); n];
     // How many of a batch went to the relay and how many straight on.
     let split = |sent: &[(usize, usize, u16, Vec<u8>)]| {
         let direct = sent.iter().filter(|(i, ..)| relayed && dest[*i] == origin).count();
@@ -679,13 +727,13 @@ fn run_net(mut sc: Scenario, relayed: bool) -> io::Result<Report> {
     let mut sent = Vec::new();
     for (i, bot) in sc.bots.iter().enumerate() {
         let d = frame(NO_TOKEN, &bot.join());
-        socks[i][0].send_to(&d, dest[i])?;
+        socks[i][0].send_to(&seal(i, &d), dest[i])?;
         sent.push((i, i, 0, d));
     }
     let (via, direct) = split(&sent);
     deliver(&mut net, rl, before, via, direct)?;
-    let retry = udp_challenges(&mut net, edge.as_deref(), &socks, &owner, &sent, to)?;
-    answer_udp(&mut net, rl, &socks, to, retry)?;
+    let retry = udp_challenges(&mut net, edge.as_deref(), &socks, keys, &owner, &sent, to)?;
+    answer_udp(&mut net, rl, &socks, keys, to, retry)?;
 
     for tick in 1..=sc.ticks {
         net.begin_tick()?;
@@ -694,11 +742,16 @@ fn run_net(mut sc: Scenario, relayed: bool) -> io::Result<Report> {
         }
         let before = relay_stats(rl);
         let mut sent = Vec::new();
+        // A tap has heard last tick's wire by now.
+        let heard = std::mem::replace(&mut wire, vec![Vec::new(); n]);
         for (i, bot) in sc.bots.iter_mut().enumerate() {
+            if let Some(v) = taps[i] {
+                heard[v].iter().for_each(|w| bot.overheard(w));
+            }
             // The server's word on who is admitted decides only whether to
             // wait for a snapshot; what is in it is read off the socket.
             let snapshot = match net.server().player_id(socks[i][0].local_addr()?) {
-                Some(_) => read_snapshot(&socks[i][0], to, tick, &mut lab.sessions[i])?,
+                Some(_) => read_snapshot(&socks[i][0], to, keys[i].as_ref(), tick, &mut lab.sessions[i])?,
                 None => Vec::new(),
             };
             lab.count_hidden(i, net.server().sim(), &snapshot);
@@ -706,19 +759,21 @@ fn run_net(mut sc: Scenario, relayed: bool) -> io::Result<Report> {
                 if route[i] == n {
                     lab.bystander.tx += d.len() as u64;
                 }
-                socks[route[i]][k as usize].send_to(&d, dest[i])?;
+                let w = seal(i, &d);
+                socks[route[i]][k as usize].send_to(&w, dest[i])?;
+                wire[i].push(w);
                 sent.push((i, route[i], k, d));
             }
         }
         let (via, direct) = split(&sent);
         deliver(&mut net, rl, before, via, direct)?;
-        let retry = udp_challenges(&mut net, edge.as_deref(), &socks, &owner, &sent, to)?;
-        answer_udp(&mut net, rl, &socks, to, retry)?;
+        let retry = udp_challenges(&mut net, edge.as_deref(), &socks, keys, &owner, &sent, to)?;
+        answer_udp(&mut net, rl, &socks, keys, to, retry)?;
         drain_extra_ports(&socks)?;
-        lab.bystander.rx += drain_bytes(&socks[n][0], Duration::ZERO)?;
+        lab.bystander.rx += drain_bytes(&socks[n][0], Duration::ZERO, down_seal)?;
         lab.measure(net.end_tick());
     }
-    lab.bystander.rx += drain_bytes(&socks[n][0], Duration::from_millis(100))?;
+    lab.bystander.rx += drain_bytes(&socks[n][0], Duration::from_millis(100), down_seal)?;
 
     let (tel, stats) = net.into_server().into_parts();
     let mut report = lab.report(&sc, tel, stats);
@@ -796,7 +851,7 @@ pub fn edge_seen(s: &RelayStats) -> u64 {
 
 /// Client datagrams the relay dropped at the edge.
 pub fn edge_dropped(s: &RelayStats) -> u64 {
-    s.short + s.bad_token + s.join_rate + s.bad_cookie + s.oversize
+    s.short + s.bad_seal + s.expired + s.bad_token + s.join_rate + s.bad_cookie + s.oversize
 }
 
 /// Relay counters now, or zeros without a relay.
@@ -831,6 +886,7 @@ fn udp_challenges(
     net: &mut NetServer,
     edge: Option<&[bool]>,
     socks: &[Vec<UdpSocket>],
+    keys: &[Option<ClientKeys>],
     owner: &HashMap<SocketAddr, (usize, u16)>,
     sent: &[(usize, usize, u16, Vec<u8>)],
     server: SocketAddr,
@@ -846,7 +902,7 @@ fn udp_challenges(
             if i != slot || !via_relay[*i] || with_cookie(d, 0).is_none() {
                 continue;
             }
-            let cookie = read_challenge(&socks[*slot][*k as usize], server)?;
+            let cookie = read_challenge(&socks[*slot][*k as usize], server, keys[*slot].as_ref())?;
             retry.extend(with_cookie(d, cookie).map(|r| (*slot, *k, r)));
         }
         return Ok(retry);
@@ -869,12 +925,14 @@ fn answer_udp(
     net: &mut NetServer,
     relay: Option<&Relay>,
     socks: &[Vec<UdpSocket>],
+    keys: &[Option<ClientKeys>],
     to: SocketAddr,
     retry: Vec<(usize, u16, Vec<u8>)>,
 ) -> io::Result<()> {
     let before = relay_stats(relay);
     for (i, k, d) in &retry {
-        socks[*i][*k as usize].send_to(d, to)?;
+        let wire = keys[*i].as_ref().map_or_else(|| d.clone(), |keys| seal_up(keys, d));
+        socks[*i][*k as usize].send_to(&wire, to)?;
     }
     deliver(net, relay, before, retry.len(), 0)?;
     net.take_replies();
@@ -884,22 +942,29 @@ fn answer_udp(
 /// One datagram off `sock`, which must have come from `server` — the only
 /// server address a bot knows. Behind a relay, a datagram from anywhere else
 /// would mean the origin's address reached a client.
-fn recv_from_server(sock: &UdpSocket, server: SocketAddr, buf: &mut [u8]) -> io::Result<usize> {
-    let (n, from) = sock.recv_from(buf)?;
+///
+/// With `keys` (behind a relay) the datagram must also open under them: a
+/// bot's own traffic always comes sealed for its own session.
+fn recv_from_server(sock: &UdpSocket, server: SocketAddr, keys: Option<&ClientKeys>) -> io::Result<Vec<u8>> {
+    let mut buf = [0u8; MAX_DATAGRAM + EDGE_DOWN_MAX];
+    let (n, from) = sock.recv_from(&mut buf)?;
     if from != server {
         let msg = format!("a bot heard from {from}, not the server address it was given ({server})");
         return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
     }
-    Ok(n)
+    match keys {
+        None => Ok(buf[..n].to_vec()),
+        Some(k) => open_down(k, &mut buf[..n]).map(<[u8]>::to_vec).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("a bot could not open what the relay sent it: {e:?}"))
+        }),
+    }
 }
 
 /// Read from `sock` until a challenge arrives, skipping whatever was queued
 /// before it; its cookie.
-fn read_challenge(sock: &UdpSocket, server: SocketAddr) -> io::Result<u64> {
-    let mut buf = [0u8; MAX_DATAGRAM];
+fn read_challenge(sock: &UdpSocket, server: SocketAddr, keys: Option<&ClientKeys>) -> io::Result<u64> {
     loop {
-        let n = recv_from_server(sock, server, &mut buf)?;
-        if let Ok(ServerMsg::Challenge { cookie }) = decode::<ServerMsg>(&buf[..n]) {
+        if let Ok(ServerMsg::Challenge { cookie }) = decode::<ServerMsg>(&recv_from_server(sock, server, keys)?) {
             return Ok(cookie);
         }
     }
@@ -907,11 +972,10 @@ fn read_challenge(sock: &UdpSocket, server: SocketAddr) -> io::Result<u64> {
 
 /// Read from `sock` until `want` arrives, skipping whatever was queued
 /// before it (snapshots and Joined replies nobody reads on that port).
+/// Direct runs only: nothing here is sealed.
 fn wait_for(sock: &UdpSocket, server: SocketAddr, want: &ServerMsg) -> io::Result<()> {
-    let mut buf = [0u8; MAX_DATAGRAM];
     loop {
-        let n = recv_from_server(sock, server, &mut buf)?;
-        if decode::<ServerMsg>(&buf[..n]).ok().as_ref() == Some(want) {
+        if decode::<ServerMsg>(&recv_from_server(sock, server, None)?).ok().as_ref() == Some(want) {
             return Ok(());
         }
     }
@@ -937,15 +1001,19 @@ fn drain_extra_ports(socks: &[Vec<UdpSocket>]) -> io::Result<()> {
     Ok(())
 }
 
-/// Bytes waiting on a non-blocking socket, read and counted (after `settle`,
-/// for anything still in flight).
-fn drain_bytes(sock: &UdpSocket, settle: Duration) -> io::Result<u64> {
+/// Message bytes waiting on a non-blocking socket, read and counted (after
+/// `settle`, for anything still in flight): each datagram's length less
+/// `seal`, the bytes of seal around each message. Counted as messages so a
+/// relayed run compares with an in-process one; the seal adds less to what
+/// a bystander receives than it adds to what was sent in its name
+/// (`EDGE_DOWN_MAX` < `EDGE_UP_MAX`), so on the wire it amplifies less.
+fn drain_bytes(sock: &UdpSocket, settle: Duration, seal: u64) -> io::Result<u64> {
     std::thread::sleep(settle);
-    let mut buf = [0u8; MAX_DATAGRAM];
+    let mut buf = [0u8; MAX_DATAGRAM + EDGE_DOWN_MAX];
     let mut total = 0;
     loop {
         match sock.recv(&mut buf) {
-            Ok(n) => total += n as u64,
+            Ok(n) => total += (n as u64).saturating_sub(seal),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(total),
             Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
             Err(e) => return Err(e),
@@ -957,13 +1025,12 @@ fn drain_bytes(sock: &UdpSocket, settle: Duration) -> io::Result<u64> {
 fn read_snapshot(
     sock: &UdpSocket,
     server: SocketAddr,
+    keys: Option<&ClientKeys>,
     tick: u32,
     session: &mut Option<Session>,
 ) -> io::Result<Vec<PlayerState>> {
-    let mut buf = [0u8; MAX_DATAGRAM];
     loop {
-        let n = recv_from_server(sock, server, &mut buf)?;
-        match decode::<ServerMsg>(&buf[..n]) {
+        match decode::<ServerMsg>(&recv_from_server(sock, server, keys)?) {
             Ok(ServerMsg::Joined { player_id, token, .. }) => *session = Some(Session { player_id, token }),
             Ok(ServerMsg::Snapshot { tick: t, players }) if t == tick => return Ok(players),
             other => {
@@ -977,7 +1044,7 @@ fn read_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aegis_client_sdk::{burst, flood, garbage, spoof, zeroflood};
+    use aegis_client_sdk::{burst, flood, garbage, sniff, spoof, zeroflood};
     use aegis_detector::detectors::{accuracy, aim_exact, anomaly_rate};
     use aegis_detector::monitor::WINDOW;
     use aegis_detector::{FlagReason, Suite};
@@ -1419,6 +1486,34 @@ mod tests {
             assert_eq!(u.alerts, m.alerts, "{} alerts differ", u.name);
         }
         assert!(mem.bots.iter().any(|b| !b.alerts.is_empty()), "no alerts: the comparison proves nothing");
+    }
+
+    /// The before/after of sealing the client's leg (protocol v3). Without a
+    /// relay, an on-path attacker reads the honest player's token and seq off
+    /// the wire and takes its player: from the tick after it first overhears,
+    /// its forgery reaches the server first and is accepted under the
+    /// victim's id, and the victim's own input that tick is refused — the
+    /// player walks where the sniffer says and never fires. Behind a relay it
+    /// reads the sid and noise: every forgery dies at the edge as
+    /// `bad_token`, and the victim plays the whole match untouched.
+    #[test]
+    fn an_on_path_attacker_takes_a_player_only_on_a_plain_leg() {
+        let ticks = Scenario::sniff_probe().ticks;
+        let forged = ticks - 1;
+        for (transport, open) in
+            [("in-process", run(Scenario::sniff_probe())), ("udp", run_udp(Scenario::sniff_probe()).unwrap())]
+        {
+            let v = open.bot(sniff::VICTIM);
+            assert_eq!(v.totals.accepted, ticks, "{transport}: {:?}", v.totals); // its first + every forgery
+            assert_eq!(v.totals.total_rejected(), forged, "{transport}: the victim kept its player: {:?}", v.totals);
+            assert_eq!(v.shots, 0, "{transport}: the victim fired, so it was still playing");
+        }
+        let sealed = run_relay(Scenario::sniff_probe()).unwrap();
+        let v = sealed.bot(sniff::VICTIM);
+        assert_eq!((v.totals.accepted, v.totals.total_rejected()), (ticks, 0), "{:?}", v.totals);
+        assert!(v.shots > 0, "the victim never fired behind the relay");
+        let edge = sealed.relay.expect("a relay run reports its relay");
+        assert_eq!((edge.bad_token, edge.bad_seal), (u64::from(forged), 0), "{edge:?}");
     }
 
     /// The before/after of hiding the origin. Without a relay, a client

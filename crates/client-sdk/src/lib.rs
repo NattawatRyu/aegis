@@ -25,6 +25,7 @@ pub mod nan;
 pub mod reflect;
 pub mod replay;
 pub mod rusher;
+pub mod sniff;
 pub mod speedhack;
 pub mod spoof;
 pub mod zeroflood;
@@ -86,6 +87,18 @@ pub trait Bot {
     fn routed(&mut self, ctx: &BotCtx) -> Vec<(u16, Vec<u8>)> {
         self.datagrams(ctx).into_iter().map(|d| (0, d)).collect()
     }
+
+    /// The bot (by name) whose datagrams this bot sees as they cross the
+    /// wire — an on-path observer: the same Wi-Fi, a router on the way.
+    /// `None`, the default, sees only its own.
+    fn taps(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// One datagram the tapped bot put on the wire last tick, byte for byte
+    /// as it crossed — sealed, if it went through a relay. Called before this
+    /// bot acts, so it can act on what it heard ahead of the bot it heard.
+    fn overheard(&mut self, _wire: &[u8]) {}
 }
 
 /// This bot's own position from the last snapshot, if present.

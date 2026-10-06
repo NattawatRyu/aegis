@@ -18,6 +18,10 @@
 //! enemy — the measurement `MAX_MARGIN_TICKS` is set from.
 //! `aegis-harness cull-scale [lobbies]` asks what that leak would be in a
 //! world where players move less per tick.
+//!
+//! `aegis-harness scale [crowds]` times the server's share of every tick in
+//! honest crowds of 16 to 253 players — how big one room can be inside the
+//! 30 Hz budget, and how many rooms one core holds. Run it `--release`.
 
 use std::path::PathBuf;
 
@@ -36,6 +40,10 @@ fn main() -> std::io::Result<()> {
         let lobbies = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(50);
         let max_lag = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(6);
         cull(lobbies, max_lag);
+        return Ok(());
+    }
+    if args.get(1).map(String::as_str) == Some("scale") {
+        scale(args.get(2).and_then(|s| s.parse().ok()).unwrap_or(3));
         return Ok(());
     }
     if args.get(1).map(String::as_str) == Some("cull-scale") {
@@ -150,6 +158,40 @@ fn cull_scale(lobbies: u32) {
         row.iter().for_each(|&n| print!(" {:>6.2}", 100.0 * n as f64 / walled.max(1) as f64));
         println!();
     }
+}
+
+fn scale(crowds: u32) {
+    const SIZES: [u32; 5] = [16, 32, 64, 128, aegis_harness::MAX_BOTS];
+    let budget = aegis_server::net::TICK.as_secs_f64() * 1e6;
+    if cfg!(debug_assertions) {
+        println!("WARNING: debug build - timings are meaningless, run with --release\n");
+    }
+    println!("honest crowds: {crowds} per size, 300 ticks each; server time per tick, bots excluded");
+    println!("budget: {budget:.0} us per tick (30 Hz)\n");
+    println!(
+        "{:>7} {:>6} {:>9} {:>9} {:>9} {:>7} {:>8} {:>10} {:>9}",
+        "players", "joined", "p50 us", "p99 us", "max us", "views%", "budget%", "rooms/core", "rec/tick"
+    );
+    for r in aegis_harness::scale(&SIZES, crowds) {
+        let us = |d: std::time::Duration| d.as_secs_f64() * 1e6;
+        let (p50, p99, max) = (r.at(0.5), r.at(0.99), r.at(1.0));
+        let views: f64 = r.ticks.iter().map(|t| us(t.views)).sum();
+        let all: f64 = r.ticks.iter().map(|t| us(t.total())).sum();
+        println!(
+            "{:>7} {:>6} {:>9.1} {:>9.1} {:>9.1} {:>6.0}% {:>7.1}% {:>10.0} {:>9.1}",
+            r.players,
+            r.joined,
+            us(p50.total()),
+            us(p99.total()),
+            us(max.total()),
+            100.0 * views / all.max(1e-9),
+            100.0 * us(p99.total()) / budget,
+            budget / us(p99.total()).max(1e-9),
+            r.records_per_tick
+        );
+    }
+    println!("\nviews% = share of all server time spent building culled snapshots");
+    println!("rooms/core = budget / p99 tick: rooms one core runs at 30 Hz, if nothing else ran on it");
 }
 
 fn sweep(crowds: u32) {

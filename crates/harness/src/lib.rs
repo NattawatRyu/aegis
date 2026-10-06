@@ -148,12 +148,18 @@ impl Scenario {
     /// scenario. Nobody here cheats, so any flag raised in it is a false
     /// positive.
     pub fn honest_crowd(seed: u32) -> Self {
+        Self::honest_crowd_of(seed, CROWD_SIZE)
+    }
+
+    /// [`Scenario::honest_crowd`] with `size` players — what [`scale`]
+    /// measures the server's cost per tick on. At most [`MAX_BOTS`].
+    pub fn honest_crowd_of(seed: u32, size: u32) -> Self {
         Self {
             name: "honest_crowd",
             ticks: 300,
-            bots: (0..CROWD_SIZE)
+            bots: (0..size)
                 .map(|k| {
-                    let s = seed.wrapping_mul(CROWD_SIZE).wrapping_add(k + 1);
+                    let s = seed.wrapping_mul(size).wrapping_add(k + 1);
                     match k % 4 {
                         0 => Box::new(HonestBot::with_seed(s)) as Box<dyn Bot>,
                         2 => Box::new(CamperBot::with_seed(s)),
@@ -241,6 +247,25 @@ pub struct Report {
     /// The whole world at the start of every tick (index tick - 1) — what
     /// [`cull_sweep`] replays. Kept by the in-process run only.
     pub frames: Vec<Vec<PlayerState>>,
+    /// What each tick cost the server (index tick - 1). In-process run only.
+    pub cost: Vec<TickCost>,
+}
+
+/// Wall time one tick spent in the server, split by phase. Bots, and the
+/// lab's own bookkeeping, are not in it: a live server does not run them.
+/// Only meaningful from a `--release` build.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TickCost {
+    /// Building every admitted player's culled snapshot view.
+    pub views: Duration,
+    /// Everything else: `begin_tick`, every `receive`, `end_tick`.
+    pub server: Duration,
+}
+
+impl TickCost {
+    pub fn total(&self) -> Duration {
+        self.views + self.server
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -349,6 +374,52 @@ pub fn honest_sweep(crowds: u32) -> Vec<HonestPlayer> {
                     life,
                 })
                 .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Most bots one scenario can hold: every bot and the bystander take an IP
+/// 127.0.0.(i + 2) (see [`bot_ip`]), so 253 bots + the bystander fill it.
+/// Also just under the protocol's limit: `PlayerId` is a `u8`.
+pub const MAX_BOTS: u32 = 253;
+
+/// What one room cost the server per tick, at one head count.
+#[derive(Debug)]
+pub struct ScaleRow {
+    pub players: u32,
+    /// Players the server admitted (all of them, or the run is wrong).
+    pub joined: u32,
+    /// Sorted ascending, one per tick of every crowd run at this size.
+    pub ticks: Vec<TickCost>,
+    /// Telemetry records the server wrote, per tick, averaged.
+    pub records_per_tick: f64,
+}
+
+impl ScaleRow {
+    /// The tick at quantile `q` in 0..=1, by total cost.
+    pub fn at(&self, q: f64) -> TickCost {
+        self.ticks[((self.ticks.len() - 1) as f64 * q).round() as usize]
+    }
+}
+
+/// Run `crowds` honest crowds at each size and time the server's share of
+/// every tick. The question it answers: how many players one room holds
+/// inside the 30 Hz budget, and how many rooms one core holds.
+pub fn scale(sizes: &[u32], crowds: u32) -> Vec<ScaleRow> {
+    sizes
+        .iter()
+        .map(|&n| {
+            assert!(n <= MAX_BOTS, "{n} players: at most {MAX_BOTS}");
+            let (mut ticks, mut records, mut joined) = (Vec::new(), 0usize, 0);
+            for seed in 0..crowds {
+                let r = run(Scenario::honest_crowd_of(seed, n));
+                joined = r.bots.iter().filter(|b| b.joined()).count() as u32;
+                records += r.telemetry.len();
+                ticks.extend(r.cost);
+            }
+            let total = ticks.len().max(1) as f64;
+            ticks.sort_by_key(TickCost::total);
+            ScaleRow { players: n, joined, ticks, records_per_tick: records as f64 / total }
         })
         .collect()
 }
@@ -553,6 +624,7 @@ impl Lab {
             bystander: self.bystander,
             relay: None,
             frames: Vec::new(),
+            cost: Vec::new(),
         }
     }
 }
@@ -582,14 +654,20 @@ pub fn run(mut sc: Scenario) -> Report {
     let mut frames = Vec::with_capacity(sc.ticks as usize);
     // What each bot put on the wire, for whoever taps it.
     let mut wire: Vec<Vec<Vec<u8>>> = vec![Vec::new(); n];
+    let mut cost = Vec::with_capacity(sc.ticks as usize);
     for tick in 1..=sc.ticks {
+        let mut c = TickCost::default();
+        let t = Instant::now();
         server.begin_tick(tick);
+        c.server += t.elapsed();
         frames.push(server.sim().snapshot());
         // Each admitted address is sent its player's view, all taken before
         // any input this tick (as the UDP run sends them all first).
+        let t = Instant::now();
         let views: Vec<Vec<PlayerState>> = (0..n)
             .map(|i| server.player_id(mem_addr(i, 0)).map(|p| server.sim().view(p)).unwrap_or_default())
             .collect();
+        c.views = t.elapsed();
         if let Some(p) = server.player_id(bystander) {
             lab.bystander.rx += encode(&ServerMsg::Snapshot { tick, players: server.sim().view(p) }).len() as u64;
         }
@@ -613,7 +691,9 @@ pub fn run(mut sc: Scenario) -> Report {
                 if from == bystander {
                     lab.bystander.tx += d.len() as u64;
                 }
+                let t = Instant::now();
                 let reply = server.receive(tick, from, &d);
+                c.server += t.elapsed();
                 if let (Some(r), true) = (reply, from == bystander) {
                     lab.bystander.rx += encode(&r.to_msg(tick)).len() as u64;
                 }
@@ -624,12 +704,16 @@ pub fn run(mut sc: Scenario) -> Report {
                 }
             }
         }
+        let t = Instant::now();
         answer_challenges(&mut server, &mut lab, tick, retry);
-        lab.measure(server.end_tick(tick));
+        let out = server.end_tick(tick);
+        c.server += t.elapsed();
+        cost.push(c);
+        lab.measure(out);
     }
 
     let (tel, net) = server.into_parts();
-    Report { frames, ..lab.report(&sc, tel, net) }
+    Report { frames, cost, ..lab.report(&sc, tel, net) }
 }
 
 /// Run a scenario over real UDP on loopback: a [`NetServer`] and one socket
@@ -1055,6 +1139,17 @@ mod tests {
 
     fn standard() -> Report {
         run(Scenario::standard())
+    }
+
+    /// The scale measurement is only a measurement if the room it times is
+    /// really full: at the largest size every bot must be admitted and play
+    /// every tick.
+    #[test]
+    fn scale_fills_the_room_at_max_bots() {
+        let [row] = scale(&[MAX_BOTS], 1).try_into().expect("one size");
+        assert_eq!((row.players, row.joined), (MAX_BOTS, MAX_BOTS));
+        assert_eq!(row.ticks.len(), 300);
+        assert!(row.records_per_tick >= MAX_BOTS as f64, "every player sends an input a tick");
     }
 
     fn rejected(b: &BotReport, reason: &str) -> u32 {

@@ -2,9 +2,10 @@
 //!
 //! It reads every datagram the victim sends ([`Bot::taps`]) and forges its
 //! own from the victim's address ([`Bot::impersonates`]). From the victim's
-//! last input it takes the session token and the seq; each tick it gets an
-//! input under that token, with a seq far ahead, to the server before the
-//! victim's. Accepted, it moves the victim's player where the sniffer says,
+//! last input it takes the session token, the seq, and the snapshot tick and
+//! proof it was stamped with (a proof read off the wire is as good as one
+//! received); each tick it gets an input under that token, with a seq far
+//! ahead, to the server before the victim's. Accepted, it moves the victim's player where the sniffer says,
 //! and the victim's own input that tick is refused (one input per player per
 //! tick). The victim is locked out of its own player.
 //!
@@ -30,8 +31,8 @@ pub const AHEAD: u32 = 1_000_000;
 
 pub struct SniffBot {
     /// What it read off the victim's last datagram: the first 8 bytes as a
-    /// token, and the seq if the rest decoded as an input.
-    heard: Option<(u64, u32)>,
+    /// token, and the seq, tick and proof if the rest decoded as an input.
+    heard: Option<(u64, u32, u32, u32)>,
 }
 
 impl SniffBot {
@@ -63,16 +64,17 @@ impl Bot for SniffBot {
     /// id and the body decodes as nothing: it tries anyway.
     fn overheard(&mut self, wire: &[u8]) {
         self.heard = split_frame(wire).map(|(token, body)| match decode::<ClientMsg>(body) {
-            Ok(ClientMsg::Input { seq, .. }) => (token, seq),
-            _ => (token, 0),
+            Ok(ClientMsg::Input { seq, tick, proof, .. }) => (token, seq, tick, proof),
+            _ => (token, 0, 0, 0),
         });
     }
 
-    fn act(&mut self, ctx: &BotCtx) -> Vec<ClientMsg> {
+    fn act(&mut self, _ctx: &BotCtx) -> Vec<ClientMsg> {
         match self.heard {
-            Some((_, seq)) => vec![ClientMsg::Input {
+            Some((_, seq, tick, proof)) => vec![ClientMsg::Input {
                 seq: seq.saturating_add(AHEAD),
-                tick: ctx.tick,
+                tick,
+                proof,
                 move_dir: Vec2::new(0.0, -1.0), // walk the victim where it chooses
                 aim: Vec2::new(1.0, 0.0),
                 shoot: false,
@@ -83,7 +85,7 @@ impl Bot for SniffBot {
 
     /// Framed under the token it overheard, not its own.
     fn datagrams(&mut self, ctx: &BotCtx) -> Vec<Vec<u8>> {
-        let token = self.heard.map(|(t, _)| t);
+        let token = self.heard.map(|(t, ..)| t);
         self.act(ctx).iter().filter_map(|m| token.map(|t| frame(t, m))).collect()
     }
 }
@@ -93,7 +95,7 @@ mod tests {
     use super::*;
 
     fn ctx() -> BotCtx<'static> {
-        BotCtx { tick: 9, my_id: 2, token: 0xAAAA, snapshot: &[] }
+        BotCtx { tick: 9, my_id: 2, token: 0xAAAA, proof: 0, snapshot: &[] }
     }
 
     /// Reading a plain input, it speaks under the victim's token, far ahead
@@ -102,7 +104,8 @@ mod tests {
     fn a_plain_input_gives_it_the_token_and_the_seq() {
         let mut b = SniffBot::new();
         assert!(b.datagrams(&ctx()).is_empty(), "nothing heard, nothing to say");
-        let victim = ClientMsg::Input { seq: 41, tick: 9, move_dir: Vec2::ZERO, aim: Vec2::ZERO, shoot: true };
+        let victim =
+            ClientMsg::Input { seq: 41, tick: 9, proof: 5, move_dir: Vec2::ZERO, aim: Vec2::ZERO, shoot: true };
         b.overheard(&frame(0x7070_7070, &victim));
         let out = b.datagrams(&ctx());
         assert_eq!(out.len(), 1);

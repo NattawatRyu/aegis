@@ -61,7 +61,7 @@ mod tests {
     }
 
     fn input(b: &mut impl Bot, tick: u32, snap: &[PlayerState]) -> (Vec2, Vec2, bool) {
-        match b.act(&BotCtx { tick, my_id: 1, token: 0, snapshot: snap })[0] {
+        match b.act(&BotCtx { tick, my_id: 1, token: 0, proof: 0, snapshot: snap })[0] {
             ClientMsg::Input { move_dir, aim, shoot, .. } => (move_dir, aim, shoot),
             _ => panic!("expected Input"),
         }

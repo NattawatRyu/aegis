@@ -34,6 +34,7 @@ impl Bot for SpeedhackBot {
         vec![ClientMsg::Input {
             seq: self.seq,
             tick: ctx.tick,
+            proof: ctx.proof,
             move_dir: Vec2::new(self.mult, 0.0),
             aim: Vec2::new(1.0, 0.0),
             shoot: false,
@@ -48,7 +49,7 @@ mod tests {
     #[test]
     fn emits_oversized_move_vector() {
         let mut b = SpeedhackBot::new();
-        let out = b.act(&BotCtx { tick: 1, my_id: 1, token: 0, snapshot: &[] });
+        let out = b.act(&BotCtx { tick: 1, my_id: 1, token: 0, proof: 0, snapshot: &[] });
         if let ClientMsg::Input { move_dir, .. } = out[0] {
             assert!(move_dir.len() > 1.0);
         } else {

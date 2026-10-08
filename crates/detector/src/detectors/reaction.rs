@@ -11,11 +11,26 @@
 //! timed shot is a player at rest who saw an enemy and pulled the trigger,
 //! and how long that took is bounded below by the human body, not by skill.
 //!
-//! Latency never makes a player look faster: the server counts from the tick
-//! the snapshot went out to the tick the shot arrived, so the round trip is
-//! added to every reaction. An honest player on a bad link looks slower; a
-//! cheater on one may look human — the known blind spot, together with a
-//! cheater who sprays without pause (all prefire, nothing timed).
+//! Latency is out of it (C6.7, 2026-10-09). Every shot is judged in the
+//! picture the client's input proves it chose on (`server::history`): which
+//! enemy, how far off, and how long since that enemy appeared, all in that
+//! snapshot's ticks. Measured with `aegis-harness lag` at round trips 0..=6
+//! ticks (0–200 ms): instant bots read 0 on every timed engagement and
+//! honest players never under 6; 1008 honest players at 3 and at 6 flagged
+//! 0 times. (Before, a lagged shot was scored against the server's world
+//! *now*: honest walkers read instant — 14 of 24 flagged at 6 — and once
+//! time was corrected without the target, instant bots went untimed.)
+//!
+//! Known gaps:
+//!   - a client that claims a picture a few ticks older than it has (real,
+//!     proven, inside the history) turns instant shots into prefire and
+//!     escapes — pinned by `StaleLiar` in the harness; its tell is aim and
+//!     hits that fit a newer picture than the claimed one;
+//!   - on a lossy link a lost snapshot breaks a run of fire, so a run can
+//!     read as two (not measured: the lab does not drop);
+//!   - a cheater who sprays without pause (all prefire, nothing timed);
+//!   - fewer than MIN_TIMED timed engagements in a match: at round trips
+//!     2–4, 3–5 of 8 triggerbots stay unjudged in 900 ticks.
 
 use crate::{Detector, Flag, FlagReason, PlayerStats};
 

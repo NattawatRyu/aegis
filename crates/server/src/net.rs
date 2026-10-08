@@ -278,7 +278,11 @@ impl NetServer {
         let server = &self.server;
         self.sids.retain(|a, _| server.player_id(*a).is_some());
         for (to, id) in self.server.peers() {
-            let snap = encode(&ServerMsg::Snapshot { tick: self.tick, players: self.server.view(id) });
+            let snap = encode(&ServerMsg::Snapshot {
+                tick: self.tick,
+                proof: self.server.tick_proof(id, self.tick),
+                players: self.server.view(id),
+            });
             self.send(to, self.sids.get(&to), &snap);
         }
         Ok(())
@@ -396,11 +400,12 @@ mod tests {
         joined(c)
     }
 
-    fn input(token: u64, seq: u32) -> Vec<u8> {
-        frame(
-            token,
-            &ClientMsg::Input { seq, tick: seq, move_dir: Vec2::new(1.0, 0.0), aim: Vec2::new(1.0, 0.0), shoot: false },
-        )
+    /// An input from player 1 (the first and only one these tests admit),
+    /// claiming snapshot `seq` with its proof.
+    fn input(n: &NetServer, token: u64, seq: u32) -> Vec<u8> {
+        let proof = n.server().tick_proof(1, seq);
+        let (move_dir, aim) = (Vec2::new(1.0, 0.0), Vec2::new(1.0, 0.0));
+        frame(token, &ClientMsg::Input { seq, tick: seq, proof, move_dir, aim, shoot: false })
     }
 
     fn read(c: &UdpSocket) -> ServerMsg {
@@ -427,7 +432,7 @@ mod tests {
 
         n.begin_tick().unwrap();
         match read(&c) {
-            ServerMsg::Snapshot { tick: 1, players } => assert_eq!(players.len(), 1),
+            ServerMsg::Snapshot { tick: 1, players, .. } => assert_eq!(players.len(), 1),
             m => panic!("expected the tick-1 snapshot, got {m:?}"),
         }
     }
@@ -547,13 +552,13 @@ mod tests {
         let ServerMsg::Joined { token, .. } = msg else { panic!("expected Joined, got {msg:?}") };
 
         relay.send_to(&up_as(me, &forger, &join_with(Some(1))), to).unwrap();
-        relay.send_to(&up_as(me, &forger, &input(token, 1)), to).unwrap();
+        relay.send_to(&up_as(me, &forger, &input(&n, token, 1)), to).unwrap();
         assert!(n.recv_one(WAIT).unwrap() && n.recv_one(WAIT).unwrap());
         assert_eq!(n.server().net_stats().get(SID_MISMATCH), 2);
         let mut buf = [0u8; MAX_DATAGRAM + ENVELOPE_MAX];
         assert!(relay.recv(&mut buf).is_err(), "a forged re-Join was answered");
 
-        relay.send_to(&up(me, &input(token, 1)), to).unwrap();
+        relay.send_to(&up(me, &input(&n, token, 1)), to).unwrap();
         assert!(n.recv_one(WAIT).unwrap());
         n.begin_tick().unwrap();
         assert!(
@@ -627,8 +632,8 @@ mod tests {
         let to = n.local_addr().unwrap();
         let c = client();
         let (_, token) = connect(&mut n, &c);
-        c.send_to(&input(NO_TOKEN, 1), to).unwrap(); // forged-looking: no token
-        c.send_to(&input(token, 1), to).unwrap(); // both queued when tick 1 opens
+        c.send_to(&input(&n, NO_TOKEN, 1), to).unwrap(); // forged-looking: no token
+        c.send_to(&input(&n, token, 1), to).unwrap(); // both queued when tick 1 opens
 
         let t = Instant::now();
         let out = n.run_tick().unwrap();

@@ -41,6 +41,7 @@ impl Bot for FloodBot {
             out.push(ClientMsg::Input {
                 seq: self.seq,
                 tick: ctx.tick,
+                proof: ctx.proof,
                 move_dir: Vec2::new(1.0, 0.0),
                 aim: Vec2::new(1.0, 0.0),
                 shoot: false,
@@ -57,7 +58,7 @@ mod tests {
     #[test]
     fn emits_many_inputs_same_tick() {
         let mut b = FloodBot::new(50);
-        let out = b.act(&BotCtx { tick: 7, my_id: 1, token: 0, snapshot: &[] });
+        let out = b.act(&BotCtx { tick: 7, my_id: 1, token: 0, proof: 0, snapshot: &[] });
         assert_eq!(out.len(), 50);
         for m in &out {
             match m {

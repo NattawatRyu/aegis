@@ -12,6 +12,7 @@
 
 pub mod cull;
 pub mod guards;
+pub mod history;
 pub mod net;
 pub mod reaction;
 pub mod server;

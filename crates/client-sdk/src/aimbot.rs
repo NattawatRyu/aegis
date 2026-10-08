@@ -48,6 +48,7 @@ impl Bot for AimbotBot {
         vec![ClientMsg::Input {
             seq: self.seq,
             tick: ctx.tick,
+            proof: ctx.proof,
             move_dir: Vec2::ZERO, // stand still, just snap-aim
             aim,
             shoot,
@@ -68,7 +69,7 @@ mod tests {
     fn aims_perfectly_at_nearest_enemy() {
         let mut b = AimbotBot::new();
         let snap = [state(1, Vec2::ZERO), state(2, Vec2::new(10.0, 0.0)), state(3, Vec2::new(0.0, 40.0))];
-        let out = b.act(&BotCtx { tick: 1, my_id: 1, token: 0, snapshot: &snap });
+        let out = b.act(&BotCtx { tick: 1, my_id: 1, token: 0, proof: 0, snapshot: &snap });
         if let ClientMsg::Input { aim, shoot, .. } = out[0] {
             assert!(shoot);
             // nearest enemy is id 2 at (10,0); perfect aim is exactly (1,0)
@@ -83,8 +84,8 @@ mod tests {
     fn every_value_it_sends_is_guard_legal() {
         let mut b = AimbotBot::new();
         let snap = [state(1, Vec2::ZERO), state(2, Vec2::new(5.0, 5.0))];
-        let s1 = b.act(&BotCtx { tick: 1, my_id: 1, token: 0, snapshot: &snap });
-        let s2 = b.act(&BotCtx { tick: 2, my_id: 1, token: 0, snapshot: &snap });
+        let s1 = b.act(&BotCtx { tick: 1, my_id: 1, token: 0, proof: 0, snapshot: &snap });
+        let s2 = b.act(&BotCtx { tick: 2, my_id: 1, token: 0, proof: 0, snapshot: &snap });
         for (v, prev, cur) in [(&s1, 0u32, 1u32), (&s2, 1, 2)] {
             assert_eq!(v.len(), 1); // one input per tick -> rate guard clean
             if let ClientMsg::Input { seq, move_dir, aim, .. } = v[0] {

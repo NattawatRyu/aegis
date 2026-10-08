@@ -34,6 +34,7 @@ impl Bot for ReplayBot {
         vec![ClientMsg::Input {
             seq: self.fixed_seq,
             tick: ctx.tick,
+            proof: ctx.proof,
             move_dir: Vec2::new(1.0, 0.0),
             aim: Vec2::new(1.0, 0.0),
             shoot: false,
@@ -48,8 +49,8 @@ mod tests {
     #[test]
     fn repeats_the_same_seq() {
         let mut b = ReplayBot::new();
-        let a = b.act(&BotCtx { tick: 1, my_id: 1, token: 0, snapshot: &[] });
-        let c = b.act(&BotCtx { tick: 2, my_id: 1, token: 0, snapshot: &[] });
+        let a = b.act(&BotCtx { tick: 1, my_id: 1, token: 0, proof: 0, snapshot: &[] });
+        let c = b.act(&BotCtx { tick: 2, my_id: 1, token: 0, proof: 0, snapshot: &[] });
         let sa = match a[0] {
             ClientMsg::Input { seq, .. } => seq,
             _ => panic!(),

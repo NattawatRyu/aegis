@@ -58,7 +58,7 @@ mod tests {
     #[test]
     fn every_datagram_is_token_zero_junk() {
         let mut b = ZeroFloodBot::new();
-        let out = b.datagrams(&BotCtx { tick: 1, my_id: 1, token: 77, snapshot: &[] });
+        let out = b.datagrams(&BotCtx { tick: 1, my_id: 1, token: 77, proof: 0, snapshot: &[] });
         assert_eq!(out.len(), PER_TICK);
         for d in &out {
             let (token, body) = split_frame(d).expect("carries a token");

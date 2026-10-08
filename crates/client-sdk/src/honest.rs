@@ -127,7 +127,7 @@ impl Bot for HonestBot {
             }
             None => (self.walk, false),
         };
-        vec![ClientMsg::Input { seq: self.seq, tick: ctx.tick, move_dir: self.walk, aim, shoot }]
+        vec![ClientMsg::Input { seq: self.seq, tick: ctx.tick, proof: ctx.proof, move_dir: self.walk, aim, shoot }]
     }
 }
 
@@ -144,7 +144,7 @@ mod tests {
     fn no_enemy_walks_without_shooting() {
         let mut b = HonestBot::new();
         let snap = [state(1, Vec2::ZERO)];
-        let out = b.act(&BotCtx { tick: 1, my_id: 1, token: 0, snapshot: &snap });
+        let out = b.act(&BotCtx { tick: 1, my_id: 1, token: 0, proof: 0, snapshot: &snap });
         assert_eq!(out.len(), 1);
         if let ClientMsg::Input { shoot, move_dir, .. } = out[0] {
             assert!(!shoot);
@@ -161,7 +161,7 @@ mod tests {
         // bearing to (3,4) is (0.6, 0.8); every aim lands within the error
         // cone, and once the reaction delay has run out it fires every tick
         for tick in 1..=200 {
-            let out = b.act(&BotCtx { tick, my_id: 1, token: 0, snapshot: &snap });
+            let out = b.act(&BotCtx { tick, my_id: 1, token: 0, proof: 0, snapshot: &snap });
             if let ClientMsg::Input { shoot, aim, .. } = out[0] {
                 if tick < 1 + REACT_MIN {
                     assert!(!shoot, "tick {tick}: fired before reacting");
@@ -184,7 +184,7 @@ mod tests {
         let mut b = HonestBot::new();
         let snap = [state(1, Vec2::ZERO), state(2, Vec2::new(3.0, 4.0))];
         let exact = (1..=200)
-            .filter(|&tick| match b.act(&BotCtx { tick, my_id: 1, token: 0, snapshot: &snap })[0] {
+            .filter(|&tick| match b.act(&BotCtx { tick, my_id: 1, token: 0, proof: 0, snapshot: &snap })[0] {
                 ClientMsg::Input { aim, .. } => (aim.x - 0.6).abs() < 1e-6 && (aim.y - 0.8).abs() < 1e-6,
                 _ => panic!("expected Input"),
             })
@@ -197,7 +197,7 @@ mod tests {
         let mut b = HonestBot::with_seed(0);
         let snap = [state(1, Vec2::ZERO), state(2, Vec2::new(1.0, 0.0))];
         let exact = (1..=100)
-            .filter(|&tick| match b.act(&BotCtx { tick, my_id: 1, token: 0, snapshot: &snap })[0] {
+            .filter(|&tick| match b.act(&BotCtx { tick, my_id: 1, token: 0, proof: 0, snapshot: &snap })[0] {
                 ClientMsg::Input { aim, .. } => aim == Vec2::new(1.0, 0.0),
                 _ => panic!("expected Input"),
             })
@@ -208,11 +208,17 @@ mod tests {
     #[test]
     fn different_seeds_aim_differently() {
         let snap = [state(1, Vec2::ZERO), state(2, Vec2::new(1.0, 0.0))];
-        let aim =
-            |seed| match HonestBot::with_seed(seed).act(&BotCtx { tick: 1, my_id: 1, token: 0, snapshot: &snap })[0] {
-                ClientMsg::Input { aim, .. } => aim,
-                _ => panic!("expected Input"),
-            };
+        let aim = |seed| match HonestBot::with_seed(seed).act(&BotCtx {
+            tick: 1,
+            my_id: 1,
+            token: 0,
+            proof: 0,
+            snapshot: &snap,
+        })[0]
+        {
+            ClientMsg::Input { aim, .. } => aim,
+            _ => panic!("expected Input"),
+        };
         assert_ne!(aim(1), aim(2));
     }
 
@@ -230,19 +236,19 @@ mod tests {
         let mut b = HonestBot::new();
         let at = |x| [state(1, Vec2::new(x, 0.0))];
         assert_eq!(
-            walk_of(&b.act(&BotCtx { tick: 1, my_id: 1, token: 0, snapshot: &at(0.0) })[0]),
+            walk_of(&b.act(&BotCtx { tick: 1, my_id: 1, token: 0, proof: 0, snapshot: &at(0.0) })[0]),
             Vec2::new(1.0, 0.0)
         );
         assert_eq!(
-            walk_of(&b.act(&BotCtx { tick: 2, my_id: 1, token: 0, snapshot: &at(5.0) })[0]),
+            walk_of(&b.act(&BotCtx { tick: 2, my_id: 1, token: 0, proof: 0, snapshot: &at(5.0) })[0]),
             Vec2::new(1.0, 0.0)
         );
         assert_eq!(
-            walk_of(&b.act(&BotCtx { tick: 3, my_id: 1, token: 0, snapshot: &at(5.0) })[0]),
+            walk_of(&b.act(&BotCtx { tick: 3, my_id: 1, token: 0, proof: 0, snapshot: &at(5.0) })[0]),
             Vec2::new(-0.0, 1.0)
         );
         assert_eq!(
-            walk_of(&b.act(&BotCtx { tick: 4, my_id: 1, token: 0, snapshot: &at(5.0) })[0]),
+            walk_of(&b.act(&BotCtx { tick: 4, my_id: 1, token: 0, proof: 0, snapshot: &at(5.0) })[0]),
             Vec2::new(-1.0, -0.0)
         );
     }
@@ -251,13 +257,13 @@ mod tests {
     fn seq_increases_each_tick() {
         let mut b = HonestBot::new();
         let snap = [state(1, Vec2::ZERO)];
-        let s1 = seq_of(&b.act(&BotCtx { tick: 1, my_id: 1, token: 0, snapshot: &snap })[0]);
-        let s2 = seq_of(&b.act(&BotCtx { tick: 2, my_id: 1, token: 0, snapshot: &snap })[0]);
+        let s1 = seq_of(&b.act(&BotCtx { tick: 1, my_id: 1, token: 0, proof: 0, snapshot: &snap })[0]);
+        let s2 = seq_of(&b.act(&BotCtx { tick: 2, my_id: 1, token: 0, proof: 0, snapshot: &snap })[0]);
         assert!(s2 > s1);
     }
 
     fn shoots(b: &mut HonestBot, tick: u32, snap: &[PlayerState]) -> bool {
-        match b.act(&BotCtx { tick, my_id: 1, token: 0, snapshot: snap })[0] {
+        match b.act(&BotCtx { tick, my_id: 1, token: 0, proof: 0, snapshot: snap })[0] {
             ClientMsg::Input { shoot, .. } => shoot,
             _ => panic!("expected Input"),
         }
@@ -288,7 +294,7 @@ mod tests {
         let mut rng = 42;
         for tick in 1..=50 {
             let want = rotate(Vec2::new(1.0, 0.0), jitter(&mut rng) * AIM_ERROR_RAD);
-            match b.act(&BotCtx { tick, my_id: 1, token: 0, snapshot: &snap })[0] {
+            match b.act(&BotCtx { tick, my_id: 1, token: 0, proof: 0, snapshot: &snap })[0] {
                 ClientMsg::Input { aim, .. } => assert_eq!(aim, want, "tick {tick}"),
                 _ => panic!("expected Input"),
             }

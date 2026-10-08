@@ -60,6 +60,7 @@ impl Bot for SpoofBot {
                 ClientMsg::Input {
                     seq: self.seq,
                     tick: ctx.tick,
+                    proof: ctx.proof,
                     move_dir: Vec2::new(-1.0, 0.0),
                     aim: Vec2::new(-1.0, 0.0),
                     shoot: false,
@@ -76,7 +77,7 @@ mod tests {
     #[test]
     fn forges_a_burst_past_the_cap_with_seqs_ahead_of_any_client() {
         let mut b = SpoofBot::new();
-        let out = b.act(&BotCtx { tick: 1, my_id: 1, token: 0, snapshot: &[] });
+        let out = b.act(&BotCtx { tick: 1, my_id: 1, token: 0, proof: 0, snapshot: &[] });
         assert_eq!(out.len(), PER_TICK);
         assert!(matches!(out[0], ClientMsg::Input { seq, .. } if seq > SEQ_BASE));
         assert_eq!(b.impersonates(), Some(VICTIM));

@@ -5,7 +5,7 @@
 //! function, for guards that don't run per-input), and add one line to
 //! [`Pipeline::standard`]. Nothing else in the server needs to change.
 //!
-//! Seven guards run at their own stage rather than in the per-input pipeline,
+//! Nine guards run at their own stage rather than in the per-input pipeline,
 //! because they act on data the pipeline never sees:
 //!   - [`session`] — runs first, on the source address + token header.
 //!   - [`source_rate`] — then, per player or per source IP, before any decode.
@@ -15,6 +15,9 @@
 //!     the client receives at its source address.
 //!   - [`ip_sessions`] — runs at admission, on the joining IP's live sessions.
 //!   - [`joined`]  — runs before the pipeline, on the admitted source addresses.
+//!   - [`tick_proof`] — runs before the pipeline, on the snapshot tick an
+//!     input claims and that snapshot's proof.
+//!   - [`stale_tick`] — then, on how old that claimed tick is.
 //!
 //! Hit / movement authority is NOT a guard: the protocol gives a client no way
 //! to assert a position or a hit, so there is nothing to reject. That defense
@@ -32,6 +35,8 @@ pub mod replay;
 pub mod sanity;
 pub mod session;
 pub mod source_rate;
+pub mod stale_tick;
+pub mod tick_proof;
 pub mod version;
 
 /// Per-input context handed to every guard.
@@ -67,12 +72,14 @@ pub enum RejectReason {
     MalformedInput,
     RateExceeded,
     Replay,
+    BadTickProof,
+    StaleTick,
 }
 
 impl RejectReason {
     /// Every reason, for coverage checks ("does some bot trip each guard?").
     /// A new variant goes here too.
-    pub const ALL: [RejectReason; 10] = [
+    pub const ALL: [RejectReason; 12] = [
         RejectReason::BadCookie,
         RejectReason::IpSessions,
         RejectReason::BadToken,
@@ -83,6 +90,8 @@ impl RejectReason {
         RejectReason::MalformedInput,
         RejectReason::RateExceeded,
         RejectReason::Replay,
+        RejectReason::BadTickProof,
+        RejectReason::StaleTick,
     ];
 
     /// Stable string label for telemetry / detector features. Kept in sync with
@@ -99,6 +108,8 @@ impl RejectReason {
             RejectReason::MalformedInput => "malformed_input",
             RejectReason::RateExceeded => "rate_exceeded",
             RejectReason::Replay => "replay",
+            RejectReason::BadTickProof => "bad_tick_proof",
+            RejectReason::StaleTick => "stale_tick",
         }
     }
 }

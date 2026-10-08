@@ -44,6 +44,7 @@ impl Bot for GarbageBot {
         let real = encode(&ClientMsg::Input {
             seq: self.seq,
             tick: ctx.tick,
+            proof: ctx.proof,
             move_dir: Vec2::new(1.0, 0.0),
             aim: Vec2::new(1.0, 0.0),
             shoot: false,
@@ -72,7 +73,7 @@ mod tests {
     #[test]
     fn every_datagram_fails_to_decode() {
         let mut b = GarbageBot::new();
-        let out = b.datagrams(&BotCtx { tick: 1, my_id: 1, token: 77, snapshot: &[] });
+        let out = b.datagrams(&BotCtx { tick: 1, my_id: 1, token: 77, proof: 0, snapshot: &[] });
         assert_eq!(out.len(), SHAPES);
         for d in &out {
             let (token, body) = split_frame(d).expect("every shape carries the real token");

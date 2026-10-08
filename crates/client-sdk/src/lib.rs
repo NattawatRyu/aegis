@@ -28,6 +28,8 @@ pub mod rusher;
 pub mod sniff;
 pub mod speedhack;
 pub mod spoof;
+pub mod staleliar;
+pub mod tickliar;
 pub mod triggerbot;
 pub mod zeroflood;
 
@@ -35,7 +37,11 @@ pub mod zeroflood;
 /// client has. `snapshot` is the server's view for this player (pillar D
 /// culling): only players it can see, so ESP has nothing behind a wall to use.
 pub struct BotCtx<'a> {
+    /// The tick of the snapshot this bot is acting on.
     pub tick: u32,
+    /// That snapshot's `proof`, echoed in every `Input` stamped with `tick`
+    /// — the server's evidence the client really had that snapshot.
+    pub proof: u32,
     pub my_id: PlayerId,
     /// The session token from this bot's `Joined` (`NO_TOKEN` if it has none).
     pub token: u64,

@@ -8,10 +8,16 @@
 //! server as an origin behind a relay and writes `<scenario>.relay.jsonl` —
 //! also byte-identical.
 //!
-//! `aegis-harness sweep [crowds]` instead runs that many honest crowds (16 players) and
-//! prints how the honest population scores on every detector signal, over the
-//! whole run and at its online peak — the measurement the detector thresholds
-//! are set from.
+//! `aegis-harness sweep [crowds] [rtt]` instead runs that many honest crowds
+//! (16 players, every one at round trip `rtt` ticks, default 0) and prints
+//! how the honest population scores on every detector signal, over the whole
+//! run and at its online peak — the measurement the detector thresholds are
+//! set from.
+//!
+//! `aegis-harness lag [seeds] [max_rtt] [stale]` runs [`Scenario::lag_mix`] (or,
+//! with `stale`, [`Scenario::stale_mix`]) crowds at
+//! every round trip 0..=max_rtt and prints, per kind of player, how its
+//! timed reactions read and how often the reaction detector flagged it.
 //!
 //! `aegis-harness cull [lobbies] [max_lag]` replays honest lobbies and prints,
 //! per culling margin, what it leaks and how late a lagging client sees an
@@ -26,14 +32,20 @@
 use std::path::PathBuf;
 
 use aegis_harness::{
-    cull_sweep, edge_dropped, edge_seen, honest_sweep, leak_by_step, run, run_relay, run_udp, HonestPlayer, Scenario,
+    cull_sweep, edge_dropped, edge_seen, honest_sweep_at, leak_by_step, run, run_relay, run_udp, HonestPlayer, Scenario,
 };
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("sweep") {
         let crowds = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(63);
-        sweep(crowds);
+        sweep(crowds, args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0));
+        return Ok(());
+    }
+    if args.get(1).map(String::as_str) == Some("lag") {
+        let seeds = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8);
+        let stale = args.get(4).map(String::as_str) == Some("stale");
+        lag(seeds, args.get(3).and_then(|s| s.parse().ok()).unwrap_or(6), stale);
         return Ok(());
     }
     if args.get(1).map(String::as_str) == Some("cull") {
@@ -194,9 +206,106 @@ fn scale(crowds: u32) {
     println!("rooms/core = budget / p99 tick: rooms one core runs at 30 Hz, if nothing else ran on it");
 }
 
-fn sweep(crowds: u32) {
-    let all = honest_sweep(crowds);
-    println!("honest players: {} ({} crowds of {})", all.len(), crowds, aegis_harness::CROWD_SIZE);
+fn lag(seeds: u32, max_rtt: u32, stale: bool) {
+    use aegis_detector::detectors::aim_exact::EXACT_RAD;
+    use aegis_detector::detectors::reaction::{is_fast, MIN_TIMED};
+    use aegis_detector::FlagReason;
+    use aegis_telemetry::Outcome;
+    use std::collections::BTreeMap;
+
+    /// One kind of player, summed over every crowd at one round trip.
+    #[derive(Default)]
+    struct Row {
+        players: u32,
+        reacts: Vec<u32>,
+        judged: u32,
+        reaction: u32,
+        shots: u32,
+        exact: u32,
+        aim_exact: u32,
+        struck: u32,
+        blind: u32,
+        any: u32,
+    }
+
+    println!(
+        "{} crowds: {seeds} per round trip, 12 honest + 4 instant bots, {} ticks",
+        if stale { "stale_mix" } else { "lag_mix" },
+        aegis_harness::CROWD_TICKS
+    );
+    println!("react = ticks from the snapshot first showing the enemy to the shot it chose on that picture");
+    println!("judged = players with reaction's MIN_TIMED timed engagements; flag columns = players flagged\n");
+    println!(
+        "{:>3} {:<10} {:>7} {:>6} {:>6} {:>4} {:>4} {:>6} {:>8} {:>7} {:>9} {:>4} {:>7}",
+        "rtt",
+        "player",
+        "players",
+        "timed",
+        "fast%",
+        "p10",
+        "p50",
+        "judged",
+        "reaction",
+        "exact%",
+        "aim_exact",
+        "any",
+        "blind%"
+    );
+    for rtt in 0..=max_rtt {
+        let mut rows: BTreeMap<&str, Row> = BTreeMap::new();
+        for seed in 0..seeds {
+            let r = run(if stale { Scenario::stale_mix(seed, rtt) } else { Scenario::lag_mix(seed, rtt) });
+            for b in &r.bots {
+                let Some(id) = b.id else { continue };
+                let row = rows.entry(b.name).or_default();
+                row.players += 1;
+                let mut reacts = Vec::new();
+                for x in r.telemetry.records().iter().filter(|x| x.player == id) {
+                    if let Outcome::Shot { aim_err, react, .. } = x.outcome {
+                        row.shots += 1;
+                        row.exact += u32::from(aim_err < EXACT_RAD);
+                        reacts.extend(react);
+                    }
+                }
+                row.judged += u32::from(reacts.len() as u32 >= MIN_TIMED);
+                row.reacts.extend(reacts);
+                let flagged = |why| b.alerts.iter().any(|a| a.flag.reason == why);
+                row.reaction += u32::from(flagged(FlagReason::Reaction));
+                row.aim_exact += u32::from(flagged(FlagReason::AimExact));
+                row.any += u32::from(!b.alerts.is_empty());
+                row.struck += b.struck;
+                row.blind += b.blind;
+            }
+        }
+        for (name, mut row) in rows {
+            row.reacts.sort_unstable();
+            let n = row.reacts.len();
+            let q = |p: f32| row.reacts.get(((n.max(1) - 1) as f32 * p).round() as usize).copied().unwrap_or(0);
+            let fast = row.reacts.iter().filter(|&&k| is_fast(k)).count();
+            println!(
+                "{:>3} {:<10} {:>7} {:>6} {:>5.0}% {:>4} {:>4} {:>6} {:>8} {:>6.0}% {:>9} {:>4} {:>6.1}%",
+                rtt,
+                name,
+                row.players,
+                n,
+                100.0 * fast as f32 / n.max(1) as f32,
+                q(0.1),
+                q(0.5),
+                row.judged,
+                row.reaction,
+                100.0 * row.exact as f32 / row.shots.max(1) as f32,
+                row.aim_exact,
+                row.any,
+                100.0 * row.blind as f32 / row.struck.max(1) as f32
+            );
+        }
+        println!();
+    }
+}
+
+fn sweep(crowds: u32, rtt: u32) {
+    let all = honest_sweep_at(crowds, rtt);
+    println!("honest players: {} ({} crowds of {}, rtt {rtt})", all.len(), crowds, aegis_harness::CROWD_SIZE);
     for style in [None, Some("honest"), Some("camper"), Some("rusher")] {
         let players: Vec<&HonestPlayer> = all.iter().filter(|p| style.is_none_or(|s| p.style == s)).collect();
         let col = |f: &dyn Fn(&HonestPlayer) -> f32| {

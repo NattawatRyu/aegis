@@ -27,7 +27,10 @@ use siphasher::sip::SipHasher24;
 ///     source address before the server admits it.
 /// v3: through a relay, every datagram is sealed per session ([`seal_up`],
 ///     [`seal_down`]) under keys the game's backend issued ([`mint_connect`]).
-pub const PROTOCOL_VERSION: u16 = 3;
+/// v4: every snapshot carries a `proof` of its tick, and every input echoes
+///     the proof of the snapshot it was chosen on — reaction is timed from
+///     what the client had, not from when its input arrived.
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// Bytes of session token in front of every client datagram.
 pub const TOKEN_LEN: usize = 8;
@@ -93,8 +96,15 @@ pub enum ClientMsg {
         cookie: Option<u64>,
     },
     /// `seq`: client's monotonic counter, used for dup/replay detection.
-    /// `tick`: the tick the client believes it is acting on (lag context).
-    Input { seq: u32, tick: u32, move_dir: Vec2, aim: Vec2, shoot: bool },
+    /// `tick`: the tick of the snapshot the client chose this input on —
+    /// the one it *displayed*, if it renders behind what it has received.
+    /// `proof`: that snapshot's [`ServerMsg::Snapshot`] `proof`, echoed. The
+    /// server refuses an input whose proof does not match its tick, so a
+    /// client can claim only a snapshot it really got: never a newer one.
+    /// Nor one older than 16 ticks, from before it joined, or older than one
+    /// it already claimed (the server's `stale_tick` guard): every shot is
+    /// judged in the picture claimed, and only the last 16 are kept.
+    Input { seq: u32, tick: u32, proof: u32, move_dir: Vec2, aim: Vec2, shoot: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -110,8 +120,14 @@ pub enum ServerMsg {
     /// One behind a wall is left out, so a wallhack has nothing to draw —
     /// killed at the source instead of detected. Same shape as the full
     /// world, so culling needed no version bump.
+    ///
+    /// `proof` is a MAC of (this player, its session, `tick`) under a key only the server
+    /// holds: the client cannot compute it for a tick it has not been sent.
+    /// Ticks count up one at a time, so without it any client could claim to
+    /// have seen any tick.
     Snapshot {
         tick: u32,
+        proof: u32,
         players: Vec<PlayerState>,
     },
     /// Answer to a Join without a valid cookie: send the Join again with this
@@ -867,6 +883,7 @@ mod tests {
         let m = ClientMsg::Input {
             seq: 7,
             tick: 100,
+            proof: 0xDEAD_BEEF,
             move_dir: Vec2::new(0.3, -0.4),
             aim: Vec2::new(1.0, 0.0),
             shoot: true,
@@ -879,6 +896,7 @@ mod tests {
     fn servermsg_snapshot_roundtrip() {
         let m = ServerMsg::Snapshot {
             tick: 42,
+            proof: u32::MAX,
             players: vec![
                 PlayerState { id: 1, pos: Vec2::new(1.0, 2.0), health: 100, alive: true },
                 PlayerState { id: 2, pos: Vec2::ZERO, health: 0, alive: false },

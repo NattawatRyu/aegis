@@ -71,7 +71,7 @@ mod tests {
     #[test]
     fn joins_from_every_source_port_in_turn() {
         let mut b = JoinFloodBot::new();
-        let ctx = BotCtx { tick: 1, my_id: 1, token: 0, snapshot: &[] };
+        let ctx = BotCtx { tick: 1, my_id: 1, token: 0, proof: 0, snapshot: &[] };
         let mut seen: Vec<u16> = Vec::new();
         for _ in 0..(SOURCES / JOINS_PER_TICK + 1) {
             let out = b.routed(&ctx);

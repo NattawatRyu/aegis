@@ -47,7 +47,7 @@ impl Bot for HumanizedAimbot {
             Some(e) => (rotate(unit_towards(me, e.pos), jitter(&mut self.rng) * JITTER_RAD), true),
             None => (Vec2::new(1.0, 0.0), false),
         };
-        vec![ClientMsg::Input { seq: self.seq, tick: ctx.tick, move_dir: Vec2::ZERO, aim, shoot }]
+        vec![ClientMsg::Input { seq: self.seq, tick: ctx.tick, proof: ctx.proof, move_dir: Vec2::ZERO, aim, shoot }]
     }
 }
 
@@ -68,7 +68,7 @@ mod tests {
         let snap = [state(1, Vec2::ZERO), state(2, Vec2::new(10.0, 0.0))];
         let mut exact = 0;
         for tick in 1..=300 {
-            match b.act(&BotCtx { tick, my_id: 1, token: 0, snapshot: &snap })[0] {
+            match b.act(&BotCtx { tick, my_id: 1, token: 0, proof: 0, snapshot: &snap })[0] {
                 ClientMsg::Input { aim, shoot, .. } => {
                     assert!(shoot);
                     let off = aim.y.atan2(aim.x).abs();

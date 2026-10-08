@@ -6,7 +6,7 @@
 //! ```text
 //! begin_tick  -> idle sessions end, respawns, then the snapshot clients act on
 //! receive     -> once per datagram:
-//!                address + token?  yes -> player budget -> decode -> pipeline
+//!                address + token?  yes -> player budget -> decode -> tick proof -> pipeline
 //!                                  no  -> IP budget -> decode -> Join only
 //!                                         (no cookie -> Challenge; cookie -> admit)
 //! end_tick    -> shots against the pre-move world, then moves
@@ -32,7 +32,10 @@ use aegis_telemetry::Telemetry;
 use crate::guards::cookie::CookieJar;
 use crate::guards::session::{self, Session};
 use crate::guards::source_rate::SourceRate;
+use crate::guards::stale_tick::StaleTick;
+use crate::guards::tick_proof::TickProof;
 use crate::guards::{ip_sessions, joined, packet, version};
+use crate::history::History;
 use crate::reaction::Reaction;
 use crate::{ClientInput, GuardCtx, GuardVerdict, Pipeline, RejectReason, Sim, Visibility, Wall};
 
@@ -52,6 +55,10 @@ pub struct TickOutcome {
     pub kills: Vec<PlayerId>,
     /// One entry per applied move: who, and how far they actually travelled.
     pub steps: Vec<(PlayerId, f32)>,
+    /// One entry per hit: the shooter, and whether the player it hit was in
+    /// the picture its input claimed. A hit on someone it was not shown is
+    /// a shot at an enemy it says it could not see.
+    pub hits: Vec<(PlayerId, bool)>,
 }
 
 /// Datagrams dropped without a player to pin them on: rate-budget drops
@@ -80,11 +87,17 @@ pub struct Server {
     vis: Visibility,
     /// Players moved since `vis` was computed.
     vis_stale: bool,
-    /// Who was alive when `vis` was computed — the world this tick's
-    /// snapshots show. Aim evidence is measured against it, not against
-    /// whoever is still alive by the shooter's turn ([`Server::end_tick`]).
-    /// A player admitted mid-tick is in no snapshot yet, so not in it.
-    shown: [bool; 256],
+    /// The worlds the last [`HISTORY`](crate::history::HISTORY) ticks' snapshots showed, each taken
+    /// when `vis` was computed. Aim evidence is measured in the one the
+    /// shooter's input claims, not in whoever is still alive and where by
+    /// the shot's turn ([`Server::end_tick`]). A player admitted mid-tick is
+    /// in no snapshot yet, so not in that tick's.
+    history: History,
+    /// Bounds the snapshot each input may claim ([`StaleTick`]).
+    stale: StaleTick,
+    /// Each player id's session token, so a snapshot's proof is bound to the
+    /// session it was sent in. 0 for an id nobody holds.
+    tokens: Box<[u64; 256]>,
     /// Engagements and firing streaks, for each shot's reaction time.
     react: Reaction,
     pipe: Pipeline,
@@ -109,6 +122,8 @@ pub struct Server {
     /// What session tokens are MAC'd under: random, or the link key shared
     /// with a relay so it can pre-check them ([`Server::share_token_key`]).
     token_key: LinkKey,
+    /// Proves which snapshots a client was sent ([`Server::tick_proof`]).
+    proofs: TickProof,
     /// Player `id` enters at `spawns[(id - 1) % len]`.
     spawns: Vec<Vec2>,
     /// Inputs accepted this tick, in arrival order, waiting for `end_tick`.
@@ -148,7 +163,9 @@ impl Server {
             sim: Sim::with_walls(walls),
             vis: Visibility::default(),
             vis_stale: false,
-            shown: [false; 256],
+            history: History::default(),
+            stale: StaleTick::default(),
+            tokens: Box::new([0; 256]),
             react: Reaction::default(),
             pipe: Pipeline::standard(),
             tel: Telemetry::new(),
@@ -161,6 +178,7 @@ impl Server {
             cookies: CookieJar::new(),
             edge_cookies: false,
             token_key: LinkKey::random(),
+            proofs: TickProof::new(),
             spawns,
             pending: Vec::new(),
         }
@@ -203,6 +221,7 @@ impl Server {
             if let Some(s) = self.sessions.remove(&a) {
                 self.sim.despawn(s.player_id);
                 self.pipe.forget(s.player_id);
+                self.tokens[s.player_id as usize] = 0;
                 self.pending.retain(|&(p, _)| p != s.player_id);
                 self.tel.left(tick, s.player_id);
             }
@@ -210,7 +229,7 @@ impl Server {
         self.sim.step_respawns();
         self.vis.recompute(&self.sim);
         self.vis_stale = false;
-        self.show();
+        self.history.record(tick, &self.sim, &self.vis);
         self.react.observe(tick, &self.sim, &self.vis);
         self.sim.snapshot()
     }
@@ -223,6 +242,13 @@ impl Server {
         // each test, harness scenario and transport — checks it.
         debug_assert_eq!(v, self.sim.view(id), "shared visibility diverged for player {id}");
         v
+    }
+
+    /// The `proof` that goes in player `id`'s snapshot of `tick`, bound to
+    /// its current session. Its input claiming that snapshot must echo it
+    /// ([`crate::guards::tick_proof`]).
+    pub fn tick_proof(&self, id: PlayerId, tick: u32) -> u32 {
+        self.proofs.issue(id, self.tokens[id as usize], tick)
     }
 
     /// The tick's line of sight, for whoever else reads it.
@@ -307,19 +333,14 @@ impl Server {
         self.last_seen.insert(from, tick);
         self.sim.spawn(player_id, self.spawns[(player_id as usize - 1) % self.spawns.len()]);
         // Mid-tick: it can shoot and be shot before the next recompute, but
-        // no snapshot has shown it, so it is no one's aim evidence yet.
+        // no snapshot has shown it (it is in no frame of `history`), so it is
+        // no one's aim evidence yet.
         self.vis.add(&self.sim, player_id);
-        self.shown[player_id as usize] = false;
         self.react.joined(tick, &self.sim, &self.vis, player_id);
+        // A new session: proofs and claims start here, whatever the id held.
+        self.tokens[player_id as usize] = s.token;
+        self.stale.admitted(player_id, tick);
         Some(s)
-    }
-
-    /// Take `shown` from the world `vis` was just computed on.
-    fn show(&mut self) {
-        self.shown = [false; 256];
-        for p in self.sim.players().iter().filter(|p| p.alive) {
-            self.shown[p.id as usize] = true;
-        }
     }
 
     /// The first id in 1..=255 after `last_id` (wrapping) that nobody holds.
@@ -349,7 +370,15 @@ impl Server {
                     None
                 }
             },
-            ClientMsg::Input { seq, tick: client_tick, move_dir, aim, shoot } => {
+            ClientMsg::Input { seq, tick: client_tick, proof, move_dir, aim, shoot } => {
+                let claim = self
+                    .proofs
+                    .verify(player, s.token, client_tick, proof)
+                    .and_then(|()| self.stale.check(player, tick, client_tick));
+                if let Err(r) = claim {
+                    self.tel.reject(tick, player, r.label());
+                    return None;
+                }
                 let mut input = ClientInput { seq, tick: client_tick, move_dir, aim, shoot };
                 match self.pipe.run(&GuardCtx { tick, player }, &mut input) {
                     GuardVerdict::Ok { anomaly } => {
@@ -370,41 +399,58 @@ impl Server {
     /// (see [`Sim::aim_error`]).
     ///
     /// Shots resolve one at a time, so who they hit and kill depends on order.
-    /// The aim evidence does not: it is measured against the nearest enemy
-    /// the shooter's snapshot showed (`shown`), even one an earlier shot this
-    /// tick has killed. Measured against the living instead, a shooter whose
-    /// target fell first was scored against the next-nearest enemy — a
-    /// reaction of a tick or two and a wild aim error it never made.
+    /// The aim evidence does not: it is measured in the world the shooter's
+    /// snapshot showed — the one its input claims (`seen`, proven and at
+    /// most [`HISTORY`](crate::history::HISTORY) old) — against the nearest enemy there, even one an
+    /// earlier shot this tick has killed, and from where both stood then.
+    /// Measured in the world now instead, a shooter whose target fell first,
+    /// or who acted a round trip ago, was scored against an enemy it had
+    /// not aimed at — a reaction of a tick or two and a wild aim error it
+    /// never made.
+    ///
+    /// A shot chosen while the shooter was dead in its own snapshot (its
+    /// trigger held through a respawn it had not seen yet) is no evidence
+    /// and starts no run of fire: it was not aimed at anything.
     pub fn end_tick(&mut self, tick: u32) -> TickOutcome {
         let pending = std::mem::take(&mut self.pending);
         let mut out = TickOutcome::default();
         // Two end_ticks with no begin_tick between (only tests do this).
         if self.vis_stale {
             self.vis.recompute(&self.sim);
-            self.show();
+            self.history.record(tick, &self.sim, &self.vis);
             self.react.observe(tick, &self.sim, &self.vis);
         }
         for &(p, input) in &pending {
             if !input.shoot {
                 continue;
             }
-            // A dead player's trigger fires nothing, and starts no streak.
-            if self.sim.player(p).is_some_and(|s| s.alive) {
-                self.react.fired(tick, p);
+            let seen = input.tick;
+            // A dead player's trigger fires nothing, and starts no streak —
+            // dead now, or dead in the picture it pulled it on.
+            let live = self.sim.player(p).is_some_and(|s| s.alive) && self.history.alive(seen, p);
+            if live {
+                self.react.fired(seen, p);
             }
-            let shown = |id: PlayerId| self.shown[id as usize];
-            let ev = self.sim.aim_evidence_in(&self.vis, p, input.aim, shown);
-            debug_assert_eq!(
-                ev.map(|(e, id)| (e.to_bits(), id)),
-                self.sim.aim_evidence(p, input.aim, shown).map(|(e, id)| (e.to_bits(), id)),
-                "shared visibility changed player {p}'s aim evidence"
-            );
+            let ev = if live { self.history.aim_evidence(seen, p, input.aim) } else { None };
+            // Oracle: on the snapshot of this very tick, the frame must agree
+            // to the bit with the sim's own ray-cast over who it showed.
+            if seen == tick && live {
+                let shown = |id: PlayerId| self.history.alive(tick, id);
+                debug_assert_eq!(
+                    ev.map(|(e, id)| (e.to_bits(), id)),
+                    self.sim.aim_evidence(p, input.aim, shown).map(|(e, id)| (e.to_bits(), id)),
+                    "the shown frame changed player {p}'s aim evidence"
+                );
+            }
             let r = self.sim.apply_shot(p, input.aim);
-            if r.is_some_and(|r| r.killed) {
-                out.kills.push(p);
+            if let Some(r) = r {
+                if r.killed {
+                    out.kills.push(p);
+                }
+                out.hits.push((p, live && self.history.sees(seen, p, r.target)));
             }
             if let Some((err, enemy)) = ev {
-                let react = self.react.engage(tick, p, enemy);
+                let react = self.react.engage(p, enemy, seen);
                 self.tel.shot(tick, p, r.is_some(), err, react);
             }
         }
@@ -463,6 +509,7 @@ impl Server {
 mod tests {
     use super::*;
     use crate::guards::source_rate::MAX_PER_TICK;
+    use crate::history::HISTORY;
     use crate::sim::{MAX_HEALTH, MOVE_SPEED, SHOT_DAMAGE};
     use aegis_protocol::{frame, NO_TOKEN, PROTOCOL_VERSION};
     use aegis_telemetry::Outcome;
@@ -491,12 +538,18 @@ mod tests {
         }
     }
 
-    fn input(token: u64, seq: u32, move_dir: Vec2, aim: Vec2, shoot: bool) -> Vec<u8> {
-        frame(token, &ClientMsg::Input { seq, tick: seq, move_dir, aim, shoot })
+    /// An input claiming the newest snapshot (tick 0 before any), with its
+    /// proof for the player `token` belongs to (any proof, for a token
+    /// nobody holds) — what an honest client on the server's doorstep sends.
+    fn input(s: &Server, token: u64, seq: u32, move_dir: Vec2, aim: Vec2, shoot: bool) -> Vec<u8> {
+        let tick = s.history.latest().unwrap_or(0);
+        let player = s.sessions.values().find(|x| x.token == token).map(|x| x.player_id);
+        let proof = player.map_or(0, |p| s.tick_proof(p, tick));
+        frame(token, &ClientMsg::Input { seq, tick, proof, move_dir, aim, shoot })
     }
 
-    fn walk(token: u64, seq: u32) -> Vec<u8> {
-        input(token, seq, Vec2::new(1.0, 0.0), Vec2::new(1.0, 0.0), false)
+    fn walk(s: &Server, token: u64, seq: u32) -> Vec<u8> {
+        input(s, token, seq, Vec2::new(1.0, 0.0), Vec2::new(1.0, 0.0), false)
     }
 
     fn server() -> Server {
@@ -542,7 +595,7 @@ mod tests {
         let p3 = hs(&mut s, 1, addr(3)).expect("join").player_id;
         assert!(s.view(1).iter().any(|p| p.id == p3), "new player missing from a view");
         assert!(s.view(p3).iter().any(|p| p.id == 1), "new player sees nobody");
-        s.receive(1, addr(1), &input(t1, 1, Vec2::ZERO, Vec2::new(0.0, 1.0), true));
+        s.receive(1, addr(1), &input(&s, t1, 1, Vec2::ZERO, Vec2::new(0.0, 1.0), true));
         s.end_tick(1);
         assert_eq!(shots(&s), vec![(1, true, 0.0)]);
     }
@@ -558,9 +611,9 @@ mod tests {
         let t2 = admit(&mut s, addr(2));
         s.begin_tick(1);
         assert!(s.view(1).iter().all(|p| p.id != 2), "setup: 2 starts hidden");
-        s.receive(1, addr(2), &input(t2, 1, Vec2::new(0.0, 1.0), Vec2::new(1.0, 0.0), false));
+        s.receive(1, addr(2), &input(&s, t2, 1, Vec2::new(0.0, 1.0), Vec2::new(1.0, 0.0), false));
         s.end_tick(1); // 2 now at (10, 5): in the open
-        s.receive(1, addr(1), &input(t1, 1, Vec2::ZERO, Vec2::new(2.0, 1.0), true));
+        s.receive(1, addr(1), &input(&s, t1, 1, Vec2::ZERO, Vec2::new(2.0, 1.0), true));
         s.end_tick(1);
         assert_eq!(shots(&s).len(), 1, "shot at a visible enemy recorded no evidence");
         assert!(shots(&s)[0].2 < 1e-6, "aim error {:?}", shots(&s));
@@ -700,7 +753,7 @@ mod tests {
     #[test]
     fn unknown_source_never_gets_an_id_or_a_record() {
         let mut s = server();
-        s.receive(1, addr(1), &walk(NO_TOKEN, 1));
+        s.receive(1, addr(1), &walk(&s, NO_TOKEN, 1));
         s.receive(1, addr(1), &[0xFF, 0xFF, 0xFF]); // too short to carry a token
         s.receive(1, addr(1), &[0xFF; 12]); // a token, then garbage
         assert_eq!(s.end_tick(1), TickOutcome::default());
@@ -713,7 +766,7 @@ mod tests {
     fn same_ip_other_port_is_not_the_player_even_with_its_token() {
         let (mut s, t1, _) = joined_pair();
         let other = SocketAddr::from(([10, 0, 0, 1], 4001));
-        s.receive(1, other, &walk(t1, 1));
+        s.receive(1, other, &walk(&s, t1, 1));
         assert_eq!(s.end_tick(1), TickOutcome::default());
         assert_eq!(s.net_stats().get("not_joined"), 1);
     }
@@ -725,7 +778,7 @@ mod tests {
     fn forged_source_with_wrong_token_is_counted_not_applied() {
         let (mut s, t1, t2) = joined_pair();
         for (seq, t) in [NO_TOKEN, t1 ^ 1, t2].into_iter().enumerate() {
-            s.receive(1, addr(1), &walk(t, seq as u32 + 1));
+            s.receive(1, addr(1), &walk(&s, t, seq as u32 + 1));
         }
         assert_eq!(s.end_tick(1), TickOutcome::default());
         assert!(s.telemetry().is_empty(), "victim's record: {:?}", s.telemetry().records());
@@ -739,9 +792,9 @@ mod tests {
     fn forged_burst_does_not_starve_the_victim() {
         let (mut s, t1, _) = joined_pair();
         for seq in 0..MAX_PER_TICK * 4 {
-            s.receive(1, addr(1), &walk(NO_TOKEN, 1_000 + seq));
+            s.receive(1, addr(1), &walk(&s, NO_TOKEN, 1_000 + seq));
         }
-        s.receive(1, addr(1), &walk(t1, 1));
+        s.receive(1, addr(1), &walk(&s, t1, 1));
         assert_eq!(s.end_tick(1).steps, vec![(1, MOVE_SPEED)]);
         assert_eq!(s.telemetry().per_player(1).accepted, 1);
         assert_eq!(s.net_stats().get("bad_token"), MAX_PER_TICK as u64);
@@ -773,7 +826,7 @@ mod tests {
         assert_eq!(s.player_id(addr(1)), None);
         let last = s.telemetry().records().last().unwrap();
         assert_eq!((last.tick, last.player, &last.outcome), (IDLE_TICKS + 1, 1, &Outcome::Left));
-        s.receive(IDLE_TICKS + 1, addr(1), &walk(t1, 1));
+        s.receive(IDLE_TICKS + 1, addr(1), &walk(&s, t1, 1));
         assert_eq!(s.net_stats().get("not_joined"), 1);
     }
 
@@ -797,9 +850,9 @@ mod tests {
     #[test]
     fn authenticated_traffic_keeps_a_session_alive_forgeries_do_not() {
         let (mut s, t1, _) = joined_pair();
-        s.receive(100, addr(1), &walk(t1, 1)); // player 1: real input at 100
+        s.receive(100, addr(1), &walk(&s, t1, 1)); // player 1: real input at 100
         for t in 1..=IDLE_TICKS + 1 {
-            s.receive(t, addr(2), &walk(NO_TOKEN, t)); // player 2: only forgeries
+            s.receive(t, addr(2), &walk(&s, NO_TOKEN, t)); // player 2: only forgeries
         }
         s.begin_tick(IDLE_TICKS + 1);
         assert_eq!(s.player_id(addr(1)), Some(1));
@@ -842,7 +895,7 @@ mod tests {
     fn a_reused_id_inherits_nothing() {
         let mut s = server();
         let old = admit(&mut s, SocketAddr::from(([10, 2, 0, 1], 4000)));
-        s.receive(1, SocketAddr::from(([10, 2, 0, 1], 4000)), &walk(old, 500));
+        s.receive(1, SocketAddr::from(([10, 2, 0, 1], 4000)), &walk(&s, old, 500));
         for n in 2..=255u8 {
             let from = SocketAddr::from(([10, 3, 0, n], 4000));
             assert_eq!(hs(&mut s, 100, from).map(|x| x.player_id), Some(n));
@@ -852,7 +905,7 @@ mod tests {
         let fresh = hs(&mut s, IDLE_TICKS + 2, newcomer).unwrap();
         assert_eq!(fresh.player_id, 1);
         assert_eq!(s.sim().player(1).unwrap().pos, Vec2::ZERO);
-        s.receive(IDLE_TICKS + 3, newcomer, &walk(fresh.token, 1));
+        s.receive(IDLE_TICKS + 3, newcomer, &walk(&s, fresh.token, 1));
         let out = s.end_tick(IDLE_TICKS + 3);
         assert_eq!(out.steps, vec![(1, MOVE_SPEED)], "net: {:?}", s.net_stats());
     }
@@ -874,7 +927,7 @@ mod tests {
     fn source_rate_drops_past_the_cap_before_decode() {
         let (mut s, t1, _) = joined_pair();
         for seq in 1..=MAX_PER_TICK + 1 {
-            s.receive(1, addr(1), &input(t1, seq, Vec2::ZERO, Vec2::ZERO, false));
+            s.receive(1, addr(1), &input(&s, t1, seq, Vec2::ZERO, Vec2::ZERO, false));
         }
         let t = s.telemetry().per_player(1);
         assert_eq!((t.accepted, t.rejected.get("rate_exceeded").copied()), (1, Some(MAX_PER_TICK - 1)));
@@ -886,7 +939,7 @@ mod tests {
     fn unjoined_flood_costs_at_most_the_cap_in_decodes() {
         let mut s = server();
         for _ in 0..100 {
-            s.receive(1, addr(9), &walk(NO_TOKEN, 1));
+            s.receive(1, addr(9), &walk(&s, NO_TOKEN, 1));
         }
         assert_eq!(s.net_stats().get("not_joined"), MAX_PER_TICK as u64);
         assert_eq!(s.net_stats().get("source_rate"), 100 - MAX_PER_TICK as u64);
@@ -910,7 +963,7 @@ mod tests {
     fn accepted_input_waits_for_end_tick() {
         let (mut s, t1, _) = joined_pair();
         s.begin_tick(1);
-        s.receive(1, addr(1), &walk(t1, 1));
+        s.receive(1, addr(1), &walk(&s, t1, 1));
         assert_eq!(s.sim().player(1).unwrap().pos, Vec2::ZERO); // not yet
         let out = s.end_tick(1);
         assert_eq!(out.steps, vec![(1, MOVE_SPEED)]);
@@ -926,8 +979,8 @@ mod tests {
     fn shots_resolve_before_moves() {
         let (mut s, t1, t2) = joined_pair();
         s.begin_tick(1);
-        s.receive(1, addr(2), &input(t2, 1, Vec2::new(0.0, 1.0), Vec2::new(-1.0, 0.0), false));
-        s.receive(1, addr(1), &input(t1, 1, Vec2::ZERO, Vec2::new(1.0, 0.0), true));
+        s.receive(1, addr(2), &input(&s, t2, 1, Vec2::new(0.0, 1.0), Vec2::new(-1.0, 0.0), false));
+        s.receive(1, addr(1), &input(&s, t1, 1, Vec2::ZERO, Vec2::new(1.0, 0.0), true));
         s.end_tick(1);
         assert_eq!(s.sim().player(2).unwrap().health, MAX_HEALTH - SHOT_DAMAGE);
         assert_eq!(s.sim().player(2).unwrap().pos, Vec2::new(10.0, MOVE_SPEED));
@@ -948,9 +1001,9 @@ mod tests {
         let last = (MAX_HEALTH / SHOT_DAMAGE) as u32;
         for t in 1..=last {
             s.begin_tick(t);
-            s.receive(t, addr(1), &input(ta, t, Vec2::ZERO, Vec2::new(1.0, 0.0), true));
+            s.receive(t, addr(1), &input(&s, ta, t, Vec2::ZERO, Vec2::new(1.0, 0.0), true));
             if t == last {
-                s.receive(t, addr(3), &input(tb, t, Vec2::ZERO, Vec2::new(-1.0, 0.0), true));
+                s.receive(t, addr(3), &input(&s, tb, t, Vec2::ZERO, Vec2::new(-1.0, 0.0), true));
             }
             s.end_tick(t);
         }
@@ -971,7 +1024,7 @@ mod tests {
         let mut kills = Vec::new();
         for t in 1..=(MAX_HEALTH / SHOT_DAMAGE) as u32 {
             s.begin_tick(t);
-            s.receive(t, addr(1), &input(t1, t, Vec2::ZERO, Vec2::new(1.0, 0.0), true));
+            s.receive(t, addr(1), &input(&s, t1, t, Vec2::ZERO, Vec2::new(1.0, 0.0), true));
             kills.extend(s.end_tick(t).kills);
         }
         assert_eq!(kills, vec![1]);
@@ -983,7 +1036,7 @@ mod tests {
         let (mut s, t1, _) = joined_pair();
         for t in 1..=(MAX_HEALTH / SHOT_DAMAGE) as u32 {
             s.begin_tick(t);
-            s.receive(t, addr(1), &input(t1, t, Vec2::ZERO, Vec2::new(1.0, 0.0), true));
+            s.receive(t, addr(1), &input(&s, t1, t, Vec2::ZERO, Vec2::new(1.0, 0.0), true));
             s.end_tick(t);
         }
         let mut snap = Vec::new();
@@ -993,5 +1046,89 @@ mod tests {
         }
         let p2 = snap.iter().find(|p| p.id == 2).unwrap();
         assert!(p2.alive && p2.health == MAX_HEALTH && p2.pos == Vec2::new(10.0, 0.0));
+    }
+
+    /// An input from the player `token` belongs to, claiming snapshot
+    /// `seen` with that snapshot's real proof.
+    fn claim(s: &Server, token: u64, seq: u32, seen: u32, aim: Vec2, shoot: bool) -> Vec<u8> {
+        let p = s.sessions.values().find(|x| x.token == token).expect("a live session").player_id;
+        let proof = s.tick_proof(p, seen);
+        frame(token, &ClientMsg::Input { seq, tick: seen, proof, move_dir: Vec2::ZERO, aim, shoot })
+    }
+
+    fn rejected(s: &Server, p: PlayerId, label: &str) -> u32 {
+        s.telemetry().per_player(p).rejected.get(label).copied().unwrap_or(0)
+    }
+
+    /// The stale-tick guard at its edges, end to end, with real proofs: a
+    /// snapshot HISTORY ticks old is refused, one tick younger is not; once
+    /// a snapshot is claimed, an older one is refused.
+    #[test]
+    fn a_snapshot_older_than_the_history_cannot_be_claimed() {
+        let (mut s, t1, _) = joined_pair();
+        let now = HISTORY + 4;
+        let aim = Vec2::new(1.0, 0.0);
+        for t in 1..now {
+            s.begin_tick(t);
+        }
+        let steps =
+            [(now - HISTORY, true), (now + 1 - HISTORY + 1, false), (now + 1 - HISTORY, true), (now + 2, false)];
+        for (k, &(seen, _)) in steps.iter().enumerate() {
+            let t = now + k as u32;
+            s.begin_tick(t);
+            s.receive(t, addr(1), &claim(&s, t1, t, seen, aim, false));
+            s.end_tick(t);
+            assert_eq!(rejected(&s, 1, "stale_tick"), steps[..=k].iter().filter(|x| x.1).count() as u32, "tick {t}");
+        }
+        assert_eq!(s.telemetry().per_player(1).accepted, 2);
+    }
+
+    /// A proof is bound to the session it was sent in: the same id and tick
+    /// under another token is a different proof.
+    #[test]
+    fn a_proof_is_bound_to_the_session() {
+        let (mut s, t1, _) = joined_pair();
+        s.begin_tick(1);
+        let mine = s.tick_proof(1, 1);
+        s.tokens[1] ^= 1;
+        assert_ne!(s.tick_proof(1, 1), mine);
+        s.tokens[1] ^= 1;
+        s.receive(1, addr(1), &claim(&s, t1, 1, 1, Vec2::new(1.0, 0.0), false));
+        assert_eq!(s.telemetry().per_player(1).accepted, 1);
+    }
+
+    /// A shot chosen on a snapshot that showed the shooter dead — its
+    /// trigger held through a respawn it had not seen yet — is no evidence
+    /// and starts no run of fire. Player 1 is killed, respawns on tick R; on
+    /// R it fires claiming R - 1 (dead there): no shot on record. On R + 1
+    /// it fires claiming R: timed 0, because the dead shot did not start a
+    /// run (had it, R would continue it and read `None`).
+    #[test]
+    fn a_shot_chosen_dead_in_its_own_picture_is_no_evidence() {
+        let (mut s, t1, _) = joined_pair();
+        for _ in 0..(MAX_HEALTH / SHOT_DAMAGE) {
+            s.sim.apply_shot(2, Vec2::new(-1.0, 0.0));
+        }
+        let mut t = 0;
+        loop {
+            t += 1;
+            s.begin_tick(t);
+            if s.sim().player(1).unwrap().alive {
+                break;
+            }
+            s.end_tick(t);
+        }
+        let aim = Vec2::new(1.0, 0.0);
+        s.receive(t, addr(1), &claim(&s, t1, t, t - 1, aim, true));
+        s.end_tick(t);
+        assert_eq!(shots(&s), vec![], "a shot from a dead picture was put on record");
+        s.begin_tick(t + 1);
+        s.receive(t + 1, addr(1), &claim(&s, t1, t + 1, t, aim, true));
+        s.end_tick(t + 1);
+        let react = s.telemetry().records().iter().find_map(|r| match r.outcome {
+            Outcome::Shot { react, .. } => Some(react),
+            _ => None,
+        });
+        assert_eq!(react, Some(Some(0)));
     }
 }

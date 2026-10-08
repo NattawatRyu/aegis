@@ -37,7 +37,7 @@ impl Bot for NanBot {
         } else {
             (Vec2::new(f32::INFINITY, 0.0), Vec2::new(1.0, 0.0))
         };
-        vec![ClientMsg::Input { seq: self.seq, tick: ctx.tick, move_dir, aim, shoot: true }]
+        vec![ClientMsg::Input { seq: self.seq, tick: ctx.tick, proof: ctx.proof, move_dir, aim, shoot: true }]
     }
 }
 
@@ -46,7 +46,7 @@ mod tests {
     use super::*;
 
     fn vecs(b: &mut NanBot, tick: u32) -> (Vec2, Vec2) {
-        match b.act(&BotCtx { tick, my_id: 1, token: 0, snapshot: &[] })[0] {
+        match b.act(&BotCtx { tick, my_id: 1, token: 0, proof: 0, snapshot: &[] })[0] {
             ClientMsg::Input { move_dir, aim, .. } => (move_dir, aim),
             _ => panic!("expected Input"),
         }

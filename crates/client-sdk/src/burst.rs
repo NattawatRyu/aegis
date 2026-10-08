@@ -65,7 +65,7 @@ mod tests {
 
     fn aim_at(b: &mut BurstBot, tick: u32) -> (Vec2, bool) {
         let snap = [state(1, Vec2::ZERO), state(2, Vec2::new(10.0, 0.0))];
-        match b.act(&BotCtx { tick, my_id: 1, token: 0, snapshot: &snap })[0] {
+        match b.act(&BotCtx { tick, my_id: 1, token: 0, proof: 0, snapshot: &snap })[0] {
             ClientMsg::Input { aim, shoot, .. } => (aim, shoot),
             _ => panic!("expected Input"),
         }

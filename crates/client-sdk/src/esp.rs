@@ -53,7 +53,7 @@ impl Bot for EspBot {
             }
             None => (Vec2::ZERO, Vec2::new(1.0, 0.0), false),
         };
-        vec![ClientMsg::Input { seq: self.seq, tick: ctx.tick, move_dir, aim, shoot }]
+        vec![ClientMsg::Input { seq: self.seq, tick: ctx.tick, proof: ctx.proof, move_dir, aim, shoot }]
     }
 }
 
@@ -72,7 +72,7 @@ mod tests {
     fn heads_for_the_nearest_enemy_it_was_sent() {
         let mut b = EspBot::new();
         let snap = [state(1, Vec2::ZERO), state(2, Vec2::new(0.0, -10.0)), state(3, Vec2::new(30.0, 0.0))];
-        match b.act(&BotCtx { tick: 1, my_id: 1, token: 0, snapshot: &snap })[0] {
+        match b.act(&BotCtx { tick: 1, my_id: 1, token: 0, proof: 0, snapshot: &snap })[0] {
             ClientMsg::Input { move_dir, shoot, .. } => {
                 assert_eq!(move_dir, Vec2::new(0.0, -1.0));
                 assert!(!shoot, "fired before a human reaction");
@@ -91,7 +91,7 @@ mod tests {
         let first = (1..100)
             .find(|&tick| {
                 matches!(
-                    b.act(&BotCtx { tick, my_id: 1, token: 0, snapshot: &snap })[0],
+                    b.act(&BotCtx { tick, my_id: 1, token: 0, proof: 0, snapshot: &snap })[0],
                     ClientMsg::Input { shoot: true, .. }
                 )
             })
@@ -104,7 +104,7 @@ mod tests {
     fn with_nothing_sent_it_has_nothing_to_chase() {
         let mut b = EspBot::new();
         let snap = [state(1, Vec2::ZERO)];
-        match b.act(&BotCtx { tick: 1, my_id: 1, token: 0, snapshot: &snap })[0] {
+        match b.act(&BotCtx { tick: 1, my_id: 1, token: 0, proof: 0, snapshot: &snap })[0] {
             ClientMsg::Input { move_dir, shoot, .. } => {
                 assert_eq!(move_dir, Vec2::ZERO);
                 assert!(!shoot);

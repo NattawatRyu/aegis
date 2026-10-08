@@ -43,6 +43,7 @@ impl Bot for BadVersionBot {
         vec![ClientMsg::Input {
             seq: self.seq,
             tick: ctx.tick,
+            proof: ctx.proof,
             move_dir: Vec2::new(1.0, 0.0),
             aim: Vec2::new(1.0, 0.0),
             shoot: false,
@@ -66,7 +67,7 @@ mod tests {
     #[test]
     fn then_sends_legal_inputs() {
         let mut b = BadVersionBot::new();
-        let out = b.act(&BotCtx { tick: 1, my_id: 1, token: 0, snapshot: &[] });
+        let out = b.act(&BotCtx { tick: 1, my_id: 1, token: 0, proof: 0, snapshot: &[] });
         match out[0] {
             ClientMsg::Input { move_dir, .. } => assert!(move_dir.len() <= 1.0),
             _ => panic!("expected Input"),

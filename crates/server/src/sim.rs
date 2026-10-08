@@ -90,6 +90,26 @@ fn is_usable_aim(aim: Vec2) -> bool {
     l.is_finite() && l > 0.0
 }
 
+/// Squared distance — the order "nearest" means everywhere evidence is
+/// chosen, so every chooser agrees to the bit.
+pub(crate) fn dist2(a: Vec2, b: Vec2) -> f32 {
+    let (dx, dy) = (b.x - a.x, b.y - a.y);
+    dx * dx + dy * dy
+}
+
+/// Angle in radians between `aim` and the bearing from `from` to `to`;
+/// `None` for an aim with no direction. `atan2(cross, dot)`, not
+/// `acos(dot)`: see [`Sim::aim_error`].
+pub(crate) fn bearing_error(aim: Vec2, from: Vec2, to: Vec2) -> Option<f32> {
+    if !is_usable_aim(aim) {
+        return None;
+    }
+    let (bx, by) = (to.x - from.x, to.y - from.y);
+    let cross = aim.x * by - aim.y * bx;
+    let dot = aim.x * bx + aim.y * by;
+    Some(cross.atan2(dot).abs())
+}
+
 /// Ticks a dead player waits before `step_respawns` revives it (1s at 30Hz).
 pub const RESPAWN_TICKS: u32 = 30;
 
@@ -308,19 +328,15 @@ impl Sim {
         if !is_usable_aim(aim) {
             return None;
         }
-        let d2 = |p: &PlayerState| {
-            let (dx, dy) = (p.pos.x - s.pos.x, p.pos.y - s.pos.y);
-            dx * dx + dy * dy
-        };
-        let e =
-            self.players.iter().filter(|p| p.id != shooter && candidate(p)).min_by(|a, b| d2(a).total_cmp(&d2(b)))?;
-        let (bx, by) = (e.pos.x - s.pos.x, e.pos.y - s.pos.y);
-        if bx * bx + by * by <= HIT_RADIUS * HIT_RADIUS {
+        let e = self
+            .players
+            .iter()
+            .filter(|p| p.id != shooter && candidate(p))
+            .min_by(|a, b| dist2(s.pos, a.pos).total_cmp(&dist2(s.pos, b.pos)))?;
+        if dist2(s.pos, e.pos) <= HIT_RADIUS * HIT_RADIUS {
             return None;
         }
-        let cross = aim.x * by - aim.y * bx;
-        let dot = aim.x * bx + aim.y * by;
-        Some((cross.atan2(dot).abs(), e.id))
+        bearing_error(aim, s.pos, e.pos).map(|err| (err, e.id))
     }
 
     /// Resolve a shot authoritatively. `aim` is a direction (any magnitude);

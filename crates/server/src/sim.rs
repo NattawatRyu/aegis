@@ -11,6 +11,8 @@
 
 use aegis_protocol::{PlayerId, PlayerState, Vec2};
 
+use crate::Visibility;
+
 /// Distance a player travels per tick along a unit direction.
 pub const MOVE_SPEED: f32 = 5.0;
 /// Half-width of the square arena; positions are clamped to it.
@@ -221,6 +223,11 @@ impl Sim {
         }
     }
 
+    /// Every player, in world order (the order snapshots and views use).
+    pub fn players(&self) -> &[PlayerState] {
+        &self.players
+    }
+
     pub fn player(&self, id: PlayerId) -> Option<&PlayerState> {
         self.players.iter().find(|p| p.id == id)
     }
@@ -259,6 +266,44 @@ impl Sim {
     /// `atan2(cross, dot)`, not `acos(dot)`: near 0 an f32 `acos` cannot
     /// resolve below ~5e-4 rad, which is the scale an exact-aim check lives at.
     pub fn aim_error(&self, shooter: PlayerId, aim: Vec2) -> Option<f32> {
+        self.aim_evidence(shooter, aim, |id| self.player(id).is_some_and(|p| p.alive)).map(|(err, _)| err)
+    }
+
+    /// [`Sim::aim_error`], and the enemy it was measured against, choosing
+    /// only among the players `shown` admits instead of the living. Within a
+    /// tick shots resolve one by one, so by a shooter's turn its target may
+    /// already be dead; the evidence is still about the world its snapshot
+    /// showed — the server passes who was alive in it.
+    pub fn aim_evidence(
+        &self,
+        shooter: PlayerId,
+        aim: Vec2,
+        shown: impl Fn(PlayerId) -> bool,
+    ) -> Option<(f32, PlayerId)> {
+        let s = self.player(shooter)?.pos;
+        self.aim_error_by(shooter, aim, |p| shown(p.id) && self.sees(s, p.pos))
+    }
+
+    /// [`Sim::aim_evidence`] with line of sight read from `vis` (computed on
+    /// these positions) instead of ray-cast again.
+    pub fn aim_evidence_in(
+        &self,
+        vis: &Visibility,
+        shooter: PlayerId,
+        aim: Vec2,
+        shown: impl Fn(PlayerId) -> bool,
+    ) -> Option<(f32, PlayerId)> {
+        self.aim_error_by(shooter, aim, |p| shown(p.id) && vis.sees(shooter, p.id))
+    }
+
+    /// Nearest target admitted by `candidate` (the shooter itself never is).
+    /// The shooter must be alive now: a shot from the dead is not fired.
+    fn aim_error_by(
+        &self,
+        shooter: PlayerId,
+        aim: Vec2,
+        candidate: impl Fn(&PlayerState) -> bool,
+    ) -> Option<(f32, PlayerId)> {
         let s = self.player(shooter).filter(|p| p.alive)?;
         if !is_usable_aim(aim) {
             return None;
@@ -267,18 +312,15 @@ impl Sim {
             let (dx, dy) = (p.pos.x - s.pos.x, p.pos.y - s.pos.y);
             dx * dx + dy * dy
         };
-        let e = self
-            .players
-            .iter()
-            .filter(|p| p.id != shooter && p.alive && self.sees(s.pos, p.pos))
-            .min_by(|a, b| d2(a).total_cmp(&d2(b)))?;
+        let e =
+            self.players.iter().filter(|p| p.id != shooter && candidate(p)).min_by(|a, b| d2(a).total_cmp(&d2(b)))?;
         let (bx, by) = (e.pos.x - s.pos.x, e.pos.y - s.pos.y);
         if bx * bx + by * by <= HIT_RADIUS * HIT_RADIUS {
             return None;
         }
         let cross = aim.x * by - aim.y * bx;
         let dot = aim.x * bx + aim.y * by;
-        Some(cross.atan2(dot).abs())
+        Some((cross.atan2(dot).abs(), e.id))
     }
 
     /// Resolve a shot authoritatively. `aim` is a direction (any magnitude);

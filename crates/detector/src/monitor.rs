@@ -25,11 +25,11 @@
 //! from the minimum sample on is noisier than judging one whole run, and the
 //! thresholds must hold against that, not against the run's final figure.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 
 use aegis_telemetry::{Outcome, Record};
 
-use crate::{detectors::aim_exact::is_exact, Flag, FlagReason, PlayerStats, Suite};
+use crate::{detectors::aim_exact::is_exact, detectors::reaction::is_fast, Flag, FlagReason, PlayerStats, Suite};
 
 /// Samples per window: shots for the shot detectors, accepted inputs for the
 /// input detectors. Large enough that every `MIN_*` (at most 60) is reachable
@@ -43,51 +43,58 @@ pub struct Alert {
     pub flag: Flag,
 }
 
-/// The last [`WINDOW`] shots and accepted inputs, with running counts kept in
-/// a [`PlayerStats`] so the detectors read it like any other.
+const _: () = assert!(WINDOW <= 128, "a window is one u128 per signal");
+
+/// The low `WINDOW` bits.
+const MASK: u128 = if WINDOW == 128 { u128::MAX } else { (1 << WINDOW) - 1 };
+
+/// One signal over the last [`WINDOW`] samples: a shift register, newest in
+/// bit 0. Pushing shifts the oldest out past bit `WINDOW - 1`.
+fn push(plane: &mut u128, bit: bool) {
+    *plane = ((*plane << 1) | bit as u128) & MASK;
+}
+
+/// The last [`WINDOW`] shots and accepted inputs, one bit per sample per
+/// signal: a fixed 80 bytes of planes per player however long it plays.
+/// Counts are read off the planes into a [`PlayerStats`] so the detectors
+/// read it like any other.
 #[derive(Debug)]
 struct Window {
-    /// (hit, exact) per shot, oldest first.
-    shots: VecDeque<(bool, bool)>,
-    /// anomaly per accepted input, oldest first.
-    inputs: VecDeque<bool>,
+    shots: u32,
+    hit: u128,
+    exact: u128,
+    timed: u128,
+    fast: u128,
+    inputs: u32,
+    anomaly: u128,
     stats: PlayerStats,
 }
 
 impl Window {
     fn new(player: u8) -> Self {
-        Self {
-            shots: VecDeque::with_capacity(WINDOW),
-            inputs: VecDeque::with_capacity(WINDOW),
-            stats: PlayerStats::new(player),
-        }
+        Self { shots: 0, hit: 0, exact: 0, timed: 0, fast: 0, inputs: 0, anomaly: 0, stats: PlayerStats::new(player) }
     }
 
     fn record(&mut self, o: &Outcome) {
         let s = &mut self.stats;
         match *o {
             Outcome::Accepted { anomaly } => {
-                if self.inputs.len() == WINDOW {
-                    let old = self.inputs.pop_front().expect("full window");
-                    s.accepted -= 1;
-                    s.anomalies -= old as u32;
-                }
-                self.inputs.push_back(anomaly);
-                s.accepted += 1;
-                s.anomalies += anomaly as u32;
+                self.inputs = (self.inputs + 1).min(WINDOW as u32);
+                push(&mut self.anomaly, anomaly);
+                s.accepted = self.inputs;
+                s.anomalies = self.anomaly.count_ones();
             }
-            Outcome::Shot { hit, aim_err } => {
-                if self.shots.len() == WINDOW {
-                    let (h, e) = self.shots.pop_front().expect("full window");
-                    s.shots -= 1;
-                    s.hits -= h as u32;
-                    s.exact -= e as u32;
-                }
-                let e = is_exact(aim_err);
-                self.shots.push_back((hit, e));
-                s.shots += 1;
-                s.hits += hit as u32;
-                s.exact += e as u32;
+            Outcome::Shot { hit, aim_err, react } => {
+                self.shots = (self.shots + 1).min(WINDOW as u32);
+                push(&mut self.hit, hit);
+                push(&mut self.exact, is_exact(aim_err));
+                push(&mut self.timed, react.is_some());
+                push(&mut self.fast, react.is_some_and(is_fast));
+                s.shots = self.shots;
+                s.hits = self.hit.count_ones();
+                s.exact = self.exact.count_ones();
+                s.timed = self.timed.count_ones();
+                s.fast = self.fast.count_ones();
             }
             Outcome::Rejected { .. } | Outcome::Left => {}
         }
@@ -187,7 +194,7 @@ mod tests {
     /// `n` misses from `player` at `aim_err`, one per tick from `*tick`.
     fn shoot(t: &mut Telemetry, tick: &mut u32, player: u8, n: u32, aim_err: f32) {
         for _ in 0..n {
-            t.shot(*tick, player, false, aim_err);
+            t.shot(*tick, player, false, aim_err, None);
             *tick += 1;
         }
     }
@@ -284,6 +291,82 @@ mod tests {
         assert_eq!(m.verdict(), Suite::standard().run(&recs));
     }
 
+    /// The window as it was before the bit planes (2026-10-08): a deque of
+    /// samples with running counts. Kept as the rewrite's oracle.
+    struct DequeWindow {
+        shots: std::collections::VecDeque<(bool, bool, bool, bool)>,
+        inputs: std::collections::VecDeque<bool>,
+        stats: PlayerStats,
+    }
+
+    impl DequeWindow {
+        fn new(player: u8) -> Self {
+            Self { shots: Default::default(), inputs: Default::default(), stats: PlayerStats::new(player) }
+        }
+
+        fn record(&mut self, o: &Outcome) {
+            let s = &mut self.stats;
+            match *o {
+                Outcome::Accepted { anomaly } => {
+                    if self.inputs.len() == WINDOW {
+                        let old = self.inputs.pop_front().expect("full window");
+                        s.accepted -= 1;
+                        s.anomalies -= old as u32;
+                    }
+                    self.inputs.push_back(anomaly);
+                    s.accepted += 1;
+                    s.anomalies += anomaly as u32;
+                }
+                Outcome::Shot { hit, aim_err, react } => {
+                    if self.shots.len() == WINDOW {
+                        let (h, e, t, f) = self.shots.pop_front().expect("full window");
+                        s.shots -= 1;
+                        s.hits -= h as u32;
+                        s.exact -= e as u32;
+                        s.timed -= t as u32;
+                        s.fast -= f as u32;
+                    }
+                    let (e, t, f) = (is_exact(aim_err), react.is_some(), react.is_some_and(is_fast));
+                    self.shots.push_back((hit, e, t, f));
+                    s.shots += 1;
+                    s.hits += hit as u32;
+                    s.exact += e as u32;
+                    s.timed += t as u32;
+                    s.fast += f as u32;
+                }
+                Outcome::Rejected { .. } | Outcome::Left => {}
+            }
+        }
+    }
+
+    /// Rewrite check: the bit-plane window equals the deque it replaced
+    /// after every record, sessions reset on `Left`, across seeds — and the
+    /// streams are long enough that every plane has wrapped many times.
+    #[test]
+    fn bit_planes_match_the_deque_they_replaced() {
+        for seed in 1..=8 {
+            let recs = random_stream(seed, 6000, true);
+            let mut new: BTreeMap<u8, Window> = BTreeMap::new();
+            let mut old: BTreeMap<u8, DequeWindow> = BTreeMap::new();
+            let mut full = 0;
+            for (i, r) in recs.iter().enumerate() {
+                let p = r.player;
+                if r.outcome == Outcome::Left {
+                    new.remove(&p);
+                    old.remove(&p);
+                    continue;
+                }
+                let n = new.entry(p).or_insert_with(|| Window::new(p));
+                let o = old.entry(p).or_insert_with(|| DequeWindow::new(p));
+                n.record(&r.outcome);
+                o.record(&r.outcome);
+                assert_eq!(n.stats, o.stats, "seed {seed}, record {i}");
+                full += (o.shots.len() == WINDOW) as u32;
+            }
+            assert!(full > 200, "seed {seed}: the window was full only {full} times");
+        }
+    }
+
     #[test]
     fn window_matches_a_naive_recount_of_the_last_samples() {
         // Oracle: recount the window from scratch — the last WINDOW shots and
@@ -303,10 +386,16 @@ mod tests {
     #[test]
     fn no_view_judges_below_its_detectors_minimum() {
         // Every shot a hit, none exact: accuracy alone is judged, at exactly
-        // its MIN_SHOTS-th shot and not one before.
-        let mut m = Monitor::standard();
+        // its MIN_SHOTS-th shot and not one before. (Out of the standard
+        // suite, but the monitor must still honour its minimum.)
+        let mut m =
+            Monitor::new(Suite::new(vec![Box::new(accuracy::AccuracyDetector), Box::new(aim_exact::AimExactDetector)]));
         for n in 1..=accuracy::MIN_SHOTS {
-            let a = m.observe(&Record { tick: n, player: 5, outcome: Outcome::Shot { hit: true, aim_err: WIDE } });
+            let a = m.observe(&Record {
+                tick: n,
+                player: 5,
+                outcome: Outcome::Shot { hit: true, aim_err: WIDE, react: None },
+            });
             assert_eq!(
                 reasons(&a),
                 if n == accuracy::MIN_SHOTS { vec![FlagReason::Accuracy] } else { vec![] },
@@ -316,7 +405,11 @@ mod tests {
         // Every shot exact, none a hit: aim_exact alone, at its own minimum.
         let mut m = Monitor::standard();
         for n in 1..=aim_exact::MIN_SHOTS {
-            let a = m.observe(&Record { tick: n, player: 5, outcome: Outcome::Shot { hit: false, aim_err: EXACT } });
+            let a = m.observe(&Record {
+                tick: n,
+                player: 5,
+                outcome: Outcome::Shot { hit: false, aim_err: EXACT, react: None },
+            });
             assert_eq!(
                 reasons(&a),
                 if n == aim_exact::MIN_SHOTS { vec![FlagReason::AimExact] } else { vec![] },
@@ -342,8 +435,8 @@ mod tests {
     }
 
     /// A deterministic mixed stream over 4 players: accepts (some anomalous),
-    /// rejects, shots (some exact, some hits), and — if `leaves` — the odd
-    /// `Left`.
+    /// rejects, shots (some exact, some hits, some timed), and — if `leaves`
+    /// — the odd `Left`.
     fn random_stream(seed: u64, n: usize, leaves: bool) -> Vec<Record> {
         let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
         let mut next = move || {
@@ -360,7 +453,11 @@ mod tests {
                 0 if leaves => t.left(tick, p),
                 0..=39 => t.accept(tick, p, next() % 5 == 0),
                 40..=49 => t.reject(tick, p, "replay"),
-                _ => t.shot(tick, p, next() % 3 == 0, if next() % 4 == 0 { 0.0 } else { 0.05 }),
+                _ => {
+                    // Untimed mostly; timed ones from instant to slow.
+                    let react = (next() % 3 == 0).then(|| (next() % 10) as u32);
+                    t.shot(tick, p, next() % 3 == 0, if next() % 4 == 0 { 0.0 } else { 0.05 }, react)
+                }
             }
         }
         t.records().to_vec()

@@ -6,17 +6,75 @@
 //! is what the aimbot does; an honest bot that did the same would be an aimbot
 //! with a different name, and the detector (pillar C) would have nothing to
 //! tell apart. The error is deterministic (seeded xorshift), so runs repeat.
+//!
+//! It also takes time to react. Each enemy that comes into sight gets its own
+//! delay of [`REACT_MIN`]..=[`REACT_MAX`] ticks before the bot will fire on
+//! it; one that leaves sight or dies is forgotten, and when the bot itself is
+//! dead it forgets everyone. It fires only when the *nearest* enemy is ready
+//! and holds fire otherwise, even if a farther one is ready: the server
+//! measures each shot against the nearest enemy, so a shot at another would be
+//! recorded as an instant reaction with a wild aim error. That is a lab
+//! convention, not how people play — a real player picks targets freely.
 
-use super::{jitter, my_pos, nearest_enemy, rotate, unit_towards, Bot, BotCtx};
+use super::{jitter, my_pos, nearest_enemy, rotate, unit_towards, xorshift, Bot, BotCtx};
 use aegis_protocol::{ClientMsg, Vec2};
 
 /// Largest aim error either side of the true bearing, in radians (~8.6°).
 pub const AIM_ERROR_RAD: f32 = 0.15;
 
+/// Fewest ticks between an enemy coming into sight and the first shot at it
+/// (200 ms at 30 Hz).
+pub const REACT_MIN: u32 = 6;
+/// Most ticks between an enemy coming into sight and the first shot at it
+/// (400 ms at 30 Hz).
+pub const REACT_MAX: u32 = 12;
+
+/// A human reaction: how long after an enemy comes into sight a player is
+/// ready to fire on it. Any bot that plays with an honest hand keeps one.
+pub struct Reflex {
+    /// Draws delays. Its own stream, so a bot's aim error sequence does not
+    /// depend on how many enemies it has seen.
+    rng: u32,
+    /// Per enemy id in sight: the first tick the player will fire on it this
+    /// encounter.
+    ready: [Option<u32>; 256],
+}
+
+impl Reflex {
+    /// `seed` 0 is remapped (xorshift would stall at 0).
+    pub fn with_seed(seed: u32) -> Self {
+        Self { rng: if seed == 0 { 0x5BD1_E995 } else { seed }, ready: [None; 256] }
+    }
+
+    /// Bring the table up to date with this snapshot — forget enemies no
+    /// longer alive in sight (everyone, if the player itself is dead or
+    /// absent), start a new encounter for each one newly in sight — and say
+    /// whether the nearest enemy is ready to be fired on. Call every tick.
+    pub fn nearest_ready(&mut self, ctx: &BotCtx) -> bool {
+        let alive = ctx.snapshot.iter().any(|p| p.id == ctx.my_id && p.alive);
+        let mut in_sight = [false; 256];
+        if alive {
+            for p in ctx.snapshot.iter().filter(|p| p.id != ctx.my_id && p.alive) {
+                in_sight[p.id as usize] = true;
+            }
+        }
+        for (id, &seen) in in_sight.iter().enumerate() {
+            if !seen {
+                self.ready[id] = None;
+            } else if self.ready[id].is_none() {
+                let delay = REACT_MIN + xorshift(&mut self.rng) % (REACT_MAX - REACT_MIN + 1);
+                self.ready[id] = Some(ctx.tick + delay);
+            }
+        }
+        nearest_enemy(ctx).is_some_and(|e| self.ready[e.id as usize].is_some_and(|at| ctx.tick >= at))
+    }
+}
+
 pub struct HonestBot {
     seq: u32,
     walk: Vec2,
     rng: u32,
+    reflex: Reflex,
     /// Where the last snapshot put it. Unchanged after a step means a wall
     /// (or the arena edge) is in the way, so it turns.
     last: Option<Vec2>,
@@ -32,7 +90,8 @@ impl HonestBot {
     /// honest players, not one honest player many times. A zero seed would
     /// stall xorshift at 0 (perfect aim forever), so it is remapped.
     pub fn with_seed(seed: u32) -> Self {
-        Self { seq: 0, walk: Vec2::new(1.0, 0.0), rng: if seed == 0 { 0x9E37_79B9 } else { seed }, last: None }
+        let rng = if seed == 0 { 0x9E37_79B9 } else { seed };
+        Self { seq: 0, walk: Vec2::new(1.0, 0.0), rng, reflex: Reflex::with_seed(rng ^ 0x5BD1_E995), last: None }
     }
 
     /// Next aim error in [-AIM_ERROR_RAD, AIM_ERROR_RAD].
@@ -60,10 +119,11 @@ impl Bot for HonestBot {
             self.walk = Vec2::new(-self.walk.y, self.walk.x);
         }
         self.last = me;
+        let ready = self.reflex.nearest_ready(ctx);
         let (aim, shoot) = match nearest_enemy(ctx) {
             Some(e) => {
                 let bearing = unit_towards(my_pos(ctx).unwrap_or(Vec2::ZERO), e.pos);
-                (rotate(bearing, self.aim_error()), true)
+                (rotate(bearing, self.aim_error()), ready)
             }
             None => (self.walk, false),
         };
@@ -98,11 +158,17 @@ mod tests {
     fn aims_near_the_enemy_and_shoots() {
         let mut b = HonestBot::new();
         let snap = [state(1, Vec2::ZERO), state(2, Vec2::new(3.0, 4.0))];
-        // bearing to (3,4) is (0.6, 0.8); every shot lands within the error cone
+        // bearing to (3,4) is (0.6, 0.8); every aim lands within the error
+        // cone, and once the reaction delay has run out it fires every tick
         for tick in 1..=200 {
             let out = b.act(&BotCtx { tick, my_id: 1, token: 0, snapshot: &snap });
             if let ClientMsg::Input { shoot, aim, .. } = out[0] {
-                assert!(shoot);
+                if tick < 1 + REACT_MIN {
+                    assert!(!shoot, "tick {tick}: fired before reacting");
+                }
+                if tick > REACT_MAX {
+                    assert!(shoot, "tick {tick}: still holding fire");
+                }
                 assert!((aim.len() - 1.0).abs() < 1e-5);
                 let off = (aim.x * 0.6 + aim.y * 0.8).clamp(-1.0, 1.0).acos();
                 assert!(off <= AIM_ERROR_RAD + 1e-4, "tick {tick}: {off} rad off");
@@ -188,6 +254,94 @@ mod tests {
         let s1 = seq_of(&b.act(&BotCtx { tick: 1, my_id: 1, token: 0, snapshot: &snap })[0]);
         let s2 = seq_of(&b.act(&BotCtx { tick: 2, my_id: 1, token: 0, snapshot: &snap })[0]);
         assert!(s2 > s1);
+    }
+
+    fn shoots(b: &mut HonestBot, tick: u32, snap: &[PlayerState]) -> bool {
+        match b.act(&BotCtx { tick, my_id: 1, token: 0, snapshot: snap })[0] {
+            ClientMsg::Input { shoot, .. } => shoot,
+            _ => panic!("expected Input"),
+        }
+    }
+
+    /// The first tick it fires on an enemy that stays in sight from `from`.
+    fn first_shot(b: &mut HonestBot, from: u32, snap: &[PlayerState]) -> u32 {
+        (from..from + 100).find(|&t| shoots(b, t, snap)).expect("never fired")
+    }
+
+    /// Edge: every delay lands in [REACT_MIN, REACT_MAX], and over many
+    /// seeds both ends are drawn.
+    #[test]
+    fn reaction_delay_spans_its_range() {
+        let snap = [state(1, Vec2::ZERO), state(2, Vec2::new(5.0, 0.0))];
+        let delays: Vec<u32> =
+            (1..=300).map(|seed| first_shot(&mut HonestBot::with_seed(seed), 10, &snap) - 10).collect();
+        assert!(delays.iter().all(|d| (REACT_MIN..=REACT_MAX).contains(d)), "{delays:?}");
+        assert!(delays.contains(&REACT_MIN) && delays.contains(&REACT_MAX));
+    }
+
+    /// The reaction stream is separate: the aims a seed produces are the
+    /// ones it produced before reactions existed (same xorshift sequence).
+    #[test]
+    fn reactions_do_not_shift_the_aim_sequence() {
+        let snap = [state(1, Vec2::ZERO), state(2, Vec2::new(1.0, 0.0))];
+        let mut b = HonestBot::with_seed(42);
+        let mut rng = 42;
+        for tick in 1..=50 {
+            let want = rotate(Vec2::new(1.0, 0.0), jitter(&mut rng) * AIM_ERROR_RAD);
+            match b.act(&BotCtx { tick, my_id: 1, token: 0, snapshot: &snap })[0] {
+                ClientMsg::Input { aim, .. } => assert_eq!(aim, want, "tick {tick}"),
+                _ => panic!("expected Input"),
+            }
+        }
+    }
+
+    /// Out of sight for one snapshot is a new encounter: the delay starts again.
+    #[test]
+    fn an_enemy_that_leaves_sight_is_forgotten() {
+        let mut b = HonestBot::with_seed(3);
+        let both = [state(1, Vec2::ZERO), state(2, Vec2::new(5.0, 0.0))];
+        let alone = [state(1, Vec2::ZERO)];
+        first_shot(&mut b, 1, &both);
+        assert!(!shoots(&mut b, 40, &alone));
+        assert!(first_shot(&mut b, 41, &both) - 41 >= REACT_MIN);
+    }
+
+    /// A dead enemy (still in the snapshot) is forgotten; its respawn is new.
+    #[test]
+    fn an_enemy_that_dies_is_forgotten() {
+        let mut b = HonestBot::with_seed(3);
+        let both = [state(1, Vec2::ZERO), state(2, Vec2::new(5.0, 0.0))];
+        let dead = [state(1, Vec2::ZERO), PlayerState { alive: false, ..state(2, Vec2::new(5.0, 0.0)) }];
+        first_shot(&mut b, 1, &both);
+        assert!(!shoots(&mut b, 40, &dead));
+        assert!(first_shot(&mut b, 41, &both) - 41 >= REACT_MIN);
+    }
+
+    /// While it is dead it forgets everyone, so it does not fire the instant
+    /// it respawns on an enemy that never left sight.
+    #[test]
+    fn its_own_death_forgets_everyone() {
+        let mut b = HonestBot::with_seed(3);
+        let both = [state(1, Vec2::ZERO), state(2, Vec2::new(5.0, 0.0))];
+        let me_dead = [PlayerState { alive: false, ..state(1, Vec2::ZERO) }, state(2, Vec2::new(5.0, 0.0))];
+        first_shot(&mut b, 1, &both);
+        assert!(!shoots(&mut b, 40, &me_dead));
+        assert!(first_shot(&mut b, 41, &both) - 41 >= REACT_MIN);
+    }
+
+    /// A ready enemy that is not the nearest is not fired on: it waits for
+    /// the nearest one's delay, then fires at that one.
+    #[test]
+    fn holds_fire_until_the_nearest_is_ready() {
+        let mut b = HonestBot::with_seed(3);
+        let far = [state(1, Vec2::ZERO), state(3, Vec2::new(30.0, 0.0))];
+        let both = [state(1, Vec2::ZERO), state(2, Vec2::new(5.0, 0.0)), state(3, Vec2::new(30.0, 0.0))];
+        first_shot(&mut b, 1, &far);
+        // the far one is ready; a nearer one walks in
+        for t in 40..40 + REACT_MIN {
+            assert!(!shoots(&mut b, t, &both), "tick {t}: fired past the nearest");
+        }
+        assert!(first_shot(&mut b, 40 + REACT_MIN, &both) <= 40 + REACT_MAX);
     }
 
     fn seq_of(m: &ClientMsg) -> u32 {

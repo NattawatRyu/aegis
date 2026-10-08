@@ -33,7 +33,8 @@ use crate::guards::cookie::CookieJar;
 use crate::guards::session::{self, Session};
 use crate::guards::source_rate::SourceRate;
 use crate::guards::{ip_sessions, joined, packet, version};
-use crate::{ClientInput, GuardCtx, GuardVerdict, Pipeline, RejectReason, Sim, Wall};
+use crate::reaction::Reaction;
+use crate::{ClientInput, GuardCtx, GuardVerdict, Pipeline, RejectReason, Sim, Visibility, Wall};
 
 /// [`NetStats`] label for a legal join refused because all 255 ids are taken.
 pub const SERVER_FULL: &str = "server_full";
@@ -74,6 +75,18 @@ impl NetStats {
 
 pub struct Server {
     sim: Sim,
+    /// Line of sight on this tick's positions: from `begin_tick` until the
+    /// moves in `end_tick` (see [`Visibility`]).
+    vis: Visibility,
+    /// Players moved since `vis` was computed.
+    vis_stale: bool,
+    /// Who was alive when `vis` was computed — the world this tick's
+    /// snapshots show. Aim evidence is measured against it, not against
+    /// whoever is still alive by the shooter's turn ([`Server::end_tick`]).
+    /// A player admitted mid-tick is in no snapshot yet, so not in it.
+    shown: [bool; 256],
+    /// Engagements and firing streaks, for each shot's reaction time.
+    react: Reaction,
     pipe: Pipeline,
     tel: Telemetry,
     net: NetStats,
@@ -133,6 +146,10 @@ impl Server {
         assert!(!spawns.is_empty(), "a server needs at least one spawn point");
         Self {
             sim: Sim::with_walls(walls),
+            vis: Visibility::default(),
+            vis_stale: false,
+            shown: [false; 256],
+            react: Reaction::default(),
             pipe: Pipeline::standard(),
             tel: Telemetry::new(),
             net: NetStats::default(),
@@ -191,7 +208,26 @@ impl Server {
             }
         }
         self.sim.step_respawns();
+        self.vis.recompute(&self.sim);
+        self.vis_stale = false;
+        self.show();
+        self.react.observe(tick, &self.sim, &self.vis);
         self.sim.snapshot()
+    }
+
+    /// What player `id` is sent this tick: [`Sim::view`], answered from the
+    /// tick's shared [`Visibility`]. Call between `begin_tick` and `end_tick`.
+    pub fn view(&self, id: PlayerId) -> Vec<PlayerState> {
+        let v = self.vis.view(&self.sim, id);
+        // Oracle: the per-player ray-cast this replaced. Every debug run —
+        // each test, harness scenario and transport — checks it.
+        debug_assert_eq!(v, self.sim.view(id), "shared visibility diverged for player {id}");
+        v
+    }
+
+    /// The tick's line of sight, for whoever else reads it.
+    pub fn visibility(&self) -> &Visibility {
+        &self.vis
     }
 
     /// Receive one datagram (a token-framed `ClientMsg`) from `from`. An input
@@ -270,7 +306,20 @@ impl Server {
         self.sessions.insert(from, s);
         self.last_seen.insert(from, tick);
         self.sim.spawn(player_id, self.spawns[(player_id as usize - 1) % self.spawns.len()]);
+        // Mid-tick: it can shoot and be shot before the next recompute, but
+        // no snapshot has shown it, so it is no one's aim evidence yet.
+        self.vis.add(&self.sim, player_id);
+        self.shown[player_id as usize] = false;
+        self.react.joined(tick, &self.sim, &self.vis, player_id);
         Some(s)
+    }
+
+    /// Take `shown` from the world `vis` was just computed on.
+    fn show(&mut self) {
+        self.shown = [false; 256];
+        for p in self.sim.players().iter().filter(|p| p.alive) {
+            self.shown[p.id as usize] = true;
+        }
     }
 
     /// The first id in 1..=255 after `last_id` (wrapping) that nobody holds.
@@ -319,20 +368,44 @@ impl Server {
     /// moves. Every shot resolves; only shots that say something about aim are
     /// recorded — no enemy, or one point-blank, is no evidence either way
     /// (see [`Sim::aim_error`]).
+    ///
+    /// Shots resolve one at a time, so who they hit and kill depends on order.
+    /// The aim evidence does not: it is measured against the nearest enemy
+    /// the shooter's snapshot showed (`shown`), even one an earlier shot this
+    /// tick has killed. Measured against the living instead, a shooter whose
+    /// target fell first was scored against the next-nearest enemy — a
+    /// reaction of a tick or two and a wild aim error it never made.
     pub fn end_tick(&mut self, tick: u32) -> TickOutcome {
         let pending = std::mem::take(&mut self.pending);
         let mut out = TickOutcome::default();
+        // Two end_ticks with no begin_tick between (only tests do this).
+        if self.vis_stale {
+            self.vis.recompute(&self.sim);
+            self.show();
+            self.react.observe(tick, &self.sim, &self.vis);
+        }
         for &(p, input) in &pending {
             if !input.shoot {
                 continue;
             }
-            let err = self.sim.aim_error(p, input.aim);
+            // A dead player's trigger fires nothing, and starts no streak.
+            if self.sim.player(p).is_some_and(|s| s.alive) {
+                self.react.fired(tick, p);
+            }
+            let shown = |id: PlayerId| self.shown[id as usize];
+            let ev = self.sim.aim_evidence_in(&self.vis, p, input.aim, shown);
+            debug_assert_eq!(
+                ev.map(|(e, id)| (e.to_bits(), id)),
+                self.sim.aim_evidence(p, input.aim, shown).map(|(e, id)| (e.to_bits(), id)),
+                "shared visibility changed player {p}'s aim evidence"
+            );
             let r = self.sim.apply_shot(p, input.aim);
             if r.is_some_and(|r| r.killed) {
                 out.kills.push(p);
             }
-            if let Some(err) = err {
-                self.tel.shot(tick, p, r.is_some(), err);
+            if let Some((err, enemy)) = ev {
+                let react = self.react.engage(tick, p, enemy);
+                self.tel.shot(tick, p, r.is_some(), err, react);
             }
         }
         for &(p, input) in &pending {
@@ -342,6 +415,7 @@ impl Server {
                 out.steps.push((p, Vec2::new(a.x - b.x, a.y - b.y).len()));
             }
         }
+        self.vis_stale = !pending.is_empty();
         out
     }
 
@@ -439,6 +513,57 @@ mod tests {
         let t1 = admit(&mut s, addr(1));
         let t2 = admit(&mut s, addr(2));
         (s, t1, t2)
+    }
+
+    fn shots(s: &Server) -> Vec<(u8, bool, f32)> {
+        s.telemetry()
+            .records()
+            .iter()
+            .filter_map(|r| match r.outcome {
+                Outcome::Shot { hit, aim_err, .. } => Some((r.player, hit, aim_err)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Edge: a player admitted mid-tick, after `begin_tick` computed the
+    /// tick's visibility, is already a viewer and can be hit that tick
+    /// (`Visibility::add`). But this tick's snapshots went out without it, so
+    /// no shooter can have aimed at it: it is not the aim evidence, even
+    /// nearest. Player 1 aims at player 2, 20 away, the nearest it was shown;
+    /// scored against player 3 instead it would read 90° off.
+    /// (Until 2026-10-08 the joiner was the evidence, and this test said so.)
+    #[test]
+    fn a_mid_tick_join_is_seen_but_is_no_ones_evidence() {
+        let mut s = Server::new(vec![Vec2::ZERO, Vec2::new(0.0, 20.0), Vec2::new(10.0, 0.0)]);
+        let t1 = admit(&mut s, addr(1));
+        admit(&mut s, addr(2));
+        s.begin_tick(1);
+        let p3 = hs(&mut s, 1, addr(3)).expect("join").player_id;
+        assert!(s.view(1).iter().any(|p| p.id == p3), "new player missing from a view");
+        assert!(s.view(p3).iter().any(|p| p.id == 1), "new player sees nobody");
+        s.receive(1, addr(1), &input(t1, 1, Vec2::ZERO, Vec2::new(0.0, 1.0), true));
+        s.end_tick(1);
+        assert_eq!(shots(&s), vec![(1, true, 0.0)]);
+    }
+
+    /// Edge: `end_tick` twice with no `begin_tick` between must not read the
+    /// first tick's line of sight after the second's moves. Player 2 walks
+    /// out from behind a pillar; the second shot must see it.
+    #[test]
+    fn end_tick_after_moves_recomputes_line_of_sight() {
+        let wall = [Wall::new(Vec2::new(4.0, -1.0), Vec2::new(6.0, 1.0))];
+        let mut s = Server::with_walls(vec![Vec2::ZERO, Vec2::new(10.0, 0.0)], &wall);
+        let t1 = admit(&mut s, addr(1));
+        let t2 = admit(&mut s, addr(2));
+        s.begin_tick(1);
+        assert!(s.view(1).iter().all(|p| p.id != 2), "setup: 2 starts hidden");
+        s.receive(1, addr(2), &input(t2, 1, Vec2::new(0.0, 1.0), Vec2::new(1.0, 0.0), false));
+        s.end_tick(1); // 2 now at (10, 5): in the open
+        s.receive(1, addr(1), &input(t1, 1, Vec2::ZERO, Vec2::new(2.0, 1.0), true));
+        s.end_tick(1);
+        assert_eq!(shots(&s).len(), 1, "shot at a visible enemy recorded no evidence");
+        assert!(shots(&s)[0].2 < 1e-6, "aim error {:?}", shots(&s));
     }
 
     #[test]
@@ -807,7 +932,37 @@ mod tests {
         assert_eq!(s.sim().player(2).unwrap().health, MAX_HEALTH - SHOT_DAMAGE);
         assert_eq!(s.sim().player(2).unwrap().pos, Vec2::new(10.0, MOVE_SPEED));
         let shot = s.telemetry().records().iter().find(|r| matches!(r.outcome, Outcome::Shot { .. })).unwrap();
-        assert_eq!((shot.player, &shot.outcome), (1, &Outcome::Shot { hit: true, aim_err: 0.0 }));
+        assert_eq!((shot.player, &shot.outcome), (1, &Outcome::Shot { hit: true, aim_err: 0.0, react: Some(0) }));
+    }
+
+    /// Two players fire at the same target in one tick and the first kills
+    /// it. The second's aim is still judged against that target — the one
+    /// its snapshot showed as nearest — not the next-nearest enemy, who was
+    /// never what it aimed at.
+    #[test]
+    fn a_target_killed_earlier_in_the_tick_is_still_the_evidence() {
+        // 1 (A) and 3 (B) both have 2 (T) nearest; 4 (U) is B's next-nearest.
+        let mut s = Server::new(vec![Vec2::ZERO, Vec2::new(10.0, 0.0), Vec2::new(20.0, 0.0), Vec2::new(20.0, 15.0)]);
+        let (ta, _, tb, _) =
+            (admit(&mut s, addr(1)), admit(&mut s, addr(2)), admit(&mut s, addr(3)), admit(&mut s, addr(4)));
+        let last = (MAX_HEALTH / SHOT_DAMAGE) as u32;
+        for t in 1..=last {
+            s.begin_tick(t);
+            s.receive(t, addr(1), &input(ta, t, Vec2::ZERO, Vec2::new(1.0, 0.0), true));
+            if t == last {
+                s.receive(t, addr(3), &input(tb, t, Vec2::ZERO, Vec2::new(-1.0, 0.0), true));
+            }
+            s.end_tick(t);
+        }
+        assert!(!s.sim().player(2).unwrap().alive, "A's shot did not kill T first");
+        let b = s
+            .telemetry()
+            .records()
+            .iter()
+            .find(|r| r.player == 3 && matches!(r.outcome, Outcome::Shot { .. }))
+            .map(|r| r.outcome.clone());
+        // Measured against U it would read pi/2 off; T has been in B's sight since tick 1.
+        assert_eq!(b, Some(Outcome::Shot { hit: true, aim_err: 0.0, react: Some(last - 1) }));
     }
 
     #[test]

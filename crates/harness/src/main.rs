@@ -211,9 +211,12 @@ fn sweep(crowds: u32) {
             ("accuracy", col(&|p| ratio(p.life.hits, p.life.shots))),
             ("aim_exact", col(&|p| ratio(p.life.exact, p.life.shots))),
             ("anomaly_rate", col(&|p| ratio(p.life.anomalies, p.life.accepted))),
+            ("timed", col(&|p| p.life.timed as f32)),
+            ("reaction", col(&|p| ratio(p.life.fast, p.life.timed))),
             ("accuracy*", col(&|p| p.peak.accuracy)),
             ("aim_exact*", col(&|p| p.peak.aim_exact)),
             ("anomaly_rate*", col(&|p| p.peak.anomaly_rate)),
+            ("reaction*", col(&|p| p.peak.reaction)),
         ];
         let flagged = players.iter().filter(|p| !p.alerts.is_empty()).count();
 

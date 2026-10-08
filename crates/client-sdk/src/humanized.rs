@@ -6,8 +6,10 @@
 //! wider than the detector's EXACT_RAD, so aim_exact sees nothing.
 //!
 //! What it cannot hide is the outcome: the jitter is small next to a hitbox at
-//! fight range, so it still hits nearly every shot. The accuracy detector is
-//! what catches it — the reason the suite has two aim detectors, not one.
+//! fight range, so it still hits nearly every shot (~0.98). So does an honest
+//! rusher fighting point-blank, which is why accuracy left the standard suite
+//! (2026-10-08). What it still cannot hide is that it fires the tick it sees
+//! you — the reaction detector flags it for that.
 
 use super::{jitter, my_pos, nearest_enemy, rotate, unit_towards, Bot, BotCtx};
 use aegis_protocol::{ClientMsg, Vec2};

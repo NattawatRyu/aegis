@@ -42,8 +42,11 @@ impl Bot for BurstBot {
 
     fn act(&mut self, ctx: &BotCtx) -> Vec<ClientMsg> {
         let mut out = self.honest.act(ctx);
-        if (ON..OFF).contains(&ctx.tick) {
-            if let (Some(e), ClientMsg::Input { aim, .. }) = (nearest_enemy(ctx), &mut out[0]) {
+        if let (Some(e), ClientMsg::Input { aim, shoot, .. }) = (nearest_enemy(ctx), &mut out[0]) {
+            // A cheater: fires the instant it has a target, on or off. Only
+            // its aim is the honest hand while the aimbot is off.
+            *shoot = true;
+            if (ON..OFF).contains(&ctx.tick) {
                 *aim = unit_towards(my_pos(ctx).unwrap_or(Vec2::ZERO), e.pos);
             }
         }
@@ -60,13 +63,10 @@ mod tests {
         PlayerState { id, pos, health: 100, alive: true }
     }
 
-    fn aim_at(b: &mut BurstBot, tick: u32) -> Vec2 {
+    fn aim_at(b: &mut BurstBot, tick: u32) -> (Vec2, bool) {
         let snap = [state(1, Vec2::ZERO), state(2, Vec2::new(10.0, 0.0))];
         match b.act(&BotCtx { tick, my_id: 1, token: 0, snapshot: &snap })[0] {
-            ClientMsg::Input { aim, shoot, .. } => {
-                assert!(shoot);
-                aim
-            }
+            ClientMsg::Input { aim, shoot, .. } => (aim, shoot),
             _ => panic!("expected Input"),
         }
     }
@@ -76,8 +76,15 @@ mod tests {
     fn snaps_only_while_switched_on() {
         let mut b = BurstBot::new();
         for tick in [1, ON - 1, ON, OFF - 1, OFF, OFF + 30] {
-            let exact = aim_at(&mut b, tick) == Vec2::new(1.0, 0.0);
+            let exact = aim_at(&mut b, tick).0 == Vec2::new(1.0, 0.0);
             assert_eq!(exact, (ON..OFF).contains(&tick), "tick {tick}");
         }
+    }
+
+    /// No human reaction, on or off: it fires the first tick it sees a target.
+    #[test]
+    fn fires_instantly_on_or_off() {
+        assert!(aim_at(&mut BurstBot::new(), ON).1);
+        assert!(aim_at(&mut BurstBot::new(), 1).1);
     }
 }

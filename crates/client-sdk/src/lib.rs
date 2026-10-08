@@ -28,6 +28,7 @@ pub mod rusher;
 pub mod sniff;
 pub mod speedhack;
 pub mod spoof;
+pub mod triggerbot;
 pub mod zeroflood;
 
 /// What a bot sees before deciding this tick — the same information a real
@@ -123,12 +124,18 @@ pub fn nearest_enemy<'a>(ctx: &'a BotCtx) -> Option<&'a PlayerState> {
 /// Deterministic noise in [-1, 1] (xorshift32), so bots with "human" error
 /// still produce byte-identical runs. `state` must be non-zero.
 pub fn jitter(state: &mut u32) -> f32 {
+    xorshift(state) as f32 / u32::MAX as f32 * 2.0 - 1.0
+}
+
+/// The next xorshift32 value, also stored in `state`. `state` must be
+/// non-zero.
+pub fn xorshift(state: &mut u32) -> u32 {
     let mut x = *state;
     x ^= x << 13;
     x ^= x >> 17;
     x ^= x << 5;
     *state = x;
-    x as f32 / u32::MAX as f32 * 2.0 - 1.0
+    x
 }
 
 /// `v` rotated by `a` radians.

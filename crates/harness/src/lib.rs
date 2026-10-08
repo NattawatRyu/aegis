@@ -41,6 +41,7 @@ use aegis_client_sdk::{
     sniff::SniffBot,
     speedhack::SpeedhackBot,
     spoof::SpoofBot,
+    triggerbot::TriggerBot,
     zeroflood::ZeroFloodBot,
     Bot, BotCtx,
 };
@@ -75,11 +76,14 @@ pub struct Scenario {
 }
 
 impl Scenario {
-    /// One of every bot, 10 seconds at 30Hz.
+    /// One of every bot, 30 seconds at 30Hz — as long as an honest crowd
+    /// ([`CROWD_TICKS`]). 10 seconds was too short to judge reaction: an
+    /// instant bot wins its fights and keeps firing, so it opens only ~6
+    /// engagements from rest in 300 ticks, under `reaction::MIN_TIMED`.
     pub fn standard() -> Self {
         Self {
             name: "standard",
-            ticks: 300,
+            ticks: CROWD_TICKS,
             bots: vec![
                 Box::new(HonestBot::new()),
                 Box::new(SpeedhackBot::new()),
@@ -96,6 +100,7 @@ impl Scenario {
                 Box::new(EspBot::new()),
                 Box::new(ZeroFloodBot::new()),
                 Box::new(BurstBot::new()),
+                Box::new(TriggerBot::new()),
             ],
         }
     }
@@ -148,7 +153,7 @@ impl Scenario {
     /// scenario. Nobody here cheats, so any flag raised in it is a false
     /// positive.
     pub fn honest_crowd(seed: u32) -> Self {
-        Self::honest_crowd_of(seed, CROWD_SIZE)
+        Self { ticks: CROWD_TICKS, ..Self::honest_crowd_of(seed, CROWD_SIZE) }
     }
 
     /// [`Scenario::honest_crowd`] with `size` players — what [`scale`]
@@ -175,6 +180,15 @@ impl Scenario {
 /// head count, so the honest population is never measured in an emptier
 /// arena than the cheaters are.
 pub const CROWD_SIZE: u32 = 16;
+
+/// How long each [`Scenario::honest_crowd`] runs. Longer than the standard
+/// scenario because honest players take a human reaction before each first
+/// shot, lose more duels, and so fire less: at 300 ticks campers and rushers
+/// never reached accuracy's minimum samples, and "never flagged" meant
+/// "never judged". 900, not 600: at 600 the rushers had not yet reached
+/// the top of their hit-rate tail (0.934 vs 0.985 at 900) — a bound measured
+/// on matches shorter than real ones is a bound on the wrong population.
+pub const CROWD_TICKS: u32 = 900;
 
 impl Scenario {
     /// An honest player and one that sends to the origin's own address. Run
@@ -332,11 +346,15 @@ pub struct Peak {
     pub accuracy: f32,
     pub aim_exact: f32,
     pub anomaly_rate: f32,
+    pub reaction: f32,
 }
 
 impl Peak {
     fn raise(&mut self, s: &PlayerStats) {
-        use aegis_detector::detectors::{accuracy, aim_exact, anomaly_rate};
+        use aegis_detector::detectors::{accuracy, aim_exact, anomaly_rate, reaction};
+        if s.timed >= reaction::MIN_TIMED {
+            self.reaction = self.reaction.max(s.fast as f32 / s.timed as f32);
+        }
         if s.shots >= accuracy::MIN_SHOTS {
             self.accuracy = self.accuracy.max(s.hits as f32 / s.shots as f32);
         }
@@ -664,12 +682,11 @@ pub fn run(mut sc: Scenario) -> Report {
         // Each admitted address is sent its player's view, all taken before
         // any input this tick (as the UDP run sends them all first).
         let t = Instant::now();
-        let views: Vec<Vec<PlayerState>> = (0..n)
-            .map(|i| server.player_id(mem_addr(i, 0)).map(|p| server.sim().view(p)).unwrap_or_default())
-            .collect();
+        let views: Vec<Vec<PlayerState>> =
+            (0..n).map(|i| server.player_id(mem_addr(i, 0)).map(|p| server.view(p)).unwrap_or_default()).collect();
         c.views = t.elapsed();
         if let Some(p) = server.player_id(bystander) {
-            lab.bystander.rx += encode(&ServerMsg::Snapshot { tick, players: server.sim().view(p) }).len() as u64;
+            lab.bystander.rx += encode(&ServerMsg::Snapshot { tick, players: server.view(p) }).len() as u64;
         }
         let mut retry = Vec::new();
         // A tap has heard last tick's wire by now; this tick's is kept for
@@ -1128,8 +1145,8 @@ fn read_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aegis_client_sdk::{burst, flood, garbage, sniff, spoof, zeroflood};
-    use aegis_detector::detectors::{accuracy, aim_exact, anomaly_rate};
+    use aegis_client_sdk::{burst, flood, garbage, honest, sniff, spoof, zeroflood};
+    use aegis_detector::detectors::{aim_exact, anomaly_rate, reaction};
     use aegis_detector::monitor::WINDOW;
     use aegis_detector::{FlagReason, Suite};
     use aegis_server::guards::source_rate::MAX_PER_TICK;
@@ -1170,6 +1187,35 @@ mod tests {
         assert_eq!(b.totals.accepted, r.ticks);
         assert_eq!(b.totals.anomalies, 0);
         assert_eq!(b.totals.total_rejected(), 0);
+    }
+
+    /// The honest hand takes `REACT_MIN` ticks or more to fire on an enemy,
+    /// and the server's `react` must see that: every timed shot by an honest
+    /// player (walker, camper, rusher) in the standard scenario and in honest
+    /// crowds is at least `REACT_MIN`. A smaller one means the server timed
+    /// an encounter the bot did not — trace it, don't loosen this.
+    #[test]
+    fn honest_reactions_are_never_faster_than_the_hand() {
+        let mut timed = 0;
+        let runs = [standard(), run(Scenario::honest_crowd(1)), run(Scenario::honest_crowd(2))];
+        for r in &runs {
+            for b in r.bots.iter().filter(|b| matches!(b.name, "honest" | "camper" | "rusher")) {
+                let id = b.id.expect("honest players join");
+                for rec in r.telemetry.records().iter().filter(|rec| rec.player == id) {
+                    if let aegis_telemetry::Outcome::Shot { react: Some(k), .. } = rec.outcome {
+                        assert!(
+                            k >= honest::REACT_MIN,
+                            "{} {} id {id} tick {}: react {k}",
+                            r.scenario,
+                            b.name,
+                            rec.tick
+                        );
+                        timed += 1;
+                    }
+                }
+            }
+        }
+        assert!(timed > 0, "no honest shot was timed");
     }
 
     #[test]
@@ -1346,7 +1392,7 @@ mod tests {
     #[test]
     fn every_flag_fires() {
         let r = standard();
-        for reason in FlagReason::ALL {
+        for reason in FlagReason::STANDARD {
             assert!(r.bots.iter().any(|b| flagged(b).contains(&reason)), "{} never fired", reason.label());
         }
     }
@@ -1354,10 +1400,13 @@ mod tests {
     #[test]
     fn detector_names_each_cheat_and_nobody_else() {
         let r = standard();
-        assert_eq!(flagged(r.bot("aimbot")), vec![FlagReason::Accuracy, FlagReason::AimExact]);
+        assert_eq!(flagged(r.bot("aimbot")), vec![FlagReason::AimExact, FlagReason::Reaction]);
         assert_eq!(flagged(r.bot("speedhack")), vec![FlagReason::AnomalyRate]);
-        assert_eq!(flagged(r.bot("burst")), vec![FlagReason::AimExact]);
-        for b in r.bots.iter().filter(|b| !["aimbot", "humanized", "speedhack", "burst"].contains(&b.name)) {
+        assert_eq!(flagged(r.bot("burst")), vec![FlagReason::AimExact, FlagReason::Reaction]);
+        assert_eq!(flagged(r.bot("humanized")), vec![FlagReason::Reaction]);
+        assert_eq!(flagged(r.bot("triggerbot")), vec![FlagReason::Reaction]);
+        let cheats = ["aimbot", "speedhack", "burst", "humanized", "triggerbot"];
+        for b in r.bots.iter().filter(|b| !cheats.contains(&b.name)) {
             assert!(b.alerts.is_empty(), "{} flagged {:?}", b.name, b.alerts);
         }
     }
@@ -1381,30 +1430,65 @@ mod tests {
         assert!(esp.alerts.is_empty(), "esp flagged {:?}", esp.alerts);
     }
 
-    /// Why there are two aim detectors: jitter hides the humanized aimbot from
-    /// aim_exact, but not from accuracy. And no guard sees it at all.
+    /// Jitter hides the humanized aimbot from aim_exact, no guard sees it,
+    /// and its hit rate is no longer a flag, because an honest rusher's
+    /// reaches it too (accuracy left the suite 2026-10-08). What gives it
+    /// away is the trigger: it fires the tick it sees you.
     #[test]
-    fn humanized_aimbot_evades_aim_exact_but_not_accuracy() {
+    fn humanized_aimbot_is_caught_by_reaction() {
         let r = standard();
         let b = r.bot("humanized");
         assert_eq!(b.totals.total_rejected(), 0);
         assert_eq!(b.totals.anomalies, 0);
-        assert_eq!(flagged(b), vec![FlagReason::Accuracy]);
+        assert!(b.accuracy() > 0.9, "humanized hit {:.2}: the evidence is still there", b.accuracy());
+        assert_eq!(flagged(b), vec![FlagReason::Reaction]);
+    }
+
+    /// The triggerbot plays like an honest walker with one difference: no
+    /// reaction. Nothing rejects it and its aim is human, so reaction is the
+    /// only detector that can name it — and does. Every engagement it opens
+    /// is timed at 0. (Its target switches — busy, not slow — the server
+    /// leaves untimed.)
+    #[test]
+    fn triggerbot_is_caught_by_reaction_alone() {
+        let r = standard();
+        let b = r.bot("triggerbot");
+        let id = b.id.expect("triggerbot joined");
+        assert_eq!(b.totals.total_rejected(), 0);
+        assert_eq!(b.totals.anomalies, 0);
+        assert_eq!(flagged(b), vec![FlagReason::Reaction]);
+        let (mut shots, mut exact, mut instant) = (0, 0, 0);
+        for rec in r.telemetry.records().iter().filter(|rec| rec.player == id) {
+            if let aegis_telemetry::Outcome::Shot { aim_err, react, .. } = rec.outcome {
+                shots += 1;
+                exact += (aim_err < aim_exact::EXACT_RAD) as u32;
+                if let Some(k) = react {
+                    assert_eq!(k, 0, "tick {}: a triggerbot timed at {k}", rec.tick);
+                    instant += 1;
+                }
+            }
+        }
+        assert!(shots >= aim_exact::MIN_SHOTS, "only {shots} shots: aim_exact never judged it");
+        assert!((exact as f32) < aim_exact::THRESHOLD * shots as f32 / 2.0, "{exact} of {shots} exact");
+        assert!(instant >= reaction::MIN_TIMED, "only {instant} engagements opened at 0");
     }
 
     /// Why the online monitor has a window: the toggle cheater's snapped
-    /// shots, averaged over the whole match, stay under the line — offline v0
-    /// never flags it. The window does, while the burst is still on, on the
-    /// last WINDOW shots rather than the lifetime.
+    /// shots, averaged over the whole match, stay under the aim_exact line —
+    /// offline v0 never flags its aim. The window does, while the burst is
+    /// still on, on the last WINDOW shots rather than the lifetime. (Its
+    /// trigger is instant on or off, so reaction flags it either way; this
+    /// test is about aim.)
     #[test]
     fn burst_aimbot_escapes_the_match_average_but_not_the_window() {
         let r = standard();
         let b = r.bot("burst");
         let id = b.id.expect("burst joined");
         let v0 = Suite::standard().run(r.telemetry.records());
-        assert!(v0.iter().all(|f| f.player != id), "v0 flagged burst: {v0:?}");
-        assert_eq!(flagged(b), vec![FlagReason::AimExact]);
-        let a = &b.alerts[0];
+        let v0_aim = v0.iter().filter(|f| f.player == id && f.reason == FlagReason::AimExact).count();
+        assert_eq!(v0_aim, 0, "v0 flagged burst's aim: {v0:?}");
+        assert_eq!(flagged(b), vec![FlagReason::AimExact, FlagReason::Reaction]);
+        let a = b.alerts.iter().find(|a| a.flag.reason == FlagReason::AimExact).expect("aim_exact alert");
         assert_eq!(a.flag.samples as usize, WINDOW, "raised by the lifetime, not the window: {a:?}");
         assert!(
             (burst::ON..burst::OFF).contains(&a.tick),
@@ -1419,8 +1503,13 @@ mod tests {
     /// walkers, campers, rushers — each with its own aim seed), zero flags:
     /// offline over the whole run, and online at every record, lifetime and
     /// window. "No flags" must not just mean "no verdict": every player is
-    /// judged by aim_exact and anomaly_rate, enough of every style reach
-    /// accuracy's larger minimum, and enough outlast a window that it slid.
+    /// judged by anomaly_rate, most of every style by aim_exact and by
+    /// reaction, and enough outlast a window that it slid. (Accuracy is not in the suite; the
+    /// sweep's `accuracy*` still reports where it would land.)
+    ///
+    /// Not every player reaches aim_exact's minimum: with a human reaction,
+    /// a camper that keeps losing duels fires a few dozen shots in a match —
+    /// as one would in a real game, where it gets no verdict either.
     #[test]
     fn honest_population_is_never_flagged() {
         let players = honest_sweep(63);
@@ -1428,15 +1517,27 @@ mod tests {
         let suite = Suite::standard();
         for p in &players {
             let s = &p.life;
-            assert!(s.shots >= aim_exact::MIN_SHOTS, "player {} only {} shots: no verdict", s.player, s.shots);
             assert!(s.accepted >= anomaly_rate::MIN_INPUTS);
             let f = suite.check(s);
             assert!(f.is_empty(), "honest player {} flagged offline {:?}", s.player, f);
             assert!(p.alerts.is_empty(), "honest player {} flagged online {:?}", s.player, p.alerts);
         }
         for style in ["honest", "camper", "rusher"] {
-            let judged = players.iter().filter(|p| p.style == style && p.life.shots >= accuracy::MIN_SHOTS).count();
-            assert!(judged >= 50, "only {judged} {style}s reached accuracy's {} shots", accuracy::MIN_SHOTS);
+            let of_style = players.iter().filter(|p| p.style == style).count();
+            let judged = |min: u32| players.iter().filter(|p| p.style == style && p.life.shots >= min).count();
+            // 4 in 5. Campers, the fewest shots, measured 224 of 252 (2026-10-08).
+            let exact = judged(aim_exact::MIN_SHOTS);
+            assert!(
+                exact * 5 >= of_style * 4,
+                "only {exact} of {of_style} {style}s reached aim_exact's {} shots",
+                aim_exact::MIN_SHOTS
+            );
+            let timed = players.iter().filter(|p| p.style == style && p.life.timed >= reaction::MIN_TIMED).count();
+            assert!(
+                timed * 5 >= of_style * 4,
+                "only {timed} of {of_style} {style}s reached reaction's {} timed engagements",
+                reaction::MIN_TIMED
+            );
         }
         let slid = players.iter().filter(|p| p.life.shots as usize > WINDOW).count();
         assert!(slid >= 150, "only {slid} honest players outlasted a {WINDOW}-shot window");
@@ -1451,12 +1552,14 @@ mod tests {
 
     /// Why the honest population is a full arena of mixed styles: the esp bot,
     /// culled, is an honest rusher, and in the 15-player standard scenario it
-    /// is the honest player most likely to trip accuracy. It does not.
+    /// has the high honest hit rate of a player fighting point-blank. Nothing
+    /// flags it. (The rushers in the longer honest crowds carry the
+    /// false-positive bound now.)
     #[test]
     fn an_honest_rusher_in_a_full_arena_is_not_an_aimbot() {
         let r = standard();
         let esp = r.bot("esp");
-        assert!(esp.shots >= accuracy::MIN_SHOTS, "esp only {} shots: no accuracy verdict", esp.shots);
+        assert!(esp.shots > 0, "esp never fired");
         assert!(esp.accuracy() > 0.6, "esp hit {:.2}: no longer the high honest tail", esp.accuracy());
         assert!(esp.alerts.is_empty(), "esp flagged {:?}", esp.alerts);
     }

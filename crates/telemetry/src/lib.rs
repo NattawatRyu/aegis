@@ -34,7 +34,10 @@ pub enum Outcome {
     /// the angle in radians between the aim and the bearing to the nearest
     /// enemy, computed server-side from authoritative positions — the
     /// detector's view of *how* the player aims, not just whether it hit.
-    Shot { hit: bool, aim_err: f32 },
+    /// `react`: ticks from that enemy coming into sight to this shot, on the
+    /// first shot of an engagement only, and not when the player was already
+    /// firing before the enemy appeared (prefire). `None` otherwise.
+    Shot { hit: bool, aim_err: f32, react: Option<u32> },
     /// The player's session ended (idle timeout). Its id may be issued to
     /// someone else later, so records after this one are a different person:
     /// anything that aggregates per id must start over here.
@@ -76,8 +79,8 @@ impl Telemetry {
         self.records.push(Record { tick, player, outcome: Outcome::Rejected { reason } });
     }
 
-    pub fn shot(&mut self, tick: u32, player: u8, hit: bool, aim_err: f32) {
-        self.records.push(Record { tick, player, outcome: Outcome::Shot { hit, aim_err } });
+    pub fn shot(&mut self, tick: u32, player: u8, hit: bool, aim_err: f32, react: Option<u32>) {
+        self.records.push(Record { tick, player, outcome: Outcome::Shot { hit, aim_err, react } });
     }
 
     pub fn left(&mut self, tick: u32, player: u8) {
@@ -156,8 +159,8 @@ mod tests {
         t.reject(1, 2, "rate_exceeded");
         t.reject(2, 2, "replay");
         t.reject(2, 3, "rate_exceeded");
-        t.shot(3, 1, false, 0.1);
-        t.shot(3, 2, true, 0.0);
+        t.shot(3, 1, false, 0.1, None);
+        t.shot(3, 2, true, 0.0, None);
         t
     }
 
@@ -179,7 +182,7 @@ mod tests {
         // inflate the accepted count the rate/anomaly features divide by.
         let mut t = Telemetry::new();
         t.accept(1, 1, false);
-        t.shot(1, 1, true, 0.0);
+        t.shot(1, 1, true, 0.0, None);
         let p = t.per_player(1);
         assert_eq!((p.accepted, p.shots, p.hits), (1, 1, 1));
     }

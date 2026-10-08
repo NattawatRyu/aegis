@@ -7,7 +7,7 @@
 //! Same layout as the server's `guards/`: each detector lives in its own file
 //! under [`detectors`] and owns exactly one signal. To add one, create
 //! `detectors/<name>.rs`, implement [`Detector`], add a [`FlagReason`] variant
-//! (and to `ALL`), and add one line to [`Suite::standard`].
+//! (and to `STANDARD`), and add one line to [`Suite::standard`].
 //!
 //! Reads telemetry [`Record`]s only — never the server crate — so the server
 //! never has to know what the detector looks for. Thresholds are measured, not
@@ -42,6 +42,11 @@ pub struct PlayerStats {
     /// Shots whose aim landed within `aim_exact::EXACT_RAD` of the bearing to
     /// the nearest enemy.
     pub exact: u32,
+    /// Shots the server timed (`Shot::react` is `Some`): the first shot of a
+    /// run of firing at an enemy just come into sight.
+    pub timed: u32,
+    /// Timed shots no slower than `reaction::FAST_TICKS`.
+    pub fast: u32,
 }
 
 impl PlayerStats {
@@ -57,10 +62,12 @@ impl PlayerStats {
                 self.accepted += 1;
                 self.anomalies += anomaly as u32;
             }
-            Outcome::Shot { hit, aim_err } => {
+            Outcome::Shot { hit, aim_err, react } => {
                 self.shots += 1;
                 self.hits += hit as u32;
                 self.exact += detectors::aim_exact::is_exact(aim_err) as u32;
+                self.timed += react.is_some() as u32;
+                self.fast += react.is_some_and(detectors::reaction::is_fast) as u32;
             }
             Outcome::Rejected { .. } | Outcome::Left => {}
         }
@@ -86,17 +93,20 @@ pub enum FlagReason {
     Accuracy,
     AimExact,
     AnomalyRate,
+    Reaction,
 }
 
 impl FlagReason {
-    /// Every reason, for coverage checks ("does some bot trip each detector?").
-    pub const ALL: [FlagReason; 3] = [FlagReason::Accuracy, FlagReason::AimExact, FlagReason::AnomalyRate];
+    /// Every reason [`Suite::standard`] can raise, for coverage checks ("does
+    /// some bot trip each detector?"). Not `Accuracy`: see [`Suite::standard`].
+    pub const STANDARD: [FlagReason; 3] = [FlagReason::AimExact, FlagReason::AnomalyRate, FlagReason::Reaction];
 
     pub fn label(self) -> &'static str {
         match self {
             FlagReason::Accuracy => "accuracy",
             FlagReason::AimExact => "aim_exact",
             FlagReason::AnomalyRate => "anomaly_rate",
+            FlagReason::Reaction => "reaction",
         }
     }
 }
@@ -124,16 +134,28 @@ pub struct Suite {
 }
 
 impl Suite {
-    /// Every detector, in report order. This list IS the documentation of what
-    /// the detector looks for.
+    /// Every detector that raises flags, in report order. This list IS the
+    /// documentation of what the detector looks for.
+    ///
+    /// Not accuracy (2026-10-08). Once honest players react like people, an
+    /// honest rusher closes in during its reaction and fires point-blank: at
+    /// 900-tick crowds its online peak reached 0.985, above the humanized
+    /// aimbot's 0.98. No line separates them, so accuracy stays as evidence
+    /// (`detectors::accuracy`, the harness sweep's `accuracy*`) until it is
+    /// normalised by range. The humanized aimbot it caught is caught by
+    /// reaction instead.
     pub fn standard() -> Self {
-        Self {
-            detectors: vec![
-                Box::new(detectors::accuracy::AccuracyDetector),
-                Box::new(detectors::aim_exact::AimExactDetector),
-                Box::new(detectors::anomaly_rate::AnomalyRateDetector),
-            ],
-        }
+        Self::new(vec![
+            Box::new(detectors::aim_exact::AimExactDetector),
+            Box::new(detectors::anomaly_rate::AnomalyRateDetector),
+            Box::new(detectors::reaction::ReactionDetector),
+        ])
+    }
+
+    /// A suite of exactly these detectors — for tests and experiments with a
+    /// detector the standard suite leaves out.
+    pub fn new(detectors: Vec<Box<dyn Detector>>) -> Self {
+        Self { detectors }
     }
 
     pub fn check(&self, s: &PlayerStats) -> Vec<Flag> {
@@ -157,8 +179,8 @@ mod tests {
         t.accept(1, 1, false);
         t.accept(2, 1, true);
         t.reject(2, 1, "replay");
-        t.shot(2, 1, true, 0.0);
-        t.shot(3, 1, false, 0.2);
+        t.shot(2, 1, true, 0.0, None);
+        t.shot(3, 1, false, 0.2, None);
         t.accept(1, 2, false);
         let m = stats(t.records());
         let p1 = &m[&1];
@@ -169,9 +191,9 @@ mod tests {
     #[test]
     fn every_reason_has_a_detector_in_the_suite() {
         let s = Suite::standard();
-        for r in FlagReason::ALL {
+        for r in FlagReason::STANDARD {
             assert!(s.detectors.iter().any(|d| d.reason() == r), "{} has no detector", r.label());
         }
-        assert_eq!(s.detectors.len(), FlagReason::ALL.len());
+        assert_eq!(s.detectors.len(), FlagReason::STANDARD.len());
     }
 }

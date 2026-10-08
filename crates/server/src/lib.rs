@@ -13,8 +13,10 @@
 pub mod cull;
 pub mod guards;
 pub mod net;
+pub mod reaction;
 pub mod server;
 pub mod sim;
+pub mod visibility;
 
 pub use cull::{Cull, MAX_MARGIN_TICKS};
 pub use guards::session::Session;
@@ -22,6 +24,7 @@ pub use guards::{ClientInput, GuardCtx, GuardVerdict, Pipeline, RejectReason};
 pub use net::NetServer;
 pub use server::{NetStats, Reply, Server, TickOutcome};
 pub use sim::{ShotResult, Sim, Wall, ARENA_WALLS};
+pub use visibility::Visibility;
 
 #[cfg(test)]
 mod integration {

@@ -64,8 +64,8 @@ mod tests {
         let snap = [state(1, Vec2::ZERO), state(2, Vec2::new(0.0, -10.0)), state(3, Vec2::new(30.0, 0.0))];
         let (move_dir, aim, shoot) = input(&mut RusherBot::with_seed(7), &snap);
         assert_eq!(move_dir, Vec2::new(0.0, -1.0));
-        assert!(shoot);
-        assert_eq!(aim, input(&mut HonestBot::with_seed(7), &snap).1);
+        let (_, h_aim, h_shoot) = input(&mut HonestBot::with_seed(7), &snap);
+        assert_eq!((aim, shoot), (h_aim, h_shoot));
     }
 
     /// Nobody in sight: it walks like the honest bot instead of standing.

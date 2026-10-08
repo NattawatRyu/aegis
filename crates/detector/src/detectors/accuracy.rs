@@ -5,12 +5,15 @@
 //!          just above -> flag
 //!
 //! The blunt instrument: no human hits almost everything. It cannot tell a
-//! great player from a subtle aimbot near the line — that is aim_exact's job,
-//! and why the threshold sits well above the best honest run (see THRESHOLD).
+//! great player from a subtle aimbot near the line — that is aim_exact's job.
+//! The threshold sits just above the best honest run, not well above it (see
+//! THRESHOLD).
 //!
 //! Weakest of the three signals, because hit rate is not only aim: range and
-//! a still target matter as much. An honest rusher in a full arena hits more
-//! than 0.8 of 30 shots; only a larger sample separates it from an aimbot.
+//! a still target matter as much. **Not in `Suite::standard` since 2026-10-08:**
+//! with a human reaction an honest rusher closes in and fires point-blank,
+//! and at 900-tick crowds it peaked at 0.985 — above the humanized aimbot.
+//! Kept as evidence, and to come back once hit rate is normalised by range.
 
 use crate::{Detector, Flag, FlagReason, PlayerStats};
 
@@ -26,14 +29,20 @@ pub const MIN_SHOTS: u32 = 60;
 /// Flag strictly above this hit rate.
 ///
 /// Measured on the same crowd, over every view the online monitor judges
-/// (running lifetime and window, from MIN_SHOTS): honest max 0.700; the esp
-/// bot (an honest rusher, culled) 0.778 in the standard scenario. Humanized
-/// aimbot 0.968, snap aimbot 0.992. The line splits the 0.778-0.968 gap.
-/// History: 0.8 at MIN 30, set 2026-10-02 from 4-player walker lobbies (max
-/// 0.231), was wrong for a full arena — an honest whole-run rate reached
-/// 0.865 there. Re-measure on real telemetry before trusting it on a live
-/// game.
-pub const THRESHOLD: f32 = 0.85;
+/// (running lifetime and window, from MIN_SHOTS), with honest players taking
+/// a 6-12 tick reaction (C6.3, 2026-10-08, 600-tick crowds): honest max
+/// 0.934 — rushers keep closing during the reaction and fire their first
+/// shots point-blank. Humanized and snap aimbot both 0.98 in the standard
+/// scenario. A thin margin, and it broke the same day: at 900-tick crowds
+/// 17 honest rushers peaked above it (max 0.985), so the user dropped
+/// accuracy from the standard suite rather than raise the line past the
+/// cheaters it was meant to catch.
+/// History: 0.8 at MIN 30 (2026-10-02, 4-player walker lobbies) was wrong
+/// for a full arena; 0.85 (2026-10-05, honest max 0.700) was wrong once
+/// honest players reacted like people; 0.95 was wrong once they played long
+/// enough to reach their tail. Re-measure on real telemetry before trusting
+/// any line on a live game.
+pub const THRESHOLD: f32 = 0.95;
 
 pub struct AccuracyDetector;
 

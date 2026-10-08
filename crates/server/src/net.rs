@@ -278,7 +278,7 @@ impl NetServer {
         let server = &self.server;
         self.sids.retain(|a, _| server.player_id(*a).is_some());
         for (to, id) in self.server.peers() {
-            let snap = encode(&ServerMsg::Snapshot { tick: self.tick, players: self.server.sim().view(id) });
+            let snap = encode(&ServerMsg::Snapshot { tick: self.tick, players: self.server.view(id) });
             self.send(to, self.sids.get(&to), &snap);
         }
         Ok(())

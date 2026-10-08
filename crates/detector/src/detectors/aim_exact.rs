@@ -11,7 +11,8 @@
 //! shot and implausible for most of them.
 //!
 //! Blind spot, by design: an aimbot that adds jitter wider than EXACT_RAD
-//! escapes this detector entirely. The accuracy detector is what catches it.
+//! escapes this detector entirely. The reaction detector catches it instead,
+//! by its trigger (accuracy, which used to, was dropped 2026-10-08).
 
 use crate::{Detector, Flag, FlagReason, PlayerStats};
 
@@ -73,7 +74,7 @@ mod tests {
     fn player(exact: usize, rest: usize, off: f32) -> PlayerStats {
         let mut s = PlayerStats::new(3);
         let shots = std::iter::repeat_n(0.0, exact).chain(std::iter::repeat_n(off, rest));
-        shots.for_each(|aim_err| s.record(&Outcome::Shot { hit: false, aim_err }));
+        shots.for_each(|aim_err| s.record(&Outcome::Shot { hit: false, aim_err, react: None }));
         s
     }
 

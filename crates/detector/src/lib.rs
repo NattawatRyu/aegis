@@ -47,6 +47,12 @@ pub struct PlayerStats {
     pub timed: u32,
     /// Timed shots no slower than `reaction::FAST_TICKS`.
     pub fast: u32,
+    /// `Glimpse` records: shots whose aim could be held against an enemy
+    /// only a newer snapshot than the claimed one had shown.
+    pub glimpsed: u32,
+    /// Glimpses that fit such an enemy and nothing shown
+    /// (`foresight::is_foreseen`).
+    pub foreseen: u32,
 }
 
 impl PlayerStats {
@@ -68,6 +74,10 @@ impl PlayerStats {
                 self.exact += detectors::aim_exact::is_exact(aim_err) as u32;
                 self.timed += react.is_some() as u32;
                 self.fast += react.is_some_and(detectors::reaction::is_fast) as u32;
+            }
+            Outcome::Glimpse { claimed, ahead } => {
+                self.glimpsed += 1;
+                self.foreseen += detectors::foresight::is_foreseen(claimed, ahead) as u32;
             }
             Outcome::Rejected { .. } | Outcome::Left => {}
         }
@@ -94,12 +104,14 @@ pub enum FlagReason {
     AimExact,
     AnomalyRate,
     Reaction,
+    Foresight,
 }
 
 impl FlagReason {
     /// Every reason [`Suite::standard`] can raise, for coverage checks ("does
     /// some bot trip each detector?"). Not `Accuracy`: see [`Suite::standard`].
-    pub const STANDARD: [FlagReason; 3] = [FlagReason::AimExact, FlagReason::AnomalyRate, FlagReason::Reaction];
+    pub const STANDARD: [FlagReason; 4] =
+        [FlagReason::AimExact, FlagReason::AnomalyRate, FlagReason::Reaction, FlagReason::Foresight];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -107,6 +119,7 @@ impl FlagReason {
             FlagReason::AimExact => "aim_exact",
             FlagReason::AnomalyRate => "anomaly_rate",
             FlagReason::Reaction => "reaction",
+            FlagReason::Foresight => "foresight",
         }
     }
 }
@@ -149,6 +162,7 @@ impl Suite {
             Box::new(detectors::aim_exact::AimExactDetector),
             Box::new(detectors::anomaly_rate::AnomalyRateDetector),
             Box::new(detectors::reaction::ReactionDetector),
+            Box::new(detectors::foresight::ForesightDetector),
         ])
     }
 

@@ -3,4 +3,5 @@
 pub mod accuracy;
 pub mod aim_exact;
 pub mod anomaly_rate;
+pub mod foresight;
 pub mod reaction;

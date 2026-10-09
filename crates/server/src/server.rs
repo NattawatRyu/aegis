@@ -35,7 +35,7 @@ use crate::guards::source_rate::SourceRate;
 use crate::guards::stale_tick::StaleTick;
 use crate::guards::tick_proof::TickProof;
 use crate::guards::{ip_sessions, joined, packet, version};
-use crate::history::History;
+use crate::history::{Glimpse, History};
 use crate::reaction::Reaction;
 use crate::{ClientInput, GuardCtx, GuardVerdict, Pipeline, RejectReason, Sim, Visibility, Wall};
 
@@ -59,6 +59,9 @@ pub struct TickOutcome {
     /// the picture its input claimed. A hit on someone it was not shown is
     /// a shot at an enemy it says it could not see.
     pub hits: Vec<(PlayerId, bool)>,
+    /// One entry per live shot whose aim can be held against an enemy only
+    /// a newer snapshot than the claimed one showed ([`History::glimpse`]).
+    pub glimpses: Vec<(PlayerId, Glimpse)>,
 }
 
 /// Datagrams dropped without a player to pin them on: rate-budget drops
@@ -432,6 +435,10 @@ impl Server {
                 self.react.fired(seen, p);
             }
             let ev = if live { self.history.aim_evidence(seen, p, input.aim) } else { None };
+            if let Some(g) = live.then(|| self.history.glimpse(seen, tick, p, input.aim)).flatten() {
+                self.tel.glimpse(tick, p, g.claimed.is_finite().then_some(g.claimed), g.ahead);
+                out.glimpses.push((p, g));
+            }
             // Oracle: on the snapshot of this very tick, the frame must agree
             // to the bit with the sim's own ray-cast over who it showed.
             if seen == tick && live {

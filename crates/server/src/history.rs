@@ -17,7 +17,7 @@
 
 use aegis_protocol::{PlayerId, Vec2};
 
-use crate::sim::{bearing_error, dist2, HIT_RADIUS};
+use crate::sim::{bearing_error, dist2, is_usable_aim, HIT_RADIUS};
 use crate::{Sim, Visibility};
 
 /// Ticks of shown worlds kept: 16 = 533 ms at 30 Hz. An input claiming an
@@ -139,6 +139,81 @@ impl History {
         }
         bearing_error(aim, me, f.pos[e as usize]).map(|err| (err, e))
     }
+
+    /// What the aim of a shot chosen on snapshot `seen` (and resolved on
+    /// `now`) says about enemies its picture did not show. `None` — nothing
+    /// to judge — unless some enemy the shooter had not been shown on any
+    /// kept tick up to `seen` came into its sight between `seen` and `now`.
+    ///
+    /// A client has seen nothing newer than the snapshot it claims, and
+    /// cannot extrapolate an enemy it has never been shown. An aim that fits
+    /// such an enemy better than every enemy in the claimed picture was
+    /// chosen on a newer snapshot than the one claimed (`StaleLiar`). An
+    /// enemy shown before `seen`, hidden there, is remembered, not foreseen:
+    /// it counts on neither side.
+    ///
+    /// `None` too if the claimed frame is gone, the shooter was not alive in
+    /// it, or the aim is degenerate.
+    pub fn glimpse(&self, seen: u32, now: u32, shooter: PlayerId, aim: Vec2) -> Option<Glimpse> {
+        let f = self.frame(seen)?;
+        if !f.alive[shooter as usize] || !is_usable_aim(aim) {
+            return None;
+        }
+        let me = f.pos[shooter as usize];
+        let mut claimed = f32::INFINITY;
+        for e in ids(&f.rows[shooter as usize]).filter(|&e| e != shooter) {
+            let to = f.pos[e as usize];
+            // Point-blank, any aim might be at it: it explains everything.
+            let err = if dist2(me, to) <= HIT_RADIUS * HIT_RADIUS { Some(0.0) } else { bearing_error(aim, me, to) };
+            claimed = claimed.min(err.unwrap_or(f32::INFINITY));
+        }
+        // Everyone shown to it on a kept tick up to `seen`, and itself.
+        let mut known: Row = [0; WORDS];
+        known[shooter as usize / 64] |= 1u64 << (shooter as usize % 64);
+        for t in seen.saturating_sub(HISTORY - 1)..=seen {
+            if let Some(g) = self.frame(t) {
+                for (k, r) in known.iter_mut().zip(g.rows[shooter as usize]) {
+                    *k |= r;
+                }
+            }
+        }
+        // Each enemy new to it, where it was on the first tick it was shown.
+        let mut ahead = f32::INFINITY;
+        for t in seen + 1..=now {
+            let Some(g) = self.frame(t) else { continue };
+            let row = g.rows[shooter as usize];
+            let new: Row = std::array::from_fn(|w| row[w] & !known[w]);
+            for (k, r) in known.iter_mut().zip(row) {
+                *k |= r;
+            }
+            let from = g.pos[shooter as usize];
+            for e in ids(&new) {
+                let to = g.pos[e as usize];
+                if dist2(from, to) > HIT_RADIUS * HIT_RADIUS {
+                    ahead = ahead.min(bearing_error(aim, from, to).unwrap_or(f32::INFINITY));
+                }
+            }
+        }
+        ahead.is_finite().then_some(Glimpse { claimed, ahead })
+    }
+}
+
+/// The ids in a sight row, ascending.
+fn ids(r: &Row) -> impl Iterator<Item = PlayerId> + '_ {
+    (0..=PlayerId::MAX).filter(move |&id| has(r, id))
+}
+
+/// A shot's aim against two pictures: the one its input claimed, and the
+/// enemies that only newer snapshots showed. See [`History::glimpse`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Glimpse {
+    /// Smallest bearing error to an enemy in the claimed picture, from where
+    /// they stood there; 0 if one was point-blank, infinite if none.
+    pub claimed: f32,
+    /// Smallest bearing error to an enemy first shown after the claimed
+    /// tick, measured on the tick it was first shown (point-blank ones are
+    /// not counted).
+    pub ahead: f32,
 }
 
 #[cfg(test)]
@@ -169,7 +244,7 @@ mod tests {
         }
         let (mut h, mut vis) = (History::default(), Visibility::default());
         let mut kept: Vec<Vec<PlayerState>> = vec![Vec::new()]; // index = tick
-        let (mut some, mut gone, mut dead_shooter) = (0, 0, 0);
+        let (mut some, mut gone, mut dead_shooter, mut open, mut near) = (0, 0, 0, 0, 0);
         for t in 1..=300u32 {
             sim.step_respawns();
             if next() % 15 == 0 {
@@ -194,11 +269,17 @@ mod tests {
                     gone += 1;
                     continue;
                 }
-                let mut w = Sim::with_walls(&ARENA_WALLS);
-                for p in kept[seen as usize].iter().filter(|p| p.alive) {
-                    w.spawn(p.id, p.pos);
-                }
+                let w = world(&kept, seen);
                 let want = w.aim_evidence(s, aim, |_| true);
+                let g = h.glimpse(seen, t, s, aim);
+                let naive = naive_glimpse(&kept, seen, t, s, aim);
+                assert_eq!(g.is_some(), naive.is_some(), "t={t}: glimpse of {s} on {seen}: {g:?} vs {naive:?}");
+                if let (Some(g), Some((c, a))) = (g, naive) {
+                    let close = |x: f32, y: f32| x == y || (x - y).abs() < 1e-4;
+                    assert!(close(g.claimed, c) && close(g.ahead, a), "t={t}: {s} on {seen}: {g:?} vs {c} {a}");
+                    open += 1;
+                    near += u32::from(g.ahead < 0.3);
+                }
                 assert_eq!(
                     got.map(|(e, id)| (e.to_bits(), id)),
                     want.map(|(e, id)| (e.to_bits(), id)),
@@ -222,5 +303,48 @@ mod tests {
             }
         }
         assert!(some > 1_000 && gone > 300 && dead_shooter > 50, "some {some}, gone {gone}, dead {dead_shooter}");
+        assert!(open > 200 && near > 20, "open {open}, near {near}");
+    }
+
+    /// The world of tick `t` rebuilt from its plain copy.
+    fn world(kept: &[Vec<PlayerState>], t: u32) -> Sim {
+        let mut w = Sim::with_walls(&ARENA_WALLS);
+        for p in kept[t as usize].iter().filter(|p| p.alive) {
+            w.spawn(p.id, p.pos);
+        }
+        w
+    }
+
+    /// [`History::glimpse`] the slow way, from rebuilt worlds, the sim's own
+    /// view and plain angles: (claimed, ahead).
+    fn naive_glimpse(kept: &[Vec<PlayerState>], seen: u32, now: u32, s: PlayerId, aim: Vec2) -> Option<(f32, f32)> {
+        use std::collections::BTreeSet;
+        use std::f32::consts::TAU;
+        let angle = |from: Vec2, to: Vec2| {
+            let d = ((to.y - from.y).atan2(to.x - from.x) - aim.y.atan2(aim.x)).rem_euclid(TAU);
+            d.min(TAU - d)
+        };
+        let blank = |a: Vec2, b: Vec2| (b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y) <= HIT_RADIUS * HIT_RADIUS;
+        let w = world(kept, seen);
+        let me = w.player(s)?.pos;
+        let mut claimed = f32::INFINITY;
+        for e in w.view(s).into_iter().filter(|p| p.id != s) {
+            claimed = claimed.min(if blank(me, e.pos) { 0.0 } else { angle(me, e.pos) });
+        }
+        let mut known = BTreeSet::from([s]);
+        for t in (now + 1).saturating_sub(HISTORY).max(1)..=seen {
+            known.extend(world(kept, t).view(s).iter().map(|p| p.id));
+        }
+        let mut ahead = f32::INFINITY;
+        for t in seen + 1..=now {
+            let w = world(kept, t);
+            let Some(from) = w.player(s).map(|p| p.pos) else { continue };
+            for e in w.view(s) {
+                if known.insert(e.id) && !blank(from, e.pos) {
+                    ahead = ahead.min(angle(from, e.pos));
+                }
+            }
+        }
+        ahead.is_finite().then_some((claimed, ahead))
     }
 }

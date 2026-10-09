@@ -24,8 +24,9 @@
 //! Known gaps:
 //!   - a client that claims a picture a few ticks older than it has (real,
 //!     proven, inside the history) turns instant shots into prefire and
-//!     escapes — pinned by `StaleLiar` in the harness; its tell is aim and
-//!     hits that fit a newer picture than the claimed one;
+//!     escapes this detector (`StaleLiar` in the harness) — it is
+//!     [`super::foresight`]'s to catch, by aim at enemies the claimed
+//!     picture never showed;
 //!   - on a lossy link a lost snapshot breaks a run of fire, so a run can
 //!     read as two (not measured: the lab does not drop);
 //!   - a cheater who sprays without pause (all prefire, nothing timed);

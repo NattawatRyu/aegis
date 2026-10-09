@@ -38,6 +38,15 @@ pub enum Outcome {
     /// first shot of an engagement only, and not when the player was already
     /// firing before the enemy appeared (prefire). `None` otherwise.
     Shot { hit: bool, aim_err: f32, react: Option<u32> },
+    /// A live shot whose aim can be held against an enemy that only a newer
+    /// snapshot than the one its input claimed had shown it. `ahead`: the
+    /// smallest angle in radians between the aim and such an enemy, on the
+    /// tick it was first shown. `claimed`: the smallest angle to any enemy
+    /// the claimed snapshot showed (`None` if it showed none). An aim that
+    /// fits the first and nothing in the second was chosen on a picture the
+    /// player says it did not have yet. Only written when a newer snapshot
+    /// exists to hold it against — never on a shot chosen on the current one.
+    Glimpse { claimed: Option<f32>, ahead: f32 },
     /// The player's session ended (idle timeout). Its id may be issued to
     /// someone else later, so records after this one are a different person:
     /// anything that aggregates per id must start over here.
@@ -83,6 +92,10 @@ impl Telemetry {
         self.records.push(Record { tick, player, outcome: Outcome::Shot { hit, aim_err, react } });
     }
 
+    pub fn glimpse(&mut self, tick: u32, player: u8, claimed: Option<f32>, ahead: f32) {
+        self.records.push(Record { tick, player, outcome: Outcome::Glimpse { claimed, ahead } });
+    }
+
     pub fn left(&mut self, tick: u32, player: u8) {
         self.records.push(Record { tick, player, outcome: Outcome::Left });
     }
@@ -126,7 +139,7 @@ impl Telemetry {
                     t.shots += 1;
                     t.hits += *hit as u32;
                 }
-                Outcome::Left => {}
+                Outcome::Glimpse { .. } | Outcome::Left => {}
             }
         }
         t
@@ -183,6 +196,7 @@ mod tests {
         let mut t = Telemetry::new();
         t.accept(1, 1, false);
         t.shot(1, 1, true, 0.0, None);
+        t.glimpse(1, 1, None, 0.1);
         let p = t.per_player(1);
         assert_eq!((p.accepted, p.shots, p.hits), (1, 1, 1));
     }

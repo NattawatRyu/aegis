@@ -85,7 +85,7 @@ pub struct ShotResult {
 /// An aim a direction can be taken from: finite and non-zero length. A zero,
 /// NaN or infinite aim fires nothing and says nothing (the sanity guard should
 /// already have rejected NaN/inf; this is the sim not relying on that).
-fn is_usable_aim(aim: Vec2) -> bool {
+pub(crate) fn is_usable_aim(aim: Vec2) -> bool {
     let l = aim.len();
     l.is_finite() && l > 0.0
 }

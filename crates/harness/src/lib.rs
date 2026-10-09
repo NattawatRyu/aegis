@@ -58,6 +58,7 @@ fn unix_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 use aegis_relay::{Clock, Relay, RelayStats};
+use aegis_server::history::Glimpse;
 use aegis_server::net::MAX_DATAGRAM;
 use aegis_server::{NetServer, NetStats, Reply, Server, Session, Sim, TickOutcome, ARENA_WALLS};
 use aegis_telemetry::{Telemetry, Totals};
@@ -292,6 +293,9 @@ pub struct BotReport {
     /// the picture its input claimed did not show it (`TickOutcome::hits`).
     pub struck: u32,
     pub blind: u32,
+    /// Its shots whose aim could be held against an enemy only a newer
+    /// snapshot than the claimed one showed (`TickOutcome::glimpses`).
+    pub glimpses: Vec<Glimpse>,
     /// Largest distance moved in a single tick. The sim's movement authority
     /// holds iff this never exceeds `MOVE_SPEED` for any bot.
     pub max_step: f32,
@@ -625,6 +629,7 @@ struct Lab {
     kills: Vec<u32>,
     struck: Vec<u32>,
     blind: Vec<u32>,
+    glimpses: Vec<Vec<Glimpse>>,
     max_step: Vec<f32>,
     hidden: Vec<u32>,
     walled: Vec<u32>,
@@ -638,6 +643,7 @@ impl Lab {
             kills: vec![0; n],
             struck: vec![0; n],
             blind: vec![0; n],
+            glimpses: vec![Vec::new(); n],
             max_step: vec![0.0; n],
             hidden: vec![0; n],
             walled: vec![0; n],
@@ -685,9 +691,14 @@ impl Lab {
             self.struck[s] += 1;
             self.blind[s] += u32::from(!shown);
         }
+        for (p, g) in out.glimpses {
+            let s = self.slot(p);
+            self.glimpses[s].push(g);
+        }
     }
 
-    fn report(self, sc: &Scenario, tel: Telemetry, net: NetStats) -> Report {
+    fn report(mut self, sc: &Scenario, tel: Telemetry, net: NetStats) -> Report {
+        let mut glimpses = std::mem::take(&mut self.glimpses);
         let alerts = Monitor::standard().run(tel.records());
         let bots = sc
             .bots
@@ -706,6 +717,7 @@ impl Lab {
                     kills: self.kills[i],
                     struck: self.struck[i],
                     blind: self.blind[i],
+                    glimpses: std::mem::take(&mut glimpses[i]),
                     max_step: self.max_step[i],
                     hidden: self.hidden[i],
                     walled: self.walled[i],
@@ -1585,26 +1597,33 @@ mod tests {
         assert!(all.iter().filter(|p| p.life.timed >= reaction::MIN_TIMED).count() * 5 >= all.len() * 4);
     }
 
-    /// KNOWN GAP, pinned (C6.7): a client may claim a snapshot up to the
-    /// history old, and an older picture it did get is real — so a
-    /// triggerbot that claims to be a few ticks laggier than it is turns
-    /// each instant shot into prefire, and holds fire a moment after each
-    /// respawn so that engagement reads human. The reaction detector judges
-    /// it and flags nothing. What would catch it: its aim and hits fit a
-    /// newer picture than the one it claims (proposed C6.8). This test is
-    /// meant to go red then.
+    /// A client may claim a snapshot up to the history old, and an older
+    /// picture it did get is real — so a triggerbot that claims to be a few
+    /// ticks laggier than it is turns each instant shot into prefire, and
+    /// holds fire a moment after each respawn so that engagement reads
+    /// human. Reaction still judges it and flags nothing (C6.7's pinned
+    /// gap). What gives it away (C6.8): it aims at enemies its claimed
+    /// picture never showed it — foresight — and nobody honest does, at any
+    /// round trip.
     #[test]
-    fn a_triggerbot_claiming_to_be_laggier_escapes_reaction() {
-        let r = run(Scenario::stale_mix(0, 0));
+    fn a_triggerbot_claiming_to_be_laggier_escapes_reaction_not_foresight() {
         let liars = ["stale1", "stale2", "stale3", "stale6"];
-        let judged = liars.iter().filter(|n| r.bot(n).totals.shots > 0).count();
-        assert_eq!(judged, 4);
-        for n in liars {
-            assert!(!flagged(r.bot(n)).contains(&FlagReason::Reaction), "{n} was caught");
+        for rtt in [0, 6] {
+            let r = run(Scenario::stale_mix(0, rtt));
+            for n in liars {
+                let f = flagged(r.bot(n));
+                assert!(!f.contains(&FlagReason::Reaction), "rtt {rtt}: {n} was timed fast");
+                assert!(f.contains(&FlagReason::Foresight), "rtt {rtt}: {n} foresaw nothing");
+            }
+            for b in r.bots.iter().filter(|b| !liars.contains(&b.name)) {
+                assert!(b.alerts.is_empty(), "rtt {rtt}: {} flagged {:?}", b.name, b.alerts);
+            }
+            if rtt == 0 {
+                let timed: Vec<u32> = liars.iter().flat_map(|n| reactions(&r)[n].clone()).collect();
+                let slow = timed.iter().filter(|&&k| !reaction::is_fast(k)).count();
+                assert!(timed.len() >= 4 * reaction::MIN_TIMED as usize / 2 && slow * 2 > timed.len(), "{timed:?}");
+            }
         }
-        let timed: Vec<u32> = liars.iter().flat_map(|n| reactions(&r)[n].clone()).collect();
-        let slow = timed.iter().filter(|&&k| !reaction::is_fast(k)).count();
-        assert!(timed.len() >= 4 * reaction::MIN_TIMED as usize / 2 && slow * 2 > timed.len(), "{timed:?}");
     }
 
     /// The headline: the aimbot trips nothing, yet out-aims the honest player.
@@ -1630,12 +1649,15 @@ mod tests {
     }
 
     /// Coverage, pillar C: every detector is tripped by some bot. A detector
-    /// no bot trips is a detector nobody has seen fire.
+    /// no bot trips is a detector nobody has seen fire. Foresight needs a
+    /// client that claims an older snapshot, which the standard scenario
+    /// (everyone claims the newest) has none of: `stale_mix` brings them.
     #[test]
     fn every_flag_fires() {
-        let r = standard();
+        let (r, s) = (standard(), run(Scenario::stale_mix(0, 0)));
+        let bots = || r.bots.iter().chain(&s.bots);
         for reason in FlagReason::STANDARD {
-            assert!(r.bots.iter().any(|b| flagged(b).contains(&reason)), "{} never fired", reason.label());
+            assert!(bots().any(|b| flagged(b).contains(&reason)), "{} never fired", reason.label());
         }
     }
 

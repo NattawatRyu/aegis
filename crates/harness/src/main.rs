@@ -19,6 +19,12 @@
 //! every round trip 0..=max_rtt and prints, per kind of player, how its
 //! timed reactions read and how often the reaction detector flagged it.
 //!
+//! `aegis-harness foresight [seeds] [max_rtt]` runs both mixes and prints,
+//! per kind of player, how many of its shots could be held against an enemy
+//! only a newer snapshot showed, and how many fit such an enemy under four
+//! (window, clear) rules — the measurement `foresight::MIN_FORESEEN` and its
+//! radii are set from.
+//!
 //! `aegis-harness cull [lobbies] [max_lag]` replays honest lobbies and prints,
 //! per culling margin, what it leaks and how late a lagging client sees an
 //! enemy — the measurement `MAX_MARGIN_TICKS` is set from.
@@ -46,6 +52,11 @@ fn main() -> std::io::Result<()> {
         let seeds = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8);
         let stale = args.get(4).map(String::as_str) == Some("stale");
         lag(seeds, args.get(3).and_then(|s| s.parse().ok()).unwrap_or(6), stale);
+        return Ok(());
+    }
+    if args.get(1).map(String::as_str) == Some("foresight") {
+        let seeds = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8);
+        foresight(seeds, args.get(3).and_then(|s| s.parse().ok()).unwrap_or(6));
         return Ok(());
     }
     if args.get(1).map(String::as_str) == Some("cull") {
@@ -223,6 +234,7 @@ fn lag(seeds: u32, max_rtt: u32, stale: bool) {
         shots: u32,
         exact: u32,
         aim_exact: u32,
+        foresight: u32,
         struck: u32,
         blind: u32,
         any: u32,
@@ -236,7 +248,7 @@ fn lag(seeds: u32, max_rtt: u32, stale: bool) {
     println!("react = ticks from the snapshot first showing the enemy to the shot it chose on that picture");
     println!("judged = players with reaction's MIN_TIMED timed engagements; flag columns = players flagged\n");
     println!(
-        "{:>3} {:<10} {:>7} {:>6} {:>6} {:>4} {:>4} {:>6} {:>8} {:>7} {:>9} {:>4} {:>7}",
+        "{:>3} {:<10} {:>7} {:>6} {:>6} {:>4} {:>4} {:>6} {:>8} {:>7} {:>9} {:>9} {:>4} {:>7}",
         "rtt",
         "player",
         "players",
@@ -248,6 +260,7 @@ fn lag(seeds: u32, max_rtt: u32, stale: bool) {
         "reaction",
         "exact%",
         "aim_exact",
+        "foresight",
         "any",
         "blind%"
     );
@@ -272,6 +285,7 @@ fn lag(seeds: u32, max_rtt: u32, stale: bool) {
                 let flagged = |why| b.alerts.iter().any(|a| a.flag.reason == why);
                 row.reaction += u32::from(flagged(FlagReason::Reaction));
                 row.aim_exact += u32::from(flagged(FlagReason::AimExact));
+                row.foresight += u32::from(flagged(FlagReason::Foresight));
                 row.any += u32::from(!b.alerts.is_empty());
                 row.struck += b.struck;
                 row.blind += b.blind;
@@ -283,7 +297,7 @@ fn lag(seeds: u32, max_rtt: u32, stale: bool) {
             let q = |p: f32| row.reacts.get(((n.max(1) - 1) as f32 * p).round() as usize).copied().unwrap_or(0);
             let fast = row.reacts.iter().filter(|&&k| is_fast(k)).count();
             println!(
-                "{:>3} {:<10} {:>7} {:>6} {:>5.0}% {:>4} {:>4} {:>6} {:>8} {:>6.0}% {:>9} {:>4} {:>6.1}%",
+                "{:>3} {:<10} {:>7} {:>6} {:>5.0}% {:>4} {:>4} {:>6} {:>8} {:>6.0}% {:>9} {:>9} {:>4} {:>6.1}%",
                 rtt,
                 name,
                 row.players,
@@ -295,9 +309,60 @@ fn lag(seeds: u32, max_rtt: u32, stale: bool) {
                 row.reaction,
                 100.0 * row.exact as f32 / row.shots.max(1) as f32,
                 row.aim_exact,
+                row.foresight,
                 row.any,
                 100.0 * row.blind as f32 / row.struck.max(1) as f32
             );
+        }
+        println!();
+    }
+}
+
+fn foresight(seeds: u32, max_rtt: u32) {
+    use aegis_server::history::Glimpse;
+    use std::collections::BTreeMap;
+
+    /// (window, clear) in radians. 0.15 = the honest hand's widest error.
+    const GRID: [(f32, f32); 4] = [(0.15, 0.2), (0.15, 0.3), (0.30, 0.3), (0.30, 0.5)];
+
+    println!("lag_mix + stale_mix crowds: {seeds} each per round trip, {} ticks", aegis_harness::CROWD_TICKS);
+    println!("open = shots whose aim can be held against an enemy only a newer snapshot showed");
+    println!("per (window w, clear c): pooled ahead% of open shots, and [fewest-most] ahead shots per player\n");
+    print!("{:>3} {:<10} {:>7} {:>6} {:>9}", "rtt", "player", "players", "open", "open/pl");
+    for (w, m) in GRID {
+        print!(" {:>20}", format!("w{w:.2} c{m:.2}"));
+    }
+    println!();
+    for rtt in 0..=max_rtt {
+        let mut rows: BTreeMap<&str, Vec<Vec<Glimpse>>> = BTreeMap::new();
+        for seed in 0..seeds {
+            for sc in [Scenario::lag_mix(seed, rtt), Scenario::stale_mix(seed, rtt)] {
+                for b in run(sc).bots.into_iter().filter(|b| b.id.is_some()) {
+                    rows.entry(b.name).or_default().push(b.glimpses);
+                }
+            }
+        }
+        for (name, players) in rows {
+            let open: usize = players.iter().map(Vec::len).sum();
+            let (lo, hi) =
+                (players.iter().map(Vec::len).min().unwrap_or(0), players.iter().map(Vec::len).max().unwrap_or(0));
+            print!("{rtt:>3} {name:<10} {:>7} {open:>6} {:>9}", players.len(), format!("{lo}-{hi}"));
+            for (w, m) in GRID {
+                let per: Vec<usize> =
+                    players.iter().map(|g| g.iter().filter(|g| g.ahead <= w && g.claimed > m).count()).collect();
+                let all: usize = per.iter().sum();
+                let cell = format!(
+                    "{:.0}% [{}-{}]",
+                    100.0 * all as f32 / open.max(1) as f32,
+                    per.iter().min().unwrap_or(&0),
+                    per.iter().max().unwrap_or(&0)
+                );
+                print!(" {cell:>20}");
+            }
+            let (w, c) = GRID[0];
+            let at =
+                |k| players.iter().filter(|g| g.iter().filter(|g| g.ahead <= w && g.claimed > c).count() >= k).count();
+            println!("  >=2/3/5: {}/{}/{}", at(2), at(3), at(5));
         }
         println!();
     }

@@ -96,7 +96,9 @@ impl Window {
                 s.timed = self.timed.count_ones();
                 s.fast = self.fast.count_ones();
             }
-            Outcome::Rejected { .. } | Outcome::Left => {}
+            // Foresight is a count, not a ratio: nothing honest dilutes it,
+            // so the lifetime view is the whole of it.
+            Outcome::Glimpse { .. } | Outcome::Rejected { .. } | Outcome::Left => {}
         }
     }
 }
@@ -133,7 +135,7 @@ impl Monitor {
                 return Vec::new();
             }
             Outcome::Rejected { .. } => false,
-            Outcome::Accepted { .. } | Outcome::Shot { .. } => true,
+            Outcome::Accepted { .. } | Outcome::Shot { .. } | Outcome::Glimpse { .. } => true,
         };
         let l = self.live.entry(r.player).or_insert_with(|| Live {
             life: PlayerStats::new(r.player),
@@ -334,7 +336,7 @@ mod tests {
                     s.timed += t as u32;
                     s.fast += f as u32;
                 }
-                Outcome::Rejected { .. } | Outcome::Left => {}
+                Outcome::Glimpse { .. } | Outcome::Rejected { .. } | Outcome::Left => {}
             }
         }
     }

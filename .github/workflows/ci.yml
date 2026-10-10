@@ -9,6 +9,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  AEGIS_REQUIRE_DOTNET: 1
 
 jobs:
   fmt:
@@ -33,6 +34,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      # For aegis-ffi's test of the C# binding (bindings/csharp), which
+      # AEGIS_REQUIRE_DOTNET turns from skipped-without-dotnet into required.
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            6.0.x
+            8.0.x
       - name: clippy
         run: |
           cargo clippy --workspace --all-targets -- -D warnings

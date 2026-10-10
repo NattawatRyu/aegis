@@ -2,3 +2,9 @@
 /scenarios/out/
 *.jsonl
 **/*.rs.bk
+/bindings/csharp/**/bin/
+/bindings/csharp/**/obj/
+/demos/godot/.godot/
+/demos/godot/native/
+/demos/godot/bin/
+/demos/godot/obj/

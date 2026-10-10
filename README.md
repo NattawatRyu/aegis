@@ -92,6 +92,11 @@ crates/
   ffi/          C ABI (include/aegis.h): the detector, the client, and the
                 evidence over an engine's own world; C examples in examples/
   harness/      runs every bot against the real guards + sim, reports per bot
+bindings/
+  csharp/       C# over the C ABI (Unity, Godot, Stride, .NET); Aegis.Check
+                is run by aegis-ffi's tests
+demos/
+  godot/        a Godot 4 (.NET) game with Aegis inside (AEGIS_GODOT test)
 scenarios/out/  harness telemetry output (gitignored)
 ```
 
@@ -102,7 +107,12 @@ it to the online detector (`aegis_monitor_*`), whose every line is the
 game's to set (`AegisConfig`, `aegis_config_at_tick_rate`). Its clients
 speak to the relay through `aegis_client_*`. `examples/engine.c` is the
 whole loop in one file; a test builds every example with the platform's C
-compiler and checks the header against the library.
+compiler and checks the header against the library. From C# (Unity, Godot,
+Stride, any .NET): `bindings/csharp`, a netstandard2.1 wrapper over the
+same library (`AegisMonitor`, `AegisClient`, `AegisEvidence`,
+`NoiseHandshake`), held to it by the same kind of test. `demos/godot` is a
+Godot 4 game using it on its own world (Godot raycasts answer line of
+sight): the aimbot is flagged within seconds, the honest bots never.
 
 The edge key rotates in epochs (`Relay::add_edge`, `Relay::retire_edge`),
 so a leaked key exposes one epoch's traffic. Without a backend (LAN,

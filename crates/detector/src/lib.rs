@@ -12,7 +12,9 @@
 //! Reads telemetry [`Record`]s only — never the server crate — so the server
 //! never has to know what the detector looks for. Thresholds are measured, not
 //! guessed: each detector's `THRESHOLD` doc cites the honest sweep
-//! (`aegis-harness sweep`) it was set from.
+//! (`aegis-harness sweep`) it was set from. Those are the lab's defaults; a
+//! game sets its own through [`Config`] ([`Monitor::with_config`]), which is
+//! validated before it runs.
 //!
 //! A [`Flag`] is evidence for a human reviewer, not a ban. Every detector
 //! refuses to judge a player with fewer samples than its minimum: a player who
@@ -22,7 +24,9 @@ use std::collections::BTreeMap;
 
 use aegis_telemetry::{Outcome, Record};
 
+pub mod config;
 pub mod detectors;
+pub use config::{Config, ConfigError};
 
 pub mod monitor;
 pub use monitor::{Alert, Monitor};
@@ -60,9 +64,15 @@ impl PlayerStats {
         Self { player, ..Default::default() }
     }
 
-    /// Count one outcome. `Rejected` and `Left` change nothing here: what
-    /// `Left` means is up to the caller (see [`stats`] and [`Monitor`]).
+    /// Count one outcome under the default lines ([`Config::DEFAULT`]).
     pub fn record(&mut self, o: &Outcome) {
+        self.count(o, &Config::DEFAULT);
+    }
+
+    /// Count one outcome, classifying it — exact, fast, foreseen — by `cfg`'s
+    /// lines. `Rejected` and `Left` change nothing here: what `Left` means
+    /// is up to the caller (see [`stats`] and [`Monitor`]).
+    pub fn count(&mut self, o: &Outcome, cfg: &Config) {
         match *o {
             Outcome::Accepted { anomaly } => {
                 self.accepted += 1;
@@ -71,13 +81,13 @@ impl PlayerStats {
             Outcome::Shot { hit, aim_err, react } => {
                 self.shots += 1;
                 self.hits += hit as u32;
-                self.exact += detectors::aim_exact::is_exact(aim_err) as u32;
+                self.exact += cfg.aim_exact.is_exact(aim_err) as u32;
                 self.timed += react.is_some() as u32;
-                self.fast += react.is_some_and(detectors::reaction::is_fast) as u32;
+                self.fast += react.is_some_and(|k| cfg.reaction.is_fast(k)) as u32;
             }
             Outcome::Glimpse { claimed, ahead } => {
                 self.glimpsed += 1;
-                self.foreseen += detectors::foresight::is_foreseen(claimed, ahead) as u32;
+                self.foreseen += cfg.foresight.is_foreseen(claimed, ahead) as u32;
             }
             Outcome::Rejected { .. } | Outcome::Left => {}
         }
@@ -90,9 +100,14 @@ impl PlayerStats {
 /// reused, and wrong on a live server. [`Monitor`] is the online form; this
 /// stays as its oracle.
 pub fn stats(records: &[Record]) -> BTreeMap<u8, PlayerStats> {
+    stats_with(records, &Config::DEFAULT)
+}
+
+/// [`stats`] under a game's own lines.
+pub fn stats_with(records: &[Record], cfg: &Config) -> BTreeMap<u8, PlayerStats> {
     let mut m: BTreeMap<u8, PlayerStats> = BTreeMap::new();
     for r in records {
-        m.entry(r.player).or_insert_with(|| PlayerStats::new(r.player)).record(&r.outcome);
+        m.entry(r.player).or_insert_with(|| PlayerStats::new(r.player)).count(&r.outcome, cfg);
     }
     m
 }
@@ -144,6 +159,9 @@ pub trait Detector {
 
 pub struct Suite {
     detectors: Vec<Box<dyn Detector>>,
+    /// The lines samples are classified by (exact, fast, foreseen) before
+    /// any detector sees the counts.
+    cfg: Config,
 }
 
 impl Suite {
@@ -158,18 +176,33 @@ impl Suite {
     /// normalised by range. The humanized aimbot it caught is caught by
     /// reaction instead.
     pub fn standard() -> Self {
-        Self::new(vec![
-            Box::new(detectors::aim_exact::AimExactDetector),
-            Box::new(detectors::anomaly_rate::AnomalyRateDetector),
-            Box::new(detectors::reaction::ReactionDetector),
-            Box::new(detectors::foresight::ForesightDetector),
-        ])
+        Self::with_config(Config::DEFAULT).expect("the defaults are valid")
     }
 
-    /// A suite of exactly these detectors — for tests and experiments with a
-    /// detector the standard suite leaves out.
+    /// The standard detectors under a game's own lines; refused if
+    /// [`Config::validate`] refuses them.
+    pub fn with_config(cfg: Config) -> Result<Self, ConfigError> {
+        cfg.validate()?;
+        Ok(Self {
+            detectors: vec![
+                Box::new(detectors::aim_exact::AimExactDetector { cfg: cfg.aim_exact }),
+                Box::new(detectors::anomaly_rate::AnomalyRateDetector { cfg: cfg.anomaly_rate }),
+                Box::new(detectors::reaction::ReactionDetector { cfg: cfg.reaction }),
+                Box::new(detectors::foresight::ForesightDetector { cfg: cfg.foresight }),
+            ],
+            cfg,
+        })
+    }
+
+    /// A suite of exactly these detectors, at the default lines — for tests
+    /// and experiments with a detector the standard suite leaves out.
     pub fn new(detectors: Vec<Box<dyn Detector>>) -> Self {
-        Self { detectors }
+        Self { detectors, cfg: Config::DEFAULT }
+    }
+
+    /// The lines this suite classifies samples by.
+    pub fn config(&self) -> &Config {
+        &self.cfg
     }
 
     pub fn check(&self, s: &PlayerStats) -> Vec<Flag> {
@@ -178,7 +211,7 @@ impl Suite {
 
     /// Every flag for every player in the stream.
     pub fn run(&self, records: &[Record]) -> Vec<Flag> {
-        stats(records).values().flat_map(|s| self.check(s)).collect()
+        stats_with(records, &self.cfg).values().flat_map(|s| self.check(s)).collect()
     }
 }
 

@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 
 use aegis_telemetry::{Outcome, Record};
 
-use crate::{detectors::aim_exact::is_exact, detectors::reaction::is_fast, Flag, FlagReason, PlayerStats, Suite};
+use crate::{Config, ConfigError, Flag, FlagReason, PlayerStats, Suite};
 
 /// Samples per window: shots for the shot detectors, accepted inputs for the
 /// input detectors. Large enough that every `MIN_*` (at most 60) is reachable
@@ -54,10 +54,10 @@ fn push(plane: &mut u128, bit: bool) {
     *plane = ((*plane << 1) | bit as u128) & MASK;
 }
 
-/// The last [`WINDOW`] shots and accepted inputs, one bit per sample per
-/// signal: a fixed 80 bytes of planes per player however long it plays.
-/// Counts are read off the planes into a [`PlayerStats`] so the detectors
-/// read it like any other.
+/// The last [`WINDOW`] shots, accepted inputs and glimpses, one bit per
+/// sample per signal: a fixed 96 bytes of planes per player however long it
+/// plays. Counts are read off the planes into a [`PlayerStats`] so the
+/// detectors read it like any other.
 #[derive(Debug)]
 struct Window {
     shots: u32,
@@ -67,15 +67,34 @@ struct Window {
     fast: u128,
     inputs: u32,
     anomaly: u128,
+    glimpses: u32,
+    foreseen: u128,
     stats: PlayerStats,
 }
 
 impl Window {
     fn new(player: u8) -> Self {
-        Self { shots: 0, hit: 0, exact: 0, timed: 0, fast: 0, inputs: 0, anomaly: 0, stats: PlayerStats::new(player) }
+        Self {
+            shots: 0,
+            hit: 0,
+            exact: 0,
+            timed: 0,
+            fast: 0,
+            inputs: 0,
+            anomaly: 0,
+            glimpses: 0,
+            foreseen: 0,
+            stats: PlayerStats::new(player),
+        }
     }
 
+    /// [`Window::count`] at the default lines.
+    #[cfg(test)]
     fn record(&mut self, o: &Outcome) {
+        self.count(o, &Config::DEFAULT);
+    }
+
+    fn count(&mut self, o: &Outcome, cfg: &Config) {
         let s = &mut self.stats;
         match *o {
             Outcome::Accepted { anomaly } => {
@@ -87,18 +106,24 @@ impl Window {
             Outcome::Shot { hit, aim_err, react } => {
                 self.shots = (self.shots + 1).min(WINDOW as u32);
                 push(&mut self.hit, hit);
-                push(&mut self.exact, is_exact(aim_err));
+                push(&mut self.exact, cfg.aim_exact.is_exact(aim_err));
                 push(&mut self.timed, react.is_some());
-                push(&mut self.fast, react.is_some_and(is_fast));
+                push(&mut self.fast, react.is_some_and(|k| cfg.reaction.is_fast(k)));
                 s.shots = self.shots;
                 s.hits = self.hit.count_ones();
                 s.exact = self.exact.count_ones();
                 s.timed = self.timed.count_ones();
                 s.fast = self.fast.count_ones();
             }
-            // Foresight is a count, not a ratio: nothing honest dilutes it,
-            // so the lifetime view is the whole of it.
-            Outcome::Glimpse { .. } | Outcome::Rejected { .. } | Outcome::Left => {}
+            // Foresight in bursts: a liar who foresees a few times in a row
+            // and then plays straight is diluted over a life, not here.
+            Outcome::Glimpse { claimed, ahead } => {
+                self.glimpses = (self.glimpses + 1).min(WINDOW as u32);
+                push(&mut self.foreseen, cfg.foresight.is_foreseen(claimed, ahead));
+                s.glimpsed = self.glimpses;
+                s.foreseen = self.foreseen.count_ones();
+            }
+            Outcome::Rejected { .. } | Outcome::Left => {}
         }
     }
 }
@@ -118,12 +143,19 @@ pub struct Monitor {
 }
 
 impl Monitor {
+    /// Samples are classified by the suite's lines ([`Suite::config`]).
     pub fn new(suite: Suite) -> Self {
         Self { suite, live: BTreeMap::new() }
     }
 
     pub fn standard() -> Self {
         Self::new(Suite::standard())
+    }
+
+    /// The standard detectors under a game's own lines; refused if
+    /// [`Config::validate`] refuses them.
+    pub fn with_config(cfg: Config) -> Result<Self, ConfigError> {
+        Suite::with_config(cfg).map(Self::new)
     }
 
     /// Feed one record, in stream order. Returns the alerts it raised — empty
@@ -145,8 +177,9 @@ impl Monitor {
         if !counted {
             return Vec::new();
         }
-        l.life.record(&r.outcome);
-        l.window.record(&r.outcome);
+        let cfg = self.suite.config();
+        l.life.count(&r.outcome, cfg);
+        l.window.count(&r.outcome, cfg);
         let mut out = Vec::new();
         for flag in self.suite.check(&l.life).into_iter().chain(self.suite.check(&l.window.stats)) {
             if !l.raised.contains(&flag.reason) {
@@ -182,6 +215,8 @@ impl Monitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::detectors::aim_exact::is_exact;
+    use crate::detectors::reaction::is_fast;
     use crate::detectors::{accuracy, aim_exact};
     use crate::stats;
     use aegis_telemetry::Telemetry;
@@ -199,6 +234,68 @@ mod tests {
             t.shot(*tick, player, false, aim_err, None);
             *tick += 1;
         }
+    }
+
+    /// `n` glimpses from `player`, foreseen or explained, one per tick.
+    fn glimpse(t: &mut Telemetry, tick: &mut u32, player: u8, n: u32, foreseen: bool) {
+        for _ in 0..n {
+            t.glimpse(*tick, player, if foreseen { None } else { Some(0.05) }, 0.0);
+            *tick += 1;
+        }
+    }
+
+    /// A liar who foresees in one burst after a long straight stretch: over
+    /// its life the share is under the line (3 of 403), so only the window
+    /// sees it — and it does, on the third, not before.
+    #[test]
+    fn a_burst_of_foresight_is_seen_by_the_window_not_the_life() {
+        use crate::detectors::foresight;
+        let mut t = Telemetry::new();
+        let mut tick = 1;
+        glimpse(&mut t, &mut tick, 5, 400, false);
+        glimpse(&mut t, &mut tick, 5, foresight::MIN_FORESEEN, true);
+        let life = &stats(t.records())[&5];
+        assert!(life.foreseen as f32 / (life.glimpsed as f32) <= foresight::THRESHOLD, "setup: life over the line");
+        assert_eq!(Suite::standard().run(t.records()), vec![], "the offline fold saw it");
+        let alerts = Monitor::standard().run(t.records());
+        assert_eq!(reasons(&alerts), vec![FlagReason::Foresight]);
+        assert_eq!(alerts[0].tick, tick - 1, "raised on the last of the burst");
+        assert_eq!(alerts[0].flag.samples, WINDOW as u32);
+    }
+
+    /// The window forgets: the same 3, spread one per 100 glimpses, never
+    /// sit in one window together and never cross the life's share.
+    #[test]
+    fn foresight_spread_thin_is_never_flagged() {
+        let mut t = Telemetry::new();
+        let mut tick = 1;
+        for _ in 0..10 {
+            glimpse(&mut t, &mut tick, 5, 1, true);
+            glimpse(&mut t, &mut tick, 5, WINDOW as u32, false);
+        }
+        assert_eq!(Monitor::standard().run(t.records()), vec![]);
+    }
+
+    /// A game's lines change what a sample is, not only where the share is
+    /// cut: at 60 Hz a 5-tick reaction (83 ms) is fast; at 30 Hz (167 ms)
+    /// it is not.
+    #[test]
+    fn a_games_tick_rate_changes_what_reads_fast() {
+        use crate::detectors::reaction::MIN_TIMED;
+        let mut t = Telemetry::new();
+        for k in 0..MIN_TIMED {
+            t.shot(k, 6, false, WIDE, Some(5));
+        }
+        assert_eq!(Monitor::standard().run(t.records()), vec![]);
+        let at60 = Monitor::with_config(Config::at_tick_rate(60)).unwrap().run(t.records());
+        assert_eq!(reasons(&at60), vec![FlagReason::Reaction]);
+    }
+
+    #[test]
+    fn a_config_that_cannot_mean_what_it_says_is_refused() {
+        let mut c = Config::DEFAULT;
+        c.foresight.clear_rad = c.foresight.fit_rad / 2.0;
+        assert_eq!(Monitor::with_config(c).err().map(|e| e.field), Some("foresight.clear_rad"));
     }
 
     #[test]
@@ -390,8 +487,10 @@ mod tests {
         // Every shot a hit, none exact: accuracy alone is judged, at exactly
         // its MIN_SHOTS-th shot and not one before. (Out of the standard
         // suite, but the monitor must still honour its minimum.)
-        let mut m =
-            Monitor::new(Suite::new(vec![Box::new(accuracy::AccuracyDetector), Box::new(aim_exact::AimExactDetector)]));
+        let mut m = Monitor::new(Suite::new(vec![
+            Box::new(accuracy::AccuracyDetector::default()),
+            Box::new(aim_exact::AimExactDetector::default()),
+        ]));
         for n in 1..=accuracy::MIN_SHOTS {
             let a = m.observe(&Record {
                 tick: n,

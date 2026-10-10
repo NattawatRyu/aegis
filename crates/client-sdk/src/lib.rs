@@ -14,6 +14,7 @@ pub mod aimbot;
 pub mod badversion;
 pub mod burst;
 pub mod camper;
+pub mod conn;
 pub mod direct;
 pub mod esp;
 pub mod flood;

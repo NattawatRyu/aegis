@@ -31,7 +31,11 @@
 //!     read as two (not measured: the lab does not drop);
 //!   - a cheater who sprays without pause (all prefire, nothing timed);
 //!   - fewer than MIN_TIMED timed engagements in a match: at round trips
-//!     2–4, 3–5 of 8 triggerbots stay unjudged in 900 ticks.
+//!     2–4, 0–2 of 8 triggerbots stay unjudged in 900 ticks at MIN_TIMED 8
+//!     (3–5 at 10).
+//!
+//! Every line is the game's to set (`Config`, `crate::Config`): FAST_TICKS
+//! is 100 ms at 30 Hz, and `Config::at_tick_rate` converts it.
 
 use crate::{Detector, Flag, FlagReason, PlayerStats};
 
@@ -42,10 +46,16 @@ use crate::{Detector, Flag, FlagReason, PlayerStats};
 /// a hunch — and guesses are a minority of engagements.
 pub const FAST_TICKS: u32 = 3;
 
-/// Fewer timed engagements than this and the share is noise. At 10, a player
-/// who guesses on 1 engagement in 10 crosses THRESHOLD (6 of 10) with
-/// probability ~1.5e-4 per verdict.
-pub const MIN_TIMED: u32 = 10;
+/// Fewer timed engagements than this and the share is noise.
+///
+/// 8, the middle of the measured range (2026-10-09, `aegis-harness lag 8 6`,
+/// 900-tick crowds): at 10 only 3–7 of 8 triggerbots got a verdict at round
+/// trips 2–4 — a lagged engagement starts less often from rest — at 8, 6–8
+/// of 8; at 6, 7–8. The cost is noise: a player who guesses on 1 engagement
+/// in 10 crosses THRESHOLD (5 of 8) with probability ~4e-4 per verdict, vs
+/// ~1.5e-4 at 10 and ~1.3e-3 at 6. A game with long matches can raise it
+/// (`Config::min_timed`); one with short rounds can lower it.
+pub const MIN_TIMED: u32 = 8;
 
 /// Flag strictly above this share of fast reactions.
 ///
@@ -57,11 +67,49 @@ pub const MIN_TIMED: u32 = 10;
 /// before it is trusted on a live game.
 pub const THRESHOLD: f32 = 0.5;
 
+/// The fastest a human reacts, in milliseconds: what FAST_TICKS is at
+/// 30 Hz, and what [`Config::at_tick_rate`] converts for other rates.
+pub const FAST_MS: u32 = 100;
+
+/// Is a reaction fast, at the default [`FAST_TICKS`]? See [`Config::is_fast`].
 pub fn is_fast(react: u32) -> bool {
-    react <= FAST_TICKS
+    Config::DEFAULT.is_fast(react)
 }
 
-pub struct ReactionDetector;
+/// This detector's lines, per game; the consts above are the defaults.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Config {
+    /// In the game's ticks: [`Config::at_tick_rate`] sets it from FAST_MS.
+    pub fast_ticks: u32,
+    pub min_timed: u32,
+    pub threshold: f32,
+}
+
+impl Config {
+    pub const DEFAULT: Self = Self { fast_ticks: FAST_TICKS, min_timed: MIN_TIMED, threshold: THRESHOLD };
+
+    /// The defaults for a server ticking `hz` times a second: FAST_MS in its
+    /// ticks, rounded down (a reaction is timed in whole ticks, and rounding
+    /// up would call a human at the line fast), at least 1.
+    pub fn at_tick_rate(hz: u32) -> Self {
+        Self { fast_ticks: (FAST_MS * hz / 1000).max(1), ..Self::DEFAULT }
+    }
+
+    pub fn is_fast(&self, react: u32) -> bool {
+        react <= self.fast_ticks
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+#[derive(Default)]
+pub struct ReactionDetector {
+    pub cfg: Config,
+}
 
 impl Detector for ReactionDetector {
     fn reason(&self) -> FlagReason {
@@ -69,15 +117,15 @@ impl Detector for ReactionDetector {
     }
 
     fn check(&self, s: &PlayerStats) -> Option<Flag> {
-        if s.timed < MIN_TIMED {
+        if s.timed < self.cfg.min_timed {
             return None;
         }
         let share = s.fast as f32 / s.timed as f32;
-        (share > THRESHOLD).then_some(Flag {
+        (share > self.cfg.threshold).then_some(Flag {
             player: s.player,
             reason: FlagReason::Reaction,
             value: share,
-            threshold: THRESHOLD,
+            threshold: self.cfg.threshold,
             samples: s.timed,
         })
     }
@@ -100,20 +148,20 @@ mod tests {
     #[test]
     fn too_few_timed_is_no_verdict_even_if_all_instant() {
         let r = vec![0; MIN_TIMED as usize - 1];
-        assert_eq!(ReactionDetector.check(&player(&r, 500)), None, "untimed shots counted as samples");
+        assert_eq!(ReactionDetector::default().check(&player(&r, 500)), None, "untimed shots counted as samples");
     }
 
     #[test]
     fn all_instant_at_min_timed_is_flagged() {
-        let f = ReactionDetector.check(&player(&vec![0; MIN_TIMED as usize], 0)).expect("flag");
+        let f = ReactionDetector::default().check(&player(&vec![0; MIN_TIMED as usize], 0)).expect("flag");
         assert_eq!((f.player, f.reason, f.value, f.samples), (4, FlagReason::Reaction, 1.0, MIN_TIMED));
     }
 
     #[test]
     fn fast_ticks_itself_is_fast_one_more_is_not() {
         let n = MIN_TIMED as usize;
-        assert!(ReactionDetector.check(&player(&vec![FAST_TICKS; n], 0)).is_some());
-        assert_eq!(ReactionDetector.check(&player(&vec![FAST_TICKS + 1; n], 0)), None);
+        assert!(ReactionDetector::default().check(&player(&vec![FAST_TICKS; n], 0)).is_some());
+        assert_eq!(ReactionDetector::default().check(&player(&vec![FAST_TICKS + 1; n], 0)), None);
     }
 
     #[test]
@@ -121,14 +169,14 @@ mod tests {
         let at = (THRESHOLD * 100.0).round() as usize;
         let mut r = vec![0; at];
         r.extend(vec![8; 100 - at]);
-        assert_eq!(ReactionDetector.check(&player(&r, 0)), None);
+        assert_eq!(ReactionDetector::default().check(&player(&r, 0)), None);
         r[at] = 0;
-        assert!(ReactionDetector.check(&player(&r, 0)).is_some());
+        assert!(ReactionDetector::default().check(&player(&r, 0)).is_some());
     }
 
     #[test]
     fn a_human_hand_is_left_alone() {
         let r: Vec<u32> = (0..60).map(|k| 6 + k % 7).collect();
-        assert_eq!(ReactionDetector.check(&player(&r, 200)), None);
+        assert_eq!(ReactionDetector::default().check(&player(&r, 200)), None);
     }
 }

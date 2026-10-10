@@ -89,9 +89,28 @@ crates/
   telemetry/    guard verdicts + shot evidence as jsonl, for the detector
   detector/     pillar C: one detector per file, flags for human review
   relay/        pillar D: the only address clients see; forwards to a private origin
+  ffi/          C ABI (include/aegis.h): the detector, the client, and the
+                evidence over an engine's own world; C examples in examples/
   harness/      runs every bot against the real guards + sim, reports per bot
 scenarios/out/  harness telemetry output (gitignored)
 ```
+
+From another engine (C, C++, C#, anything with a C FFI): `crates/ffi`. An
+engine with its own simulation hands Aegis its players and its line of
+sight each tick (`aegis_evidence_*`), gets each shot's evidence, and feeds
+it to the online detector (`aegis_monitor_*`), whose every line is the
+game's to set (`AegisConfig`, `aegis_config_at_tick_rate`). Its clients
+speak to the relay through `aegis_client_*`. `examples/engine.c` is the
+whole loop in one file; a test builds every example with the platform's C
+compiler and checks the header against the library.
+
+The edge key rotates in epochs (`Relay::add_edge`, `Relay::retire_edge`),
+so a leaked key exposes one epoch's traffic. Without a backend (LAN,
+community servers), feature `noise` lets the relay hand out sessions itself
+over a Noise NK handshake, answered with a Diffie-Hellman only after a
+cookie round trip. A C client does the handshake with `aegis_noise_*`
+(aegis-ffi built with feature `noise`) and hands the keys it gets to
+`aegis_client_*` like a backend's.
 
 Run the lab:
 

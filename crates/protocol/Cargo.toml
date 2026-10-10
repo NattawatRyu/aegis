@@ -14,3 +14,9 @@ chacha20poly1305 = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"
 getrandom = "0.3"
+snow = { version = "0.10", optional = true }
+
+[features]
+# Opt-in: a relay that is its own backend, keys delivered over a Noise NK
+# handshake instead of by the game's backend over HTTPS (`noise`).
+noise = ["dep:snow"]

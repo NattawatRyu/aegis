@@ -1,0 +1,27 @@
+[package]
+name = "aegis-ffi"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Aegis C ABI: the online detector (pillar C) for engines that are not written in Rust. Header: include/aegis.h."
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+aegis-detector = { path = "../detector" }
+aegis-telemetry = { path = "../telemetry" }
+aegis-protocol = { path = "../protocol" }
+aegis-client-sdk = { path = "../client-sdk" }
+aegis-server = { path = "../server" }
+
+[features]
+# aegis_noise_*: keys from a relay that is its own backend (Noise NK).
+noise = ["aegis-protocol/noise", "aegis-relay/noise"]
+
+[dev-dependencies]
+# Finds the platform's C compiler (MSVC, gcc, clang) for the test that
+# builds and runs the C example against the real library.
+cc = "1"
+aegis-relay = { path = "../relay" }

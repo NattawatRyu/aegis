@@ -34,11 +34,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: test
         # Includes the network oracles: the UDP and relay runs must write
-        # telemetry byte-identical to the in-process run.
+        # telemetry byte-identical to the in-process run. And aegis-ffi's C
+        # examples, built with this runner's C compiler against aegis.h.
         run: cargo test --workspace
+      - name: test, opt-in Noise
+        run: |
+          cargo test -p aegis-protocol --features noise
+          cargo test -p aegis-relay --features noise
+          cargo test -p aegis-ffi --features noise
       - name: harness, three transports
         run: |
           cargo run -q -p aegis-harness

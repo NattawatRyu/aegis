@@ -18,7 +18,9 @@
 use aegis_protocol::{PlayerId, Vec2};
 
 use crate::sim::{bearing_error, dist2, is_usable_aim, HIT_RADIUS};
-use crate::{Sim, Visibility};
+#[cfg(doc)]
+use crate::Sim;
+use crate::{Visibility, World};
 
 /// Ticks of shown worlds kept: 16 = 533 ms at 30 Hz. An input claiming an
 /// older snapshot is refused (`guards::stale_tick`), so a player with a
@@ -49,6 +51,9 @@ struct Frame {
 
 pub struct History {
     frames: Box<[Frame]>,
+    /// An enemy this close is point-blank: any aim might be at it, so it
+    /// is no evidence of aim. The lab's is its hitbox ([`HIT_RADIUS`]).
+    point_blank: f32,
 }
 
 impl Default for History {
@@ -60,15 +65,21 @@ impl Default for History {
             rows: [[0; WORDS]; 256],
             order: Vec::with_capacity(256),
         };
-        Self { frames: (0..HISTORY).map(|_| empty()).collect() }
+        Self { frames: (0..HISTORY).map(|_| empty()).collect(), point_blank: HIT_RADIUS }
     }
 }
 
 impl History {
+    /// Kept worlds for a game whose hitbox radius (how close is point-blank)
+    /// is `point_blank`, in its units.
+    pub fn with_point_blank(point_blank: f32) -> Self {
+        Self { point_blank, ..Self::default() }
+    }
+
     /// Tick `tick`'s world, as shown: `sim` and its `vis`, read at the start
     /// of the tick before anyone joins or moves. Recording a tick again
     /// replaces it.
-    pub fn record(&mut self, tick: u32, sim: &Sim, vis: &Visibility) {
+    pub fn record(&mut self, tick: u32, sim: &impl World, vis: &Visibility) {
         let f = &mut self.frames[(tick % HISTORY) as usize];
         f.tick = Some(tick);
         f.alive = [false; 256];
@@ -134,7 +145,7 @@ impl History {
             .copied()
             .filter(|&e| e != shooter && has(row, e))
             .min_by(|&a, &b| d2(a).total_cmp(&d2(b)))?;
-        if d2(e) <= HIT_RADIUS * HIT_RADIUS {
+        if d2(e) <= self.point_blank * self.point_blank {
             return None;
         }
         bearing_error(aim, me, f.pos[e as usize]).map(|err| (err, e))
@@ -164,7 +175,11 @@ impl History {
         for e in ids(&f.rows[shooter as usize]).filter(|&e| e != shooter) {
             let to = f.pos[e as usize];
             // Point-blank, any aim might be at it: it explains everything.
-            let err = if dist2(me, to) <= HIT_RADIUS * HIT_RADIUS { Some(0.0) } else { bearing_error(aim, me, to) };
+            let err = if dist2(me, to) <= self.point_blank * self.point_blank {
+                Some(0.0)
+            } else {
+                bearing_error(aim, me, to)
+            };
             claimed = claimed.min(err.unwrap_or(f32::INFINITY));
         }
         // Everyone shown to it on a kept tick up to `seen`, and itself.
@@ -189,7 +204,7 @@ impl History {
             let from = g.pos[shooter as usize];
             for e in ids(&new) {
                 let to = g.pos[e as usize];
-                if dist2(from, to) > HIT_RADIUS * HIT_RADIUS {
+                if dist2(from, to) > self.point_blank * self.point_blank {
                     ahead = ahead.min(bearing_error(aim, from, to).unwrap_or(f32::INFINITY));
                 }
             }
@@ -220,6 +235,7 @@ pub struct Glimpse {
 mod tests {
     use super::*;
     use crate::sim::{ARENA_HALF, ARENA_WALLS, MAX_HEALTH, SHOT_DAMAGE};
+    use crate::Sim;
     use aegis_protocol::PlayerState;
 
     /// The oracle: a random walled world, moving, killing and respawning,

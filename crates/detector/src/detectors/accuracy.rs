@@ -44,7 +44,27 @@ pub const MIN_SHOTS: u32 = 60;
 /// any line on a live game.
 pub const THRESHOLD: f32 = 0.95;
 
-pub struct AccuracyDetector;
+/// This detector's lines, per game; the consts above are the defaults.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Config {
+    pub min_shots: u32,
+    pub threshold: f32,
+}
+
+impl Config {
+    pub const DEFAULT: Self = Self { min_shots: MIN_SHOTS, threshold: THRESHOLD };
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+#[derive(Default)]
+pub struct AccuracyDetector {
+    pub cfg: Config,
+}
 
 impl Detector for AccuracyDetector {
     fn reason(&self) -> FlagReason {
@@ -53,15 +73,15 @@ impl Detector for AccuracyDetector {
 
     fn check(&self, s: &PlayerStats) -> Option<Flag> {
         let shots = s.shots;
-        if shots < MIN_SHOTS {
+        if shots < self.cfg.min_shots {
             return None;
         }
         let rate = s.hits as f32 / shots as f32;
-        (rate > THRESHOLD).then_some(Flag {
+        (rate > self.cfg.threshold).then_some(Flag {
             player: s.player,
             reason: FlagReason::Accuracy,
             value: rate,
-            threshold: THRESHOLD,
+            threshold: self.cfg.threshold,
             samples: shots,
         })
     }
@@ -77,12 +97,12 @@ mod tests {
 
     #[test]
     fn too_few_shots_is_no_verdict_even_at_100_percent() {
-        assert_eq!(AccuracyDetector.check(&player(MIN_SHOTS - 1, MIN_SHOTS - 1)), None);
+        assert_eq!(AccuracyDetector::default().check(&player(MIN_SHOTS - 1, MIN_SHOTS - 1)), None);
     }
 
     #[test]
     fn at_min_shots_a_perfect_record_is_flagged() {
-        let f = AccuracyDetector.check(&player(MIN_SHOTS, MIN_SHOTS)).expect("flag");
+        let f = AccuracyDetector::default().check(&player(MIN_SHOTS, MIN_SHOTS)).expect("flag");
         assert_eq!((f.player, f.reason, f.value, f.samples), (7, FlagReason::Accuracy, 1.0, MIN_SHOTS));
     }
 
@@ -90,12 +110,12 @@ mod tests {
     fn threshold_itself_is_not_flagged_just_above_is() {
         // 100 shots so the rate lands exactly on the line.
         let at = (THRESHOLD * 100.0).round() as u32;
-        assert_eq!(AccuracyDetector.check(&player(100, at)), None);
-        assert!(AccuracyDetector.check(&player(100, at + 1)).is_some());
+        assert_eq!(AccuracyDetector::default().check(&player(100, at)), None);
+        assert!(AccuracyDetector::default().check(&player(100, at + 1)).is_some());
     }
 
     #[test]
     fn a_human_hit_rate_is_left_alone() {
-        assert_eq!(AccuracyDetector.check(&player(200, 70)), None);
+        assert_eq!(AccuracyDetector::default().check(&player(200, 70)), None);
     }
 }

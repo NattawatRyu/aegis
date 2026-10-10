@@ -8,3 +8,7 @@ description = "Aegis relay: the only address clients ever see. Forwards to an or
 
 [dependencies]
 aegis-protocol = { path = "../protocol" }
+
+[features]
+# Opt-in: answer Noise NK hellos and hand out sessions without a backend.
+noise = ["aegis-protocol/noise"]

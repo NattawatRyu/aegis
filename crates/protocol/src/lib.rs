@@ -20,6 +20,9 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use siphasher::sip::SipHasher24;
 
+#[cfg(feature = "noise")]
+pub mod noise;
+
 /// Bumped whenever the wire format changes. Clients on a different version
 /// must be rejected at `Join` (handled by the server crate).
 /// v1: session token header on every client datagram.
@@ -426,13 +429,22 @@ pub const EDGE_UP_MAX: usize = SID_LEN + NONCE_LEN + TAG_LEN;
 pub const EDGE_DOWN_MAX: usize = NONCE_LEN + TAG_LEN;
 
 /// A client's session id at the relay: when its connect token stops
-/// admitting new Joins (unix seconds, little-endian), then 8 random bytes.
-/// Sent in the clear in front of every client datagram; both of the
-/// client's keys are derived from it, so it names them without the relay
-/// remembering anything — and altering any byte of it (the expiry included)
-/// names keys nobody holds.
+/// admitting new Joins (unix seconds, little-endian), the epoch of the
+/// [`EdgeKey`] it was minted under, then 7 random bytes. Sent in the clear
+/// in front of every client datagram; both of the client's keys are derived
+/// from it, so it names them without the relay remembering anything — and
+/// altering any byte of it (the expiry and epoch included) names keys
+/// nobody holds.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct Sid([u8; SID_LEN]);
+
+/// Where in a sid its epoch is.
+const SID_EPOCH: usize = 8;
+
+/// The one epoch no edge key may have: a sid naming it is a Noise hello
+/// (feature `noise`), never a session. Reserved whether or not the feature
+/// is built, so the meaning of a sid does not depend on it.
+pub const HELLO_EPOCH: u8 = 255;
 
 impl Sid {
     pub const fn from_bytes(b: [u8; SID_LEN]) -> Self {
@@ -447,6 +459,11 @@ impl Sid {
     pub fn expires(&self) -> u64 {
         u64::from_le_bytes(self.0[..8].try_into().expect("8 bytes"))
     }
+
+    /// The epoch of the edge key whose keys this sid names.
+    pub fn epoch(&self) -> u8 {
+        self.0[SID_EPOCH]
+    }
 }
 
 /// The secret a relay shares with the game's backend (login, matchmaking) —
@@ -458,22 +475,51 @@ impl Sid {
 /// runs at the relay, and it keeps no table: the netcode.io model (Glenn
 /// Fiedler, `STANDARD.md`, 2017-) with its server-side connection table
 /// replaced by derivation. HTTPS does the part that needs certificates.
+///
+/// Rotated in epochs ([`EdgeRing`]): each key carries an epoch number, every
+/// sid names the epoch it was minted under, and a relay holds only the
+/// epochs still in use. Once an epoch is retired at the relay and its
+/// secret destroyed at the backend, the traffic it sealed cannot be opened
+/// by anyone, whatever leaks later: a leaked key exposes only its own
+/// epoch. That is forward secrecy at the granularity of an epoch, without a
+/// key exchange (and without its CPU cost at the edge).
 #[derive(Clone, Copy)]
 pub struct EdgeKey {
     prk: [u8; 32],
+    epoch: u8,
 }
 
 impl EdgeKey {
+    /// A key of epoch 0.
     pub fn new(secret: [u8; 32]) -> Self {
-        let (prk, _) = Hkdf::<Sha256>::extract(Some(b"aegis edge v1"), &secret);
-        Self { prk: prk.into() }
+        Self::with_epoch(secret, 0)
     }
 
-    /// A fresh secret from the OS CSPRNG.
+    /// A key of epoch `epoch`. Every epoch needs a fresh secret: two epochs
+    /// of one secret are one key.
+    ///
+    /// # Panics
+    /// On [`HELLO_EPOCH`], which marks a handshake, never a session.
+    pub fn with_epoch(secret: [u8; 32], epoch: u8) -> Self {
+        assert_ne!(epoch, HELLO_EPOCH, "epoch {HELLO_EPOCH} is reserved for the Noise hello");
+        let (prk, _) = Hkdf::<Sha256>::extract(Some(b"aegis edge v1"), &secret);
+        Self { prk: prk.into(), epoch }
+    }
+
+    /// A fresh secret from the OS CSPRNG, epoch 0.
     pub fn random() -> Self {
+        Self::random_epoch(0)
+    }
+
+    /// A fresh secret from the OS CSPRNG, for epoch `epoch`.
+    pub fn random_epoch(epoch: u8) -> Self {
         let mut secret = [0u8; 32];
         getrandom::fill(&mut secret).expect("aegis-protocol: OS random source unavailable");
-        Self::new(secret)
+        Self::with_epoch(secret, epoch)
+    }
+
+    pub fn epoch(&self) -> u8 {
+        self.epoch
     }
 
     /// The key for `sid`'s traffic going `dir`: up = client to relay, down =
@@ -493,7 +539,56 @@ impl EdgeKey {
 /// Never prints key material.
 impl std::fmt::Debug for EdgeKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("EdgeKey(..)")
+        write!(f, "EdgeKey {{ epoch: {}, .. }}", self.epoch)
+    }
+}
+
+/// The edge keys a relay holds, by epoch: the current one and those whose
+/// sessions still play. Rotation, in order:
+///   1. add the next epoch's key at every relay;
+///   2. the backend mints new sessions under it;
+///   3. once every session of the old epoch has ended (its sids expired
+///      and the longest session played out), retire it at every relay and
+///      destroy its secret at the backend.
+///
+/// Adding before minting means no relay ever sees a sid it cannot open.
+/// Epochs wrap at 256; an epoch number is safe to reuse once retired.
+#[derive(Clone, Debug, Default)]
+pub struct EdgeRing {
+    keys: Vec<EdgeKey>,
+}
+
+impl EdgeRing {
+    pub fn new(key: EdgeKey) -> Self {
+        Self { keys: vec![key] }
+    }
+
+    /// Hold `key`, replacing any key of its epoch.
+    pub fn add(&mut self, key: EdgeKey) {
+        self.retire(key.epoch);
+        self.keys.push(key);
+    }
+
+    /// Stop holding `epoch`'s key: its sessions no longer open here.
+    /// Whether it was held.
+    pub fn retire(&mut self, epoch: u8) -> bool {
+        let n = self.keys.len();
+        self.keys.retain(|k| k.epoch != epoch);
+        self.keys.len() != n
+    }
+
+    pub fn get(&self, epoch: u8) -> Option<&EdgeKey> {
+        self.keys.iter().find(|k| k.epoch == epoch)
+    }
+
+    /// The epochs held, in the order they were added.
+    pub fn epochs(&self) -> impl Iterator<Item = u8> + '_ {
+        self.keys.iter().map(|k| k.epoch)
+    }
+
+    /// The key added last: what new sessions are minted under.
+    pub fn current(&self) -> Option<&EdgeKey> {
+        self.keys.last()
     }
 }
 
@@ -536,11 +631,13 @@ impl std::fmt::Debug for ClientKeys {
 }
 
 /// The backend's half: a fresh session for one client, admitting Joins until
-/// `expires` (unix seconds). Hand the result to the client over HTTPS.
+/// `expires` (unix seconds), under `edge`'s epoch. Hand the result to the
+/// client over HTTPS.
 pub fn mint_connect(edge: &EdgeKey, expires: u64) -> ClientKeys {
     let mut sid = [0u8; SID_LEN];
     sid[..8].copy_from_slice(&expires.to_le_bytes());
-    getrandom::fill(&mut sid[8..]).expect("aegis-protocol: OS random source unavailable");
+    sid[SID_EPOCH] = edge.epoch;
+    getrandom::fill(&mut sid[SID_EPOCH + 1..]).expect("aegis-protocol: OS random source unavailable");
     let sid = Sid(sid);
     ClientKeys { sid, up: edge.key(Dir::Up, &sid), down: edge.key(Dir::Down, &sid) }
 }
@@ -553,6 +650,9 @@ pub enum EdgeError {
     /// The tag does not verify: not sealed under this session's key for this
     /// direction, or altered, or the sid was.
     BadSeal,
+    /// The sid names an epoch whose key is not held here: retired, or never
+    /// added ([`EdgeRing`]). Refused before any key is derived.
+    Retired,
 }
 
 /// Client side: seal a client datagram ([`frame`]) for the relay. Layout:
@@ -574,8 +674,20 @@ pub fn open_up<'a>(edge: &EdgeKey, bytes: &'a mut [u8]) -> Result<(Sid, &'a [u8]
     }
     let (head, rest) = bytes.split_at_mut(SID_LEN);
     let sid = Sid(head.try_into().expect("SID_LEN bytes"));
+    if sid.epoch() != edge.epoch {
+        return Err(EdgeError::BadSeal);
+    }
     let frame = open_with(&edge.key(Dir::Up, &sid), &sid.0, rest).ok_or(EdgeError::BadSeal)?;
     Ok((sid, frame))
+}
+
+/// [`open_up`] under whichever key of `ring` the sid's epoch names.
+pub fn open_up_ring<'a>(ring: &EdgeRing, bytes: &'a mut [u8]) -> Result<(Sid, &'a [u8]), EdgeError> {
+    if bytes.len() < EDGE_UP_MAX {
+        return Err(EdgeError::Short);
+    }
+    let edge = ring.get(bytes[SID_EPOCH]).ok_or(EdgeError::Retired)?;
+    open_up(edge, bytes)
 }
 
 /// Relay side: seal a datagram for the client holding `sid`.
@@ -867,7 +979,7 @@ mod tests {
         assert_ne!(a.up, b.up);
         assert_ne!(a.up, a.down);
         assert_ne!(a.up, EDGE.prk);
-        assert_eq!(format!("{:?}", *EDGE), "EdgeKey(..)");
+        assert_eq!(format!("{:?}", *EDGE), "EdgeKey { epoch: 0, .. }");
         assert!(!format!("{a:?}").contains(&format!("{:?}", a.up)));
     }
 
@@ -928,5 +1040,47 @@ mod tests {
         let bad = [0xFFu8, 0xFF, 0xFF, 0xFF];
         let r: Result<ClientMsg, _> = decode(&bad);
         assert!(r.is_err());
+    }
+
+    /// Rotation: each epoch opens only its own sessions; a ring opens
+    /// whichever the sid names, refuses an epoch it does not hold before
+    /// deriving anything, and nothing once it is retired.
+    #[test]
+    fn epochs_rotate_and_a_retired_epoch_opens_nothing() {
+        let (old, new) = (EdgeKey::with_epoch([1; 32], 1), EdgeKey::with_epoch([2; 32], 2));
+        let (a, b) = (mint_connect(&old, u64::MAX), mint_connect(&new, u64::MAX));
+        assert_eq!((a.sid.epoch(), b.sid.epoch()), (1, 2));
+        let up = |k: &ClientKeys| seal_up(k, b"a frame of some length");
+        assert_eq!(open_up(&new, &mut up(&a)), Err(EdgeError::BadSeal), "another epoch's key");
+
+        let mut ring = EdgeRing::new(old);
+        assert_eq!(open_up_ring(&ring, &mut up(&b)), Err(EdgeError::Retired), "not added yet");
+        ring.add(new);
+        assert_eq!(open_up_ring(&ring, &mut up(&a)).map(|(s, _)| s), Ok(a.sid));
+        assert_eq!(open_up_ring(&ring, &mut up(&b)).map(|(s, _)| s), Ok(b.sid));
+        assert!(ring.retire(1));
+        assert!(!ring.retire(1), "retired once");
+        assert_eq!(open_up_ring(&ring, &mut up(&a)), Err(EdgeError::Retired));
+        assert_eq!(open_up_ring(&ring, &mut up(&b)).map(|(s, _)| s), Ok(b.sid));
+
+        // A retired session relabelled to a held epoch names keys nobody holds.
+        let mut moved = up(&a);
+        moved[SID_EPOCH] = 2;
+        assert_eq!(open_up_ring(&ring, &mut moved), Err(EdgeError::BadSeal));
+        assert_eq!(open_up_ring(&ring, &mut up(&b)[..EDGE_UP_MAX - 1].to_vec()), Err(EdgeError::Short));
+
+        // A new secret for a held epoch replaces it.
+        ring.add(EdgeKey::with_epoch([3; 32], 2));
+        assert_eq!(open_up_ring(&ring, &mut up(&b)), Err(EdgeError::BadSeal));
+        assert_eq!(ring.epochs().collect::<Vec<_>>(), vec![2]);
+        assert_eq!(ring.current().map(EdgeKey::epoch), Some(2));
+        assert!(EdgeKey::with_epoch([1; 32], HELLO_EPOCH - 1).epoch() == 254, "the last epoch a key may have");
+    }
+
+    /// No session can ever be minted with the hello's epoch.
+    #[test]
+    #[should_panic(expected = "reserved for the Noise hello")]
+    fn the_hello_epoch_is_never_a_keys() {
+        EdgeKey::with_epoch([1; 32], HELLO_EPOCH);
     }
 }

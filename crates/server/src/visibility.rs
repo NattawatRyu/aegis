@@ -18,7 +18,9 @@
 
 use aegis_protocol::{PlayerId, PlayerState};
 
+#[cfg(doc)]
 use crate::Sim;
+use crate::World;
 
 const WORDS: usize = 4;
 type Row = [u64; WORDS];
@@ -39,14 +41,14 @@ fn bit(id: PlayerId) -> (usize, u64) {
 
 impl Visibility {
     /// Line of sight between every pair of players in `sim`, as it stands.
-    pub fn compute(sim: &Sim) -> Self {
+    pub fn compute(sim: &impl World) -> Self {
         let mut v = Self::default();
         v.recompute(sim);
         v
     }
 
     /// [`Visibility::compute`] into this one, reusing its storage.
-    pub fn recompute(&mut self, sim: &Sim) {
+    pub fn recompute(&mut self, sim: &impl World) {
         self.rows.iter_mut().for_each(|r| *r = [0; WORDS]);
         let ps = sim.players();
         for a in ps {
@@ -60,7 +62,7 @@ impl Visibility {
 
     /// Player `id` has just entered `sim` (already spawned): fill in its row
     /// and its column. Any old bits for the id are cleared first.
-    pub fn add(&mut self, sim: &Sim, id: PlayerId) {
+    pub fn add(&mut self, sim: &impl World, id: PlayerId) {
         self.remove(id);
         let Some(me) = sim.player(id).copied() else { return };
         for p in sim.players().iter().filter(|p| p.id != id) {
@@ -99,7 +101,7 @@ impl Visibility {
 
     /// What `id` is sent: [`Sim::view`] answered from these bits — itself
     /// and everyone it sees, in world order. Empty for an id not in `sim`.
-    pub fn view(&self, sim: &Sim, id: PlayerId) -> Vec<PlayerState> {
+    pub fn view(&self, sim: &impl World, id: PlayerId) -> Vec<PlayerState> {
         if sim.player(id).is_none() {
             return Vec::new();
         }
@@ -111,7 +113,7 @@ impl Visibility {
 mod tests {
     use super::*;
     use crate::sim::ARENA_WALLS;
-    use crate::Wall;
+    use crate::{Sim, Wall};
     use aegis_protocol::Vec2;
 
     fn pillar() -> Sim {

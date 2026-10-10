@@ -29,14 +29,14 @@ use std::net::{IpAddr, SocketAddr};
 use aegis_protocol::{split_frame, ClientMsg, LinkKey, PlayerId, PlayerState, ServerMsg, Vec2, NO_TOKEN, TICK_HZ};
 use aegis_telemetry::Telemetry;
 
+use crate::evidence::Evidence;
 use crate::guards::cookie::CookieJar;
 use crate::guards::session::{self, Session};
 use crate::guards::source_rate::SourceRate;
 use crate::guards::stale_tick::StaleTick;
 use crate::guards::tick_proof::TickProof;
 use crate::guards::{ip_sessions, joined, packet, version};
-use crate::history::{Glimpse, History};
-use crate::reaction::Reaction;
+use crate::history::Glimpse;
 use crate::{ClientInput, GuardCtx, GuardVerdict, Pipeline, RejectReason, Sim, Visibility, Wall};
 
 /// [`NetStats`] label for a legal join refused because all 255 ids are taken.
@@ -85,24 +85,21 @@ impl NetStats {
 
 pub struct Server {
     sim: Sim,
-    /// Line of sight on this tick's positions: from `begin_tick` until the
-    /// moves in `end_tick` (see [`Visibility`]).
-    vis: Visibility,
-    /// Players moved since `vis` was computed.
+    /// Line of sight on this tick's positions (from `begin_tick` until the
+    /// moves in `end_tick`), the worlds the last
+    /// [`HISTORY`](crate::history::HISTORY) ticks' snapshots showed, and
+    /// engagements and firing streaks. Aim evidence is measured in the
+    /// world the shooter's input claims, not in whoever is still alive and
+    /// where by the shot's turn ([`Server::end_tick`]). A player admitted
+    /// mid-tick is in no snapshot yet, so not in that tick's.
+    ev: Evidence,
+    /// Players moved since line of sight was computed.
     vis_stale: bool,
-    /// The worlds the last [`HISTORY`](crate::history::HISTORY) ticks' snapshots showed, each taken
-    /// when `vis` was computed. Aim evidence is measured in the one the
-    /// shooter's input claims, not in whoever is still alive and where by
-    /// the shot's turn ([`Server::end_tick`]). A player admitted mid-tick is
-    /// in no snapshot yet, so not in that tick's.
-    history: History,
     /// Bounds the snapshot each input may claim ([`StaleTick`]).
     stale: StaleTick,
     /// Each player id's session token, so a snapshot's proof is bound to the
     /// session it was sent in. 0 for an id nobody holds.
     tokens: Box<[u64; 256]>,
-    /// Engagements and firing streaks, for each shot's reaction time.
-    react: Reaction,
     pipe: Pipeline,
     tel: Telemetry,
     net: NetStats,
@@ -164,12 +161,10 @@ impl Server {
         assert!(!spawns.is_empty(), "a server needs at least one spawn point");
         Self {
             sim: Sim::with_walls(walls),
-            vis: Visibility::default(),
+            ev: Evidence::default(),
             vis_stale: false,
-            history: History::default(),
             stale: StaleTick::default(),
             tokens: Box::new([0; 256]),
-            react: Reaction::default(),
             pipe: Pipeline::standard(),
             tel: Telemetry::new(),
             net: NetStats::default(),
@@ -230,17 +225,15 @@ impl Server {
             }
         }
         self.sim.step_respawns();
-        self.vis.recompute(&self.sim);
+        self.ev.begin_tick(tick, &self.sim);
         self.vis_stale = false;
-        self.history.record(tick, &self.sim, &self.vis);
-        self.react.observe(tick, &self.sim, &self.vis);
         self.sim.snapshot()
     }
 
     /// What player `id` is sent this tick: [`Sim::view`], answered from the
     /// tick's shared [`Visibility`]. Call between `begin_tick` and `end_tick`.
     pub fn view(&self, id: PlayerId) -> Vec<PlayerState> {
-        let v = self.vis.view(&self.sim, id);
+        let v = self.ev.visibility().view(&self.sim, id);
         // Oracle: the per-player ray-cast this replaced. Every debug run —
         // each test, harness scenario and transport — checks it.
         debug_assert_eq!(v, self.sim.view(id), "shared visibility diverged for player {id}");
@@ -256,7 +249,7 @@ impl Server {
 
     /// The tick's line of sight, for whoever else reads it.
     pub fn visibility(&self) -> &Visibility {
-        &self.vis
+        self.ev.visibility()
     }
 
     /// Receive one datagram (a token-framed `ClientMsg`) from `from`. An input
@@ -338,8 +331,7 @@ impl Server {
         // Mid-tick: it can shoot and be shot before the next recompute, but
         // no snapshot has shown it (it is in no frame of `history`), so it is
         // no one's aim evidence yet.
-        self.vis.add(&self.sim, player_id);
-        self.react.joined(tick, &self.sim, &self.vis, player_id);
+        self.ev.joined(tick, &self.sim, player_id);
         // A new session: proofs and claims start here, whatever the id held.
         self.tokens[player_id as usize] = s.token;
         self.stale.admitted(player_id, tick);
@@ -419,9 +411,7 @@ impl Server {
         let mut out = TickOutcome::default();
         // Two end_ticks with no begin_tick between (only tests do this).
         if self.vis_stale {
-            self.vis.recompute(&self.sim);
-            self.history.record(tick, &self.sim, &self.vis);
-            self.react.observe(tick, &self.sim, &self.vis);
+            self.ev.begin_tick(tick, &self.sim);
         }
         for &(p, input) in &pending {
             if !input.shoot {
@@ -430,21 +420,18 @@ impl Server {
             let seen = input.tick;
             // A dead player's trigger fires nothing, and starts no streak —
             // dead now, or dead in the picture it pulled it on.
-            let live = self.sim.player(p).is_some_and(|s| s.alive) && self.history.alive(seen, p);
-            if live {
-                self.react.fired(seen, p);
-            }
-            let ev = if live { self.history.aim_evidence(seen, p, input.aim) } else { None };
-            if let Some(g) = live.then(|| self.history.glimpse(seen, tick, p, input.aim)).flatten() {
+            let alive = self.sim.player(p).is_some_and(|s| s.alive);
+            let ev = self.ev.shot(tick, seen, p, alive, input.aim);
+            if let Some(g) = ev.glimpse {
                 self.tel.glimpse(tick, p, g.claimed.is_finite().then_some(g.claimed), g.ahead);
                 out.glimpses.push((p, g));
             }
             // Oracle: on the snapshot of this very tick, the frame must agree
             // to the bit with the sim's own ray-cast over who it showed.
-            if seen == tick && live {
-                let shown = |id: PlayerId| self.history.alive(tick, id);
+            if seen == tick && ev.live {
+                let shown = |id: PlayerId| self.ev.history().alive(tick, id);
                 debug_assert_eq!(
-                    ev.map(|(e, id)| (e.to_bits(), id)),
+                    ev.aim.map(|(e, id, _)| (e.to_bits(), id)),
                     self.sim.aim_evidence(p, input.aim, shown).map(|(e, id)| (e.to_bits(), id)),
                     "the shown frame changed player {p}'s aim evidence"
                 );
@@ -454,10 +441,9 @@ impl Server {
                 if r.killed {
                     out.kills.push(p);
                 }
-                out.hits.push((p, live && self.history.sees(seen, p, r.target)));
+                out.hits.push((p, ev.live && self.ev.history().sees(seen, p, r.target)));
             }
-            if let Some((err, enemy)) = ev {
-                let react = self.react.engage(p, enemy, seen);
+            if let Some((err, _, react)) = ev.aim {
                 self.tel.shot(tick, p, r.is_some(), err, react);
             }
         }
@@ -549,7 +535,7 @@ mod tests {
     /// proof for the player `token` belongs to (any proof, for a token
     /// nobody holds) — what an honest client on the server's doorstep sends.
     fn input(s: &Server, token: u64, seq: u32, move_dir: Vec2, aim: Vec2, shoot: bool) -> Vec<u8> {
-        let tick = s.history.latest().unwrap_or(0);
+        let tick = s.ev.history().latest().unwrap_or(0);
         let player = s.sessions.values().find(|x| x.token == token).map(|x| x.player_id);
         let proof = player.map_or(0, |p| s.tick_proof(p, tick));
         frame(token, &ClientMsg::Input { seq, tick, proof, move_dir, aim, shoot })

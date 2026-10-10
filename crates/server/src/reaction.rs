@@ -40,7 +40,7 @@
 
 use aegis_protocol::PlayerId;
 
-use crate::{Sim, Visibility};
+use crate::{Visibility, World};
 
 const WORDS: usize = 4;
 type Row = [u64; WORDS];
@@ -91,7 +91,7 @@ impl Default for Reaction {
 }
 
 /// Bitset of the living.
-fn alive(sim: &Sim) -> Row {
+fn alive(sim: &impl World) -> Row {
     let mut r = [0; WORDS];
     for p in sim.players().iter().filter(|p| p.alive) {
         let (w, m) = bit(p.id);
@@ -104,7 +104,7 @@ impl Reaction {
     /// Start of tick `tick`, after `vis` was computed on `sim`: every pair
     /// newly in sight starts a sight interval now; every pair no longer in
     /// sight ends one.
-    pub fn observe(&mut self, tick: u32, sim: &Sim, vis: &Visibility) {
+    pub fn observe(&mut self, tick: u32, sim: &impl World, vis: &Visibility) {
         let alive = alive(sim);
         for s in 0..=PlayerId::MAX {
             let si = s as usize;
@@ -137,7 +137,7 @@ impl Reaction {
     /// out without it, so everything in sight between it and anyone else
     /// starts with the next one, `tick + 1`; whatever its predecessor saw or
     /// was seen by is gone.
-    pub fn joined(&mut self, tick: u32, sim: &Sim, vis: &Visibility, id: PlayerId) {
+    pub fn joined(&mut self, tick: u32, sim: &impl World, vis: &Visibility, id: PlayerId) {
         let tick = tick.wrapping_add(1);
         let alive = alive(sim);
         let (i, (w, m)) = (id as usize, bit(id));
@@ -217,7 +217,7 @@ impl Reaction {
 mod tests {
     use super::*;
     use crate::sim::{ARENA_HALF, ARENA_WALLS, HIT_RADIUS, MAX_HEALTH, SHOT_DAMAGE};
-    use crate::Wall;
+    use crate::{Sim, Wall};
     use aegis_protocol::Vec2;
     use std::collections::{HashMap, HashSet};
 

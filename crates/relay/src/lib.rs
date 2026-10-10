@@ -64,6 +64,13 @@
 //! reply is sealed under. A sid stops admitting Joins at its expiry; a
 //! session already admitted plays on.
 //!
+//! The edge key rotates in epochs ([`aegis_protocol::EdgeRing`]): every sid
+//! names the epoch it was minted under, and the relay holds only the epochs
+//! still in use ([`Relay::add_edge`], [`Relay::retire_edge`]). A retired
+//! epoch's sessions are dropped both ways; once its secret is destroyed at
+//! the backend too, nothing it sealed can be opened by anyone, so a key
+//! that leaks exposes its own epoch and not the traffic before it.
+//!
 //! LIMITS: an on-path observer of either leg still sees sizes, timing and
 //! (on the client's leg) the sid, and can replay a captured datagram the way
 //! it went (the session token and replay guard judge that). Anyone holding
@@ -82,13 +89,14 @@ pub mod join_rate;
 use std::io::{self, ErrorKind};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
 use aegis_protocol::{
-    decode, encode, open_up, seal_down, split_frame, token_valid, unwrap, wrap, ClientMsg, Dir, EdgeError, EdgeKey,
-    EnvelopeError, LinkKey, ServerMsg, EDGE_UP_MAX, ENVELOPE_MAX, MAX_DATAGRAM, NO_TOKEN, TICK_HZ,
+    decode, encode, open_up_ring, seal_down, split_frame, token_valid, unwrap, wrap, ClientMsg, Dir, EdgeError,
+    EdgeKey, EdgeRing, EnvelopeError, LinkKey, ServerMsg, Sid, EDGE_UP_MAX, ENVELOPE_MAX, MAX_DATAGRAM, NO_TOKEN,
+    TICK_HZ,
 };
 use join_rate::JoinRate;
 
@@ -136,6 +144,12 @@ pub struct RelayStats {
     /// Client datagrams that did not open under the keys their sid names:
     /// not from a session the backend issued, or altered. Dropped.
     pub bad_seal: u64,
+    /// Client datagrams of a session whose edge-key epoch this relay does
+    /// not hold (retired by [`Relay::retire_edge`], or never added), dropped.
+    pub retired: u64,
+    /// Origin datagrams for such a session: nobody holds keys to seal them
+    /// with. Dropped.
+    pub retired_down: u64,
     /// Joins (token 0) under a sid past its expiry, dropped. A session
     /// already admitted keeps playing on it.
     pub expired: u64,
@@ -154,6 +168,14 @@ pub struct RelayStats {
     pub bad_mac: u64,
     /// Authentic datagrams from the origin that were not an envelope, dropped.
     pub bad_envelope: u64,
+    /// Noise hellos without a cookie, answered with one (no DH spent).
+    /// Feature `noise` only, like the two below.
+    pub noise_challenged: u64,
+    /// Noise hellos with a valid cookie, answered with a session.
+    pub welcomed: u64,
+    /// Noise hellos that did not open (another relay's key, altered) or
+    /// were not a hello's size, dropped.
+    pub bad_handshake: u64,
 }
 
 #[derive(Default)]
@@ -163,6 +185,8 @@ struct Counters {
     oversize: AtomicU64,
     short: AtomicU64,
     bad_seal: AtomicU64,
+    retired: AtomicU64,
+    retired_down: AtomicU64,
     expired: AtomicU64,
     bad_token: AtomicU64,
     join_rate: AtomicU64,
@@ -171,6 +195,9 @@ struct Counters {
     foreign: AtomicU64,
     bad_mac: AtomicU64,
     bad_envelope: AtomicU64,
+    noise_challenged: AtomicU64,
+    welcomed: AtomicU64,
+    bad_handshake: AtomicU64,
 }
 
 fn bump(c: &AtomicU64) {
@@ -182,6 +209,10 @@ pub struct Relay {
     upstream: SocketAddr,
     counters: Arc<Counters>,
     clock: Clock,
+    /// The edge keys held, shared with both threads; rotated at run time.
+    edges: Arc<RwLock<EdgeRing>>,
+    #[cfg(feature = "noise")]
+    noise: Arc<RwLock<Option<Noise>>>,
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<io::Result<()>>>,
 }
@@ -211,7 +242,15 @@ impl Relay {
         edge: EdgeKey,
         clock: Clock,
     ) -> io::Result<Self> {
-        let keys = Keys { link: key, edge };
+        let edges = Arc::new(RwLock::new(EdgeRing::new(edge)));
+        #[cfg(feature = "noise")]
+        let noise = Arc::new(RwLock::new(None));
+        let keys = Keys {
+            link: key,
+            edge: edges.clone(),
+            #[cfg(feature = "noise")]
+            noise: noise.clone(),
+        };
         // Blocking reads, no timeout: on Windows a UDP read that times out
         // while a datagram is arriving can lose it (measured: 1 join in 13
         // vanished with a 10 ms poll under parallel load). Drop wakes the
@@ -224,14 +263,52 @@ impl Relay {
 
         let up = {
             let (public, upstream) = (public.try_clone()?, upstream.try_clone()?);
-            let (c, stop, clock) = (counters.clone(), stop.clone(), clock.clone());
+            let (c, stop, clock, keys) = (counters.clone(), stop.clone(), clock.clone(), keys.clone());
             std::thread::spawn(move || forward_up(&public, &upstream, origin, &keys, &clock, &c, &stop))
         };
         let down = {
             let (c, stop) = (counters.clone(), stop.clone());
             std::thread::spawn(move || forward_down(&upstream, &public, origin, &keys, &c, &stop))
         };
-        Ok(Self { public: public_addr, upstream: upstream_addr, counters, clock, stop, threads: vec![up, down] })
+        let threads = vec![up, down];
+        Ok(Self {
+            public: public_addr,
+            upstream: upstream_addr,
+            counters,
+            clock,
+            edges,
+            #[cfg(feature = "noise")]
+            noise,
+            stop,
+            threads,
+        })
+    }
+
+    /// Be the backend too (feature `noise`): answer Noise NK hellos to the
+    /// static key `relay` (whose public half clients pin) with sessions
+    /// minted under the current edge key, admitting Joins for `ttl_secs`.
+    /// See [`aegis_protocol::noise`].
+    #[cfg(feature = "noise")]
+    pub fn enable_noise(&self, relay: aegis_protocol::noise::RelayStatic, ttl_secs: u64) {
+        *self.noise.write().unwrap_or_else(PoisonError::into_inner) = Some(Noise { relay, ttl: ttl_secs });
+    }
+
+    /// Hold `edge` too (replacing a key of its epoch): sessions the backend
+    /// mints under it open here from now on. Add a new epoch at every relay
+    /// before the backend mints under it ([`EdgeRing`]).
+    pub fn add_edge(&self, edge: EdgeKey) {
+        self.edges.write().unwrap_or_else(PoisonError::into_inner).add(edge);
+    }
+
+    /// Stop holding `epoch`'s edge key: its sessions' datagrams are dropped
+    /// both ways from now on (`retired`, `retired_down`). Whether it was held.
+    pub fn retire_edge(&self, epoch: u8) -> bool {
+        self.edges.write().unwrap_or_else(PoisonError::into_inner).retire(epoch)
+    }
+
+    /// The epochs whose sessions open here.
+    pub fn edge_epochs(&self) -> Vec<u8> {
+        self.edges.read().unwrap_or_else(PoisonError::into_inner).epochs().collect()
     }
 
     /// Start the next budget window. Lockstep only: call it when the origin
@@ -268,6 +345,8 @@ impl Relay {
             oversize: get(&c.oversize),
             short: get(&c.short),
             bad_seal: get(&c.bad_seal),
+            retired: get(&c.retired),
+            retired_down: get(&c.retired_down),
             expired: get(&c.expired),
             bad_token: get(&c.bad_token),
             join_rate: get(&c.join_rate),
@@ -276,6 +355,9 @@ impl Relay {
             foreign: get(&c.foreign),
             bad_mac: get(&c.bad_mac),
             bad_envelope: get(&c.bad_envelope),
+            noise_challenged: get(&c.noise_challenged),
+            welcomed: get(&c.welcomed),
+            bad_handshake: get(&c.bad_handshake),
         }
     }
 }
@@ -313,10 +395,75 @@ fn is_reset(e: &io::Error) -> bool {
 
 /// The two secrets a relay holds: one shared with its origin, one with the
 /// game's backend.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Keys {
     link: LinkKey,
-    edge: EdgeKey,
+    edge: Arc<RwLock<EdgeRing>>,
+    /// Set by [`Relay::enable_noise`]: hellos are answered.
+    #[cfg(feature = "noise")]
+    noise: Arc<RwLock<Option<Noise>>>,
+}
+
+/// What a relay that is its own backend needs: its static key, and how long
+/// a session it hands out admits Joins.
+#[cfg(feature = "noise")]
+#[derive(Clone)]
+struct Noise {
+    relay: aegis_protocol::noise::RelayStatic,
+    ttl: u64,
+}
+
+/// Answer a Noise hello (feature `noise`, enabled): only a hello's size,
+/// within its IP's token-0 budget (a hello is a Join by other means); a
+/// cookie challenge, smaller than the hello and costing no DH, until it
+/// brings back the cookie this address was issued; then one handshake and
+/// a session minted under the current edge key, and nothing kept.
+#[cfg(feature = "noise")]
+#[allow(clippy::too_many_arguments)]
+fn answer_hello(
+    public: &UdpSocket,
+    hello: &[u8],
+    client: SocketAddr,
+    noise: &Noise,
+    keys: &Keys,
+    window: u32,
+    joins: &mut JoinRate,
+    c: &Counters,
+) {
+    use aegis_protocol::noise::{challenge, hello_cookie, welcome, HELLO_LEN};
+    if hello.len() != HELLO_LEN {
+        return bump(&c.bad_handshake);
+    }
+    if !joins.allow(window, client.ip()) {
+        return bump(&c.join_rate);
+    }
+    match hello_cookie(hello) {
+        None => {
+            let _ = public.send_to(&challenge(cookie::issue(&keys.link, client, window)), client);
+            bump(&c.noise_challenged);
+        }
+        Some(k) if !cookie::valid(&keys.link, client, window, k) => bump(&c.bad_cookie),
+        Some(_) => {
+            let Some(edge) = keys.edge.read().unwrap_or_else(PoisonError::into_inner).current().copied() else {
+                return bump(&c.retired);
+            };
+            match welcome(&noise.relay, &edge, unix_now().saturating_add(noise.ttl), hello) {
+                Ok(w) => {
+                    let _ = public.send_to(&w, client);
+                    bump(&c.welcomed);
+                }
+                Err(_) => bump(&c.bad_handshake),
+            }
+        }
+    }
+}
+
+impl Keys {
+    /// The edge key `sid`'s epoch names, if it is still held. Copied out,
+    /// so no lock is held across a send.
+    fn edge_for(&self, sid: &Sid) -> Option<EdgeKey> {
+        self.edge.read().unwrap_or_else(PoisonError::into_inner).get(sid.epoch()).copied()
+    }
 }
 
 /// Unix seconds now, for sid expiry. A clock before 1970 reads as 0 and so
@@ -357,7 +504,16 @@ fn forward_up(
             bump(&c.oversize);
             continue;
         }
-        let (sid, frame) = match open_up(&keys.edge, &mut buf[..n]) {
+        #[cfg(feature = "noise")]
+        if aegis_protocol::noise::is_hello(&buf[..n]) {
+            // Not enabled: falls through, and its epoch is held by no key.
+            if let Some(noise) = keys.noise.read().unwrap_or_else(PoisonError::into_inner).clone() {
+                answer_hello(public, &buf[..n], client, &noise, keys, clock.window(), &mut joins, c);
+                continue;
+            }
+        }
+        let opened = open_up_ring(&keys.edge.read().unwrap_or_else(PoisonError::into_inner), &mut buf[..n]);
+        let (sid, frame) = match opened {
             Ok(v) => v,
             Err(EdgeError::Short) => {
                 bump(&c.short);
@@ -365,6 +521,10 @@ fn forward_up(
             }
             Err(EdgeError::BadSeal) => {
                 bump(&c.bad_seal);
+                continue;
+            }
+            Err(EdgeError::Retired) => {
+                bump(&c.retired);
                 continue;
             }
         };
@@ -380,8 +540,13 @@ fn forward_up(
                 }
                 match decode::<ClientMsg>(body) {
                     Ok(ClientMsg::Join { cookie: None, .. }) => {
+                        // Retired since it opened, a moment ago: drop.
+                        let Some(edge) = keys.edge_for(&sid) else {
+                            bump(&c.retired);
+                            continue;
+                        };
                         let challenge = ServerMsg::Challenge { cookie: cookie::issue(key, client, window) };
-                        let _ = public.send_to(&seal_down(&keys.edge, &sid, &encode(&challenge)), client);
+                        let _ = public.send_to(&seal_down(&edge, &sid, &encode(&challenge)), client);
                         bump(&c.challenged);
                     }
                     Ok(ClientMsg::Join { cookie: Some(k), .. }) if !cookie::valid(key, client, window, k) => {
@@ -421,10 +586,14 @@ fn forward_down(
         match got {
             Ok((_, from)) if from != origin => bump(&c.foreign),
             Ok((n, _)) => match unwrap(key, Dir::Down, &mut buf[..n]) {
-                Ok((client, sid, payload)) => {
-                    let _ = public.send_to(&seal_down(&keys.edge, &sid, payload), client);
-                    bump(&c.down);
-                }
+                Ok((client, sid, payload)) => match keys.edge_for(&sid) {
+                    Some(edge) => {
+                        let _ = public.send_to(&seal_down(&edge, &sid, payload), client);
+                        bump(&c.down);
+                    }
+                    // Its epoch was retired: nobody holds keys to seal it.
+                    None => bump(&c.retired_down),
+                },
                 Err(EnvelopeError::BadMac) => bump(&c.bad_mac),
                 Err(_) => bump(&c.bad_envelope),
             },
@@ -437,7 +606,7 @@ fn forward_down(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aegis_protocol::{mint_connect, mint_token, open_down, seal_up, ClientKeys, Sid};
+    use aegis_protocol::{mint_connect, mint_token, open_down, seal_up, ClientKeys};
     use std::time::{Duration, Instant};
 
     const WAIT: Duration = Duration::from_secs(1);
@@ -593,8 +762,11 @@ mod tests {
         altered[SID_EXPIRY_BYTE] ^= 1; // a later expiry nobody issued
         send(&altered);
         send(&seal_up(&k, &join)[..EDGE_UP_MAX - 1]);
-        let s = settle(&r, |s| s.bad_seal + s.short == 4);
-        assert_eq!(s, RelayStats { bad_seal: 3, short: 1, ..Default::default() });
+        // The plain frame's byte 8, where a sid keeps its epoch, is the
+        // body's 'j': an epoch never added, refused before any key is
+        // derived.
+        let s = settle(&r, |s| s.bad_seal + s.retired + s.short == 4);
+        assert_eq!(s, RelayStats { bad_seal: 2, retired: 1, short: 1, ..Default::default() });
         let mut buf = [0u8; 256];
         assert!(origin.recv(&mut buf).is_err(), "an unsealed datagram crossed");
         assert!(client.recv(&mut buf).is_err(), "the relay answered an unsealed datagram");
@@ -602,6 +774,40 @@ mod tests {
 
     /// Byte 0 of a sid is the low byte of its expiry.
     const SID_EXPIRY_BYTE: usize = 0;
+
+    /// Rotation at run time: a session of an epoch not yet added is dropped;
+    /// once added, it crosses alongside the old epoch's; once the old epoch
+    /// is retired, neither its datagrams up nor the origin's replies to it
+    /// cross — counted, never answered — and the new one plays on.
+    #[test]
+    fn an_edge_epoch_is_added_then_retired_while_running() {
+        let origin = sock();
+        let r = spawn(&origin);
+        let client = sock();
+        let me = client.local_addr().unwrap();
+        let next = EdgeKey::with_epoch([7; 32], 1);
+        let (old, new) = (session(), mint_connect(&next, unix_now() + 3600));
+        let token = mint_token(&KEY, me, 1);
+        let send = |k: &ClientKeys| client.send_to(&seal_up(k, &tokened(token, b"input")), r.public_addr()).unwrap();
+
+        send(&new);
+        assert_eq!(settle(&r, |s| s.retired == 1).retired, 1, "an epoch not added yet");
+        r.add_edge(next);
+        assert_eq!(r.edge_epochs(), vec![0, 1]);
+        send(&old);
+        assert_eq!(opened(&mut recv(&origin).0).1, old.sid);
+        send(&new);
+        assert_eq!(opened(&mut recv(&origin).0).1, new.sid);
+
+        assert!(r.retire_edge(0));
+        assert!(!r.retire_edge(0));
+        send(&old);
+        origin.send_to(&wrap(&KEY, Dir::Down, me, &old.sid, b"to the old"), r.upstream_addr()).unwrap();
+        origin.send_to(&wrap(&KEY, Dir::Down, me, &new.sid, b"to the new"), r.upstream_addr()).unwrap();
+        assert_eq!(recv_client(&client, &new).0, b"to the new");
+        let s = settle(&r, |s| s.retired == 2 && s.retired_down == 1 && s.down == 1 && s.up == 2);
+        assert_eq!(s, RelayStats { up: 2, down: 1, retired: 2, retired_down: 1, ..Default::default() });
+    }
 
     /// Only the origin can make the relay send to a client: anyone else
     /// writing to the upstream socket is dropped — otherwise the relay would
@@ -765,7 +971,9 @@ mod tests {
         let answer = join(Some(c));
         client.send_to(&seal_up(&k, &answer), r.public_addr()).unwrap();
         assert_eq!(opened(&mut recv(&origin).0), (client.local_addr().unwrap(), k.sid, answer));
-        assert_eq!(r.stats(), RelayStats { up: 1, challenged: 1, ..Default::default() });
+        // The relay counts a datagram after sending it: the origin can hold
+        // it before `up` moves (flaked 1 in 6 runs, 2026-10-09).
+        assert_eq!(settle(&r, |s| s.up == 1), RelayStats { up: 1, challenged: 1, ..Default::default() });
     }
 
     /// A Join whose cookie was not issued to its source — a guess, another
@@ -862,5 +1070,64 @@ mod tests {
         let t = Instant::now();
         drop(r);
         assert!(t.elapsed() < WAIT);
+    }
+
+    /// Feature `noise`, end to end over UDP: a client that knows only the
+    /// relay's public key is challenged (no DH), comes back with the cookie,
+    /// is handed a session under the current edge epoch, and that session
+    /// works — its sealed Join is answered, sealed to it. A hello pinned to
+    /// another relay, a forged cookie, a hello of the wrong size, and any
+    /// hello to a relay that has not enabled it are answered with nothing.
+    #[cfg(feature = "noise")]
+    #[test]
+    fn a_noise_hello_is_challenged_then_welcomed_and_the_session_works() {
+        use aegis_protocol::noise::{hello, Answer, RelayStatic, HELLO_LEN};
+        let origin = sock();
+        let r = spawn_lockstep(&origin);
+        let client = sock();
+        let me = RelayStatic::generate();
+        let send = |d: &[u8]| client.send_to(d, r.public_addr()).unwrap();
+
+        send(&hello(&me.public(), None).1);
+        assert_eq!(settle(&r, |s| s.retired == 1).retired, 1, "not enabled: its epoch opens nothing");
+
+        r.add_edge(EdgeKey::with_epoch([8; 32], 4));
+        r.enable_noise(me.clone(), 60);
+        let (mut h, wire) = hello(&me.public(), None);
+        send(&wire);
+        let (reply, _) = recv(&client);
+        assert!(reply.len() < wire.len(), "a challenge never amplifies");
+        let Ok(Answer::Challenge(cookie)) = h.answer(&reply) else { panic!("no challenge") };
+
+        let (mut h, wire) = hello(&me.public(), Some(cookie));
+        send(&wire);
+        let Ok(Answer::Welcome(keys)) = h.answer(&recv(&client).0) else { panic!("no welcome") };
+        assert_eq!(keys.sid.epoch(), 4, "minted under the epoch added last");
+
+        let join = encode(&ClientMsg::Join { name: "riw".into(), protocol: 0, cookie: None });
+        send(&seal_up(&keys, &tokened(NO_TOKEN, &join)));
+        let (got, _) = recv_client(&client, &keys);
+        assert!(matches!(decode::<ServerMsg>(&got), Ok(ServerMsg::Challenge { .. })));
+
+        client.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        send(&hello(&RelayStatic::generate().public(), Some(cookie)).1);
+        send(&hello(&me.public(), Some(cookie ^ 1)).1);
+        send(&hello(&me.public(), Some(cookie)).1[..HELLO_LEN - 1]);
+        let s = settle(&r, |s| s.bad_handshake == 2 && s.bad_cookie == 1);
+        assert_eq!(
+            s,
+            RelayStats {
+                retired: 1,
+                noise_challenged: 1,
+                welcomed: 1,
+                challenged: 1,
+                bad_handshake: 2,
+                bad_cookie: 1,
+                ..Default::default()
+            }
+        );
+        let mut buf = [0u8; 256];
+        assert!(client.recv(&mut buf).is_err(), "a refused hello was answered");
+        assert!(origin.recv(&mut buf).is_err(), "a hello crossed to the origin");
     }
 }

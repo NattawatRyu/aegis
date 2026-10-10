@@ -23,10 +23,10 @@ pub const MIN_SHOTS: u32 = 30;
 /// hand.
 pub const EXACT_RAD: f32 = 1e-3;
 
-/// Does one shot count as exact? Applied once, when the shot is counted
-/// (`PlayerStats::record`), so the stats keep a count instead of every angle.
+/// Does one shot count as exact, at the default [`EXACT_RAD`]? See
+/// [`Config::is_exact`].
 pub fn is_exact(aim_err: f32) -> bool {
-    aim_err < EXACT_RAD
+    Config::DEFAULT.is_exact(aim_err)
 }
 
 /// Flag strictly above this share of exact shots.
@@ -41,7 +41,36 @@ pub fn is_exact(aim_err: f32) -> bool {
 /// than a quarter of its last 100.
 pub const THRESHOLD: f32 = 0.25;
 
-pub struct AimExactDetector;
+/// This detector's lines, per game. The consts above are the defaults,
+/// measured in the lab; a game sets its own from its own telemetry.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Config {
+    pub exact_rad: f32,
+    pub min_shots: u32,
+    pub threshold: f32,
+}
+
+impl Config {
+    pub const DEFAULT: Self = Self { exact_rad: EXACT_RAD, min_shots: MIN_SHOTS, threshold: THRESHOLD };
+
+    /// Does one shot count as exact? Applied once, when the shot is counted
+    /// (`PlayerStats::count`), so the stats keep a count instead of every
+    /// angle.
+    pub fn is_exact(&self, aim_err: f32) -> bool {
+        aim_err < self.exact_rad
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+#[derive(Default)]
+pub struct AimExactDetector {
+    pub cfg: Config,
+}
 
 impl Detector for AimExactDetector {
     fn reason(&self) -> FlagReason {
@@ -50,15 +79,15 @@ impl Detector for AimExactDetector {
 
     fn check(&self, s: &PlayerStats) -> Option<Flag> {
         let shots = s.shots;
-        if shots < MIN_SHOTS {
+        if shots < self.cfg.min_shots {
             return None;
         }
         let share = s.exact as f32 / shots as f32;
-        (share > THRESHOLD).then_some(Flag {
+        (share > self.cfg.threshold).then_some(Flag {
             player: s.player,
             reason: FlagReason::AimExact,
             value: share,
-            threshold: THRESHOLD,
+            threshold: self.cfg.threshold,
             samples: shots,
         })
     }
@@ -80,26 +109,26 @@ mod tests {
 
     #[test]
     fn too_few_shots_is_no_verdict_even_if_all_exact() {
-        assert_eq!(AimExactDetector.check(&player(MIN_SHOTS as usize - 1, 0, 0.0)), None);
+        assert_eq!(AimExactDetector::default().check(&player(MIN_SHOTS as usize - 1, 0, 0.0)), None);
     }
 
     #[test]
     fn all_exact_at_min_shots_is_flagged() {
-        let f = AimExactDetector.check(&player(MIN_SHOTS as usize, 0, 0.0)).expect("flag");
+        let f = AimExactDetector::default().check(&player(MIN_SHOTS as usize, 0, 0.0)).expect("flag");
         assert_eq!((f.reason, f.value, f.samples), (FlagReason::AimExact, 1.0, MIN_SHOTS));
     }
 
     #[test]
     fn exact_rad_itself_does_not_count_as_exact() {
-        assert_eq!(AimExactDetector.check(&player(0, 100, EXACT_RAD)), None);
-        assert!(AimExactDetector.check(&player(0, 100, EXACT_RAD * 0.999)).is_some());
+        assert_eq!(AimExactDetector::default().check(&player(0, 100, EXACT_RAD)), None);
+        assert!(AimExactDetector::default().check(&player(0, 100, EXACT_RAD * 0.999)).is_some());
     }
 
     #[test]
     fn threshold_itself_is_not_flagged_just_above_is() {
         let at = (THRESHOLD * 100.0).round() as usize;
-        assert_eq!(AimExactDetector.check(&player(at, 100 - at, 0.1)), None);
-        assert!(AimExactDetector.check(&player(at + 1, 99 - at, 0.1)).is_some());
+        assert_eq!(AimExactDetector::default().check(&player(at, 100 - at, 0.1)), None);
+        assert!(AimExactDetector::default().check(&player(at + 1, 99 - at, 0.1)).is_some());
     }
 
     #[test]
@@ -107,6 +136,6 @@ mod tests {
         // The documented blind spot: 100% "accuracy" but never exact.
         let mut s = player(0, 100, 0.02);
         s.hits = 100;
-        assert_eq!(AimExactDetector.check(&s), None);
+        assert_eq!(AimExactDetector::default().check(&s), None);
     }
 }

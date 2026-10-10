@@ -20,7 +20,27 @@ pub const MIN_INPUTS: u32 = 30;
 /// edge.
 pub const THRESHOLD: f32 = 0.2;
 
-pub struct AnomalyRateDetector;
+/// This detector's lines, per game; the consts above are the defaults.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Config {
+    pub min_inputs: u32,
+    pub threshold: f32,
+}
+
+impl Config {
+    pub const DEFAULT: Self = Self { min_inputs: MIN_INPUTS, threshold: THRESHOLD };
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+#[derive(Default)]
+pub struct AnomalyRateDetector {
+    pub cfg: Config,
+}
 
 impl Detector for AnomalyRateDetector {
     fn reason(&self) -> FlagReason {
@@ -28,15 +48,15 @@ impl Detector for AnomalyRateDetector {
     }
 
     fn check(&self, s: &PlayerStats) -> Option<Flag> {
-        if s.accepted < MIN_INPUTS {
+        if s.accepted < self.cfg.min_inputs {
             return None;
         }
         let rate = s.anomalies as f32 / s.accepted as f32;
-        (rate > THRESHOLD).then_some(Flag {
+        (rate > self.cfg.threshold).then_some(Flag {
             player: s.player,
             reason: FlagReason::AnomalyRate,
             value: rate,
-            threshold: THRESHOLD,
+            threshold: self.cfg.threshold,
             samples: s.accepted,
         })
     }
@@ -52,24 +72,24 @@ mod tests {
 
     #[test]
     fn too_few_inputs_is_no_verdict() {
-        assert_eq!(AnomalyRateDetector.check(&player(MIN_INPUTS - 1, MIN_INPUTS - 1)), None);
+        assert_eq!(AnomalyRateDetector::default().check(&player(MIN_INPUTS - 1, MIN_INPUTS - 1)), None);
     }
 
     #[test]
     fn every_input_anomalous_is_flagged() {
-        let f = AnomalyRateDetector.check(&player(300, 300)).expect("flag");
+        let f = AnomalyRateDetector::default().check(&player(300, 300)).expect("flag");
         assert_eq!((f.reason, f.value, f.samples), (FlagReason::AnomalyRate, 1.0, 300));
     }
 
     #[test]
     fn threshold_itself_is_not_flagged_just_above_is() {
         let at = (THRESHOLD * 100.0).round() as u32;
-        assert_eq!(AnomalyRateDetector.check(&player(100, at)), None);
-        assert!(AnomalyRateDetector.check(&player(100, at + 1)).is_some());
+        assert_eq!(AnomalyRateDetector::default().check(&player(100, at)), None);
+        assert!(AnomalyRateDetector::default().check(&player(100, at + 1)).is_some());
     }
 
     #[test]
     fn a_rare_rounding_edge_is_tolerated() {
-        assert_eq!(AnomalyRateDetector.check(&player(300, 2)), None);
+        assert_eq!(AnomalyRateDetector::default().check(&player(300, 2)), None);
     }
 }

@@ -230,6 +230,8 @@ fn lag(seeds: u32, max_rtt: u32, stale: bool) {
         players: u32,
         reacts: Vec<u32>,
         judged: u32,
+        /// Timed engagements of each player in the row.
+        counts: Vec<u32>,
         reaction: u32,
         shots: u32,
         exact: u32,
@@ -281,6 +283,7 @@ fn lag(seeds: u32, max_rtt: u32, stale: bool) {
                     }
                 }
                 row.judged += u32::from(reacts.len() as u32 >= MIN_TIMED);
+                row.counts.push(reacts.len() as u32);
                 row.reacts.extend(reacts);
                 let flagged = |why| b.alerts.iter().any(|a| a.flag.reason == why);
                 row.reaction += u32::from(flagged(FlagReason::Reaction));
@@ -312,6 +315,16 @@ fn lag(seeds: u32, max_rtt: u32, stale: bool) {
                 row.foresight,
                 row.any,
                 100.0 * row.blind as f32 / row.struck.max(1) as f32
+            );
+            // Players a smaller MIN_TIMED would judge: at 4, 6 and 8.
+            let at = |k| row.counts.iter().filter(|&&c| c >= k).count();
+            println!(
+                "{:>14} timed per player: min {}, judged at 4/6/8: {}/{}/{}",
+                "",
+                row.counts.iter().min().unwrap_or(&0),
+                at(4),
+                at(6),
+                at(8)
             );
         }
         println!();

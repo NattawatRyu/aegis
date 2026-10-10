@@ -1109,7 +1109,7 @@ pub fn edge_seen(s: &RelayStats) -> u64 {
 
 /// Client datagrams the relay dropped at the edge.
 pub fn edge_dropped(s: &RelayStats) -> u64 {
-    s.short + s.bad_seal + s.expired + s.bad_token + s.join_rate + s.bad_cookie + s.oversize
+    s.short + s.bad_seal + s.retired + s.expired + s.bad_token + s.join_rate + s.bad_cookie + s.oversize
 }
 
 /// Relay counters now, or zeros without a relay.
@@ -1601,19 +1601,18 @@ mod tests {
     /// picture it did get is real — so a triggerbot that claims to be a few
     /// ticks laggier than it is turns each instant shot into prefire, and
     /// holds fire a moment after each respawn so that engagement reads
-    /// human. Reaction still judges it and flags nothing (C6.7's pinned
-    /// gap). What gives it away (C6.8): it aims at enemies its claimed
-    /// picture never showed it — foresight — and nobody honest does, at any
-    /// round trip.
+    /// human. Most of what reaction times of it reads slow (C6.7's pinned
+    /// gap; at MIN_TIMED 8 a run that got few timed engagements is
+    /// sometimes caught anyway, by its respawns). What gives it away
+    /// (C6.8): it aims at enemies its claimed picture never showed it —
+    /// foresight — and nobody honest does, at any round trip.
     #[test]
-    fn a_triggerbot_claiming_to_be_laggier_escapes_reaction_not_foresight() {
+    fn a_triggerbot_claiming_to_be_laggier_is_caught_by_foresight() {
         let liars = ["stale1", "stale2", "stale3", "stale6"];
         for rtt in [0, 6] {
             let r = run(Scenario::stale_mix(0, rtt));
             for n in liars {
-                let f = flagged(r.bot(n));
-                assert!(!f.contains(&FlagReason::Reaction), "rtt {rtt}: {n} was timed fast");
-                assert!(f.contains(&FlagReason::Foresight), "rtt {rtt}: {n} foresaw nothing");
+                assert!(flagged(r.bot(n)).contains(&FlagReason::Foresight), "rtt {rtt}: {n} foresaw nothing");
             }
             for b in r.bots.iter().filter(|b| !liars.contains(&b.name)) {
                 assert!(b.alerts.is_empty(), "rtt {rtt}: {} flagged {:?}", b.name, b.alerts);

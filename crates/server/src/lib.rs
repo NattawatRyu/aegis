@@ -11,6 +11,7 @@
 //! in-process harness and the UDP loop drive the exact same code.
 
 pub mod cull;
+pub mod evidence;
 pub mod guards;
 pub mod history;
 pub mod net;
@@ -18,14 +19,17 @@ pub mod reaction;
 pub mod server;
 pub mod sim;
 pub mod visibility;
+pub mod world;
 
 pub use cull::{Cull, MAX_MARGIN_TICKS};
+pub use evidence::{Evidence, ShotEvidence};
 pub use guards::session::Session;
 pub use guards::{ClientInput, GuardCtx, GuardVerdict, Pipeline, RejectReason};
 pub use net::NetServer;
 pub use server::{NetStats, Reply, Server, TickOutcome};
 pub use sim::{ShotResult, Sim, Wall, ARENA_WALLS};
 pub use visibility::Visibility;
+pub use world::World;
 
 #[cfg(test)]
 mod integration {

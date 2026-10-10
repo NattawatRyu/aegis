@@ -431,7 +431,7 @@ impl Server {
             if seen == tick && ev.live {
                 let shown = |id: PlayerId| self.ev.history().alive(tick, id);
                 debug_assert_eq!(
-                    ev.aim.map(|(e, id, _)| (e.to_bits(), id)),
+                    ev.aim.map(|a| (a.err.to_bits(), a.enemy)),
                     self.sim.aim_evidence(p, input.aim, shown).map(|(e, id)| (e.to_bits(), id)),
                     "the shown frame changed player {p}'s aim evidence"
                 );
@@ -443,8 +443,8 @@ impl Server {
                 }
                 out.hits.push((p, ev.live && self.ev.history().sees(seen, p, r.target)));
             }
-            if let Some((err, _, react)) = ev.aim {
-                self.tel.shot(tick, p, r.is_some(), err, react);
+            if let Some(a) = ev.aim {
+                self.tel.shot(tick, p, r.is_some(), a.err, a.react, a.size);
             }
         }
         for &(p, input) in &pending {
@@ -978,7 +978,10 @@ mod tests {
         assert_eq!(s.sim().player(2).unwrap().health, MAX_HEALTH - SHOT_DAMAGE);
         assert_eq!(s.sim().player(2).unwrap().pos, Vec2::new(10.0, MOVE_SPEED));
         let shot = s.telemetry().records().iter().find(|r| matches!(r.outcome, Outcome::Shot { .. })).unwrap();
-        assert_eq!((shot.player, &shot.outcome), (1, &Outcome::Shot { hit: true, aim_err: 0.0, react: Some(0) }));
+        assert_eq!(
+            (shot.player, &shot.outcome),
+            (1, &Outcome::Shot { hit: true, aim_err: 0.0, react: Some(0), size: 0.1f32.asin() })
+        );
     }
 
     /// Two players fire at the same target in one tick and the first kills
@@ -1008,7 +1011,7 @@ mod tests {
             .find(|r| r.player == 3 && matches!(r.outcome, Outcome::Shot { .. }))
             .map(|r| r.outcome.clone());
         // Measured against U it would read pi/2 off; T has been in B's sight since tick 1.
-        assert_eq!(b, Some(Outcome::Shot { hit: true, aim_err: 0.0, react: Some(last - 1) }));
+        assert_eq!(b, Some(Outcome::Shot { hit: true, aim_err: 0.0, react: Some(last - 1), size: 0.1f32.asin() }));
     }
 
     #[test]

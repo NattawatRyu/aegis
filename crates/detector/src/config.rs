@@ -7,7 +7,7 @@
 //! what its own honest telemetry contradicts, and must pass
 //! [`Config::validate`] before a [`crate::Monitor`] will run it.
 
-use crate::detectors::{accuracy, aim_exact, anomaly_rate, foresight, reaction};
+use crate::detectors::{accuracy, aim_exact, anomaly_rate, far_aim, foresight, reaction};
 use crate::monitor::WINDOW;
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -17,6 +17,7 @@ pub struct Config {
     pub anomaly_rate: anomaly_rate::Config,
     pub reaction: reaction::Config,
     pub foresight: foresight::Config,
+    pub far_aim: far_aim::Config,
 }
 
 /// Why a config was refused: the field, and what is wrong with it.
@@ -41,6 +42,7 @@ impl Config {
         anomaly_rate: anomaly_rate::Config::DEFAULT,
         reaction: reaction::Config::DEFAULT,
         foresight: foresight::Config::DEFAULT,
+        far_aim: far_aim::Config::DEFAULT,
     };
 
     /// The defaults for a server ticking `hz` times a second: every line
@@ -96,6 +98,14 @@ impl Config {
             // under the share: a burst it should see, it never judges.
             return err("foresight.min_foreseen", "must be above threshold x window, or bursts go unseen");
         }
+        // Below pi/2: a target can look no bigger than that, so a line at
+        // or above it makes every shot far — raw accuracy, by another name.
+        let a = &self.far_aim;
+        if !(a.far_rad.is_finite() && a.far_rad > 0.0 && a.far_rad < std::f32::consts::FRAC_PI_2) {
+            return err("far_aim.far_rad", "must be an angle in (0, pi/2) radians");
+        }
+        share("far_aim.threshold", a.threshold)?;
+        min("far_aim.min_far", a.min_far)?;
         Ok(())
     }
 }
@@ -165,5 +175,19 @@ mod tests {
         let mut c = d;
         c.accuracy.threshold = 1.5;
         assert_eq!(refused(c), "accuracy.threshold");
+
+        let mut c = d;
+        c.far_aim.far_rad = std::f32::consts::FRAC_PI_2;
+        assert_eq!(refused(c), "far_aim.far_rad");
+        c.far_aim.far_rad = 1.5;
+        assert_eq!(c.validate(), Ok(()));
+        c.far_aim.far_rad = 0.0;
+        assert_eq!(refused(c), "far_aim.far_rad");
+        let mut c = d;
+        c.far_aim.threshold = 1.0;
+        assert_eq!(refused(c), "far_aim.threshold");
+        let mut c = d;
+        c.far_aim.min_far = 0;
+        assert_eq!(refused(c), "far_aim.min_far");
     }
 }

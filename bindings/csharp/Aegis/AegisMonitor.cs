@@ -11,7 +11,7 @@ namespace Aegis
     /// </summary>
     public sealed class AegisMonitor : IDisposable
     {
-        public const uint AbiVersion = 1;
+        public const uint AbiVersion = 2;
 
         private readonly MonitorHandle _h;
 
@@ -39,13 +39,15 @@ namespace Aegis
 
         /// <summary>
         /// aimErr: radians from the aim to the nearest enemy. react: ticks from
-        /// that enemy coming into sight; negative when not timed.
+        /// that enemy coming into sight; negative when not timed. size: that
+        /// enemy's angular radius in radians, asin(hitbox radius / distance).
         /// </summary>
-        public int Shot(uint tick, byte player, bool hit, float aimErr, int react) =>
-            AegisException.Check(Native.aegis_monitor_shot(_h, tick, player, hit, aimErr, react));
+        public int Shot(uint tick, byte player, bool hit, float aimErr, int react, float size) =>
+            AegisException.Check(Native.aegis_monitor_shot(_h, tick, player, hit, aimErr, react, size));
 
         /// <summary>A shot's evidence as AegisEvidence measured it, once the hit is known.</summary>
-        public int Shot(uint tick, byte player, bool hit, in ShotEvidence s) => Shot(tick, player, hit, s.AimErr, s.React);
+        public int Shot(uint tick, byte player, bool hit, in ShotEvidence s) =>
+            Shot(tick, player, hit, s.AimErr, s.React, s.Size);
 
         public int Glimpse(uint tick, byte player, bool hasClaimed, float claimed, float ahead) =>
             AegisException.Check(Native.aegis_monitor_glimpse(_h, tick, player, hasClaimed, claimed, ahead));

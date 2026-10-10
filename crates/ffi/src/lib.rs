@@ -35,7 +35,7 @@ use std::collections::VecDeque;
 use std::ffi::c_char;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use aegis_detector::detectors::{accuracy, aim_exact, anomaly_rate, foresight, reaction};
+use aegis_detector::detectors::{accuracy, aim_exact, anomaly_rate, far_aim, foresight, reaction};
 use aegis_detector::{Alert, Config, FlagReason, Monitor, PlayerStats};
 use aegis_telemetry::{Outcome, Record};
 
@@ -49,7 +49,7 @@ pub use evidence::{AegisEvidence, AegisSeesFn, AegisShotEvidence, AEGIS_ERR_BUSY
 pub mod noise;
 
 /// Bumped whenever a signature or a struct in `aegis.h` changes.
-pub const AEGIS_ABI_VERSION: u32 = 1;
+pub const AEGIS_ABI_VERSION: u32 = 2;
 
 pub const AEGIS_OK: i32 = 0;
 /// A required pointer was null.
@@ -70,6 +70,7 @@ pub const AEGIS_REASON_AIM_EXACT: u8 = 1;
 pub const AEGIS_REASON_ANOMALY_RATE: u8 = 2;
 pub const AEGIS_REASON_REACTION: u8 = 3;
 pub const AEGIS_REASON_FORESIGHT: u8 = 4;
+pub const AEGIS_REASON_FAR_AIM: u8 = 5;
 
 fn reason_code(r: FlagReason) -> u8 {
     match r {
@@ -78,6 +79,7 @@ fn reason_code(r: FlagReason) -> u8 {
         FlagReason::AnomalyRate => AEGIS_REASON_ANOMALY_RATE,
         FlagReason::Reaction => AEGIS_REASON_REACTION,
         FlagReason::Foresight => AEGIS_REASON_FORESIGHT,
+        FlagReason::FarAim => AEGIS_REASON_FAR_AIM,
     }
 }
 
@@ -100,6 +102,9 @@ pub struct AegisConfig {
     pub foresight_clear_rad: f32,
     pub foresight_min_foreseen: u32,
     pub foresight_threshold: f32,
+    pub far_aim_rad: f32,
+    pub far_aim_min_far: u32,
+    pub far_aim_threshold: f32,
 }
 
 impl From<Config> for AegisConfig {
@@ -119,6 +124,9 @@ impl From<Config> for AegisConfig {
             foresight_clear_rad: c.foresight.clear_rad,
             foresight_min_foreseen: c.foresight.min_foreseen,
             foresight_threshold: c.foresight.threshold,
+            far_aim_rad: c.far_aim.far_rad,
+            far_aim_min_far: c.far_aim.min_far,
+            far_aim_threshold: c.far_aim.threshold,
         }
     }
 }
@@ -143,6 +151,11 @@ impl From<AegisConfig> for Config {
                 clear_rad: c.foresight_clear_rad,
                 min_foreseen: c.foresight_min_foreseen,
                 threshold: c.foresight_threshold,
+            },
+            far_aim: far_aim::Config {
+                far_rad: c.far_aim_rad,
+                min_far: c.far_aim_min_far,
+                threshold: c.far_aim_threshold,
             },
         }
     }
@@ -188,6 +201,8 @@ pub struct AegisStats {
     pub fast: u32,
     pub glimpsed: u32,
     pub foreseen: u32,
+    pub far: u32,
+    pub far_inside: u32,
 }
 
 impl From<&PlayerStats> for AegisStats {
@@ -202,6 +217,8 @@ impl From<&PlayerStats> for AegisStats {
             fast: s.fast,
             glimpsed: s.glimpsed,
             foreseen: s.foreseen,
+            far: s.far,
+            far_inside: s.far_inside,
         }
     }
 }
@@ -359,6 +376,8 @@ pub extern "C" fn aegis_monitor_rejected(m: *mut AegisMonitor, tick: u32, player
 /// bearing to the nearest enemy, from the server's positions. `react`: ticks
 /// from that enemy coming into sight to this shot, on the first shot of an
 /// engagement that was not prefire; negative when the shot is not timed.
+/// `size`: that enemy's angular radius in radians as the shooter saw it,
+/// `asin(hitbox radius / distance)` (`AegisShotEvidence.size`).
 #[no_mangle]
 pub extern "C" fn aegis_monitor_shot(
     m: *mut AegisMonitor,
@@ -367,9 +386,10 @@ pub extern "C" fn aegis_monitor_shot(
     hit: bool,
     aim_err: f32,
     react: i32,
+    size: f32,
 ) -> i32 {
     let react = u32::try_from(react).ok();
-    observe(m, tick, player, Outcome::Shot { hit, aim_err, react })
+    observe(m, tick, player, Outcome::Shot { hit, aim_err, react, size })
 }
 
 /// A shot whose aim can be held against an enemy only a snapshot newer than
@@ -442,6 +462,7 @@ pub extern "C" fn aegis_reason_label(reason: u8) -> *const c_char {
         AEGIS_REASON_ANOMALY_RATE => b"anomaly_rate\0",
         AEGIS_REASON_REACTION => b"reaction\0",
         AEGIS_REASON_FORESIGHT => b"foresight\0",
+        AEGIS_REASON_FAR_AIM => b"far_aim\0",
         _ => b"unknown\0",
     };
     s.as_ptr().cast()
@@ -473,7 +494,7 @@ mod tests {
             assert_eq!(label.to_str().unwrap(), r.label());
         }
         // SAFETY: as above.
-        assert_eq!(unsafe { CStr::from_ptr(aegis_reason_label(5)) }.to_str().unwrap(), "unknown");
+        assert_eq!(unsafe { CStr::from_ptr(aegis_reason_label(6)) }.to_str().unwrap(), "unknown");
     }
 
     /// The refusal reaches C with its reason, cut to the buffer at its edge:
@@ -533,10 +554,13 @@ mod tests {
         let mut rust = Monitor::standard();
         let mut want = Vec::new();
         for t in 0..40u32 {
-            let rec =
-                Record { tick: t, player: 3, outcome: Outcome::Shot { hit: true, aim_err: 0.01, react: Some(1) } };
+            let rec = Record {
+                tick: t,
+                player: 3,
+                outcome: Outcome::Shot { hit: true, aim_err: 0.01, react: Some(1), size: 0.02 },
+            };
             want.extend(rust.observe(&rec));
-            assert!(aegis_monitor_shot(m, t, 3, true, 0.01, 1) >= 0);
+            assert!(aegis_monitor_shot(m, t, 3, true, 0.01, 1, 0.02) >= 0);
         }
         let mut got = Vec::new();
         let mut a = AegisAlert::from(&alert());
@@ -557,8 +581,8 @@ mod tests {
     #[test]
     fn react_below_zero_is_untimed_zero_is_timed() {
         let m = new(None);
-        aegis_monitor_shot(m, 1, 1, false, 1.0, -1);
-        aegis_monitor_shot(m, 2, 1, false, 1.0, 0);
+        aegis_monitor_shot(m, 1, 1, false, 1.0, -1, 0.5);
+        aegis_monitor_shot(m, 2, 1, false, 1.0, 0, 0.5);
         let mut s = AegisStats::default();
         aegis_monitor_stats(m, 1, false, &mut s);
         assert_eq!((s.shots, s.timed, s.fast), (2, 1, 1));

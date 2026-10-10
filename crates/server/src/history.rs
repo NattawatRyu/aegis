@@ -17,7 +17,7 @@
 
 use aegis_protocol::{PlayerId, Vec2};
 
-use crate::sim::{bearing_error, dist2, is_usable_aim, HIT_RADIUS};
+use crate::sim::{angular_radius, bearing_error, dist2, is_usable_aim, HIT_RADIUS};
 #[cfg(doc)]
 use crate::Sim;
 use crate::{Visibility, World};
@@ -131,7 +131,9 @@ impl History {
     /// the frame is gone, the shooter was not alive in it (it chose to fire
     /// while it was dead on its screen), it saw nobody, the aim is
     /// degenerate, or the enemy was point-blank — see [`Sim::aim_error`].
-    pub fn aim_evidence(&self, seen: u32, shooter: PlayerId, aim: Vec2) -> Option<(f32, PlayerId)> {
+    /// The third value is how big that enemy looked: its
+    /// [`angular_radius`] at the point-blank radius.
+    pub fn aim_evidence(&self, seen: u32, shooter: PlayerId, aim: Vec2) -> Option<(f32, PlayerId, f32)> {
         let f = self.frame(seen)?;
         if !f.alive[shooter as usize] {
             return None;
@@ -148,7 +150,8 @@ impl History {
         if d2(e) <= self.point_blank * self.point_blank {
             return None;
         }
-        bearing_error(aim, me, f.pos[e as usize]).map(|err| (err, e))
+        let to = f.pos[e as usize];
+        bearing_error(aim, me, to).map(|err| (err, e, angular_radius(self.point_blank, me, to)))
     }
 
     /// What the aim of a shot chosen on snapshot `seen` (and resolved on
@@ -297,7 +300,7 @@ mod tests {
                     near += u32::from(g.ahead < 0.3);
                 }
                 assert_eq!(
-                    got.map(|(e, id)| (e.to_bits(), id)),
+                    got.map(|(e, id, _)| (e.to_bits(), id)),
                     want.map(|(e, id)| (e.to_bits(), id)),
                     "t={t}: shooter {s} on tick {seen}"
                 );

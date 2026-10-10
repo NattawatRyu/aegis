@@ -41,6 +41,7 @@ namespace Aegis
         AnomalyRate = 2,
         Reaction = 3,
         Foresight = 4,
+        FarAim = 5,
     }
 
     public sealed class AegisException : Exception
@@ -83,6 +84,10 @@ namespace Aegis
         public float ForesightClearRad;
         public uint ForesightMinForeseen;
         public float ForesightThreshold;
+        /// <summary>A target whose angular radius is under this is far.</summary>
+        public float FarAimRad;
+        public uint FarAimMinFar;
+        public float FarAimThreshold;
 
         public static Config Default()
         {
@@ -136,6 +141,10 @@ namespace Aegis
         public uint Fast;
         public uint Glimpsed;
         public uint Foreseen;
+        /// <summary>Shots at a far target.</summary>
+        public uint Far;
+        /// <summary>Far shots whose aim passed through it.</summary>
+        public uint FarInside;
     }
 
     /// <summary>What a datagram was; fields are read by Kind (see Rx, Event).</summary>
@@ -197,7 +206,7 @@ namespace Aegis
 
     /// <summary>
     /// What one shot says. Live false: no evidence at all. HasAim: feed
-    /// AegisMonitor.Shot with AimErr and React once the hit is known.
+    /// AegisMonitor.Shot with AimErr, React and Size once the hit is known.
     /// HasGlimpse: feed AegisMonitor.Glimpse with HasClaimed, Claimed, Ahead
     /// first.
     /// </summary>
@@ -216,6 +225,8 @@ namespace Aegis
         public int React;
         public float Claimed;
         public float Ahead;
+        /// <summary>The enemy's angular radius in radians, asin(pointBlank / distance).</summary>
+        public float Size;
 
         public bool Live => LiveByte != 0;
         public bool HasAim => HasAimByte != 0;

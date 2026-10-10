@@ -52,7 +52,7 @@ namespace Aegis
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int aegis_monitor_shot(MonitorHandle m, uint tick, byte player,
-            [MarshalAs(UnmanagedType.U1)] bool hit, float aimErr, int react);
+            [MarshalAs(UnmanagedType.U1)] bool hit, float aimErr, int react, float size);
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int aegis_monitor_glimpse(MonitorHandle m, uint tick, byte player,

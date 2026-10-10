@@ -34,6 +34,9 @@ static void layout(void) {
     OFF(AegisConfig, foresight_clear_rad);
     OFF(AegisConfig, foresight_min_foreseen);
     OFF(AegisConfig, foresight_threshold);
+    OFF(AegisConfig, far_aim_rad);
+    OFF(AegisConfig, far_aim_min_far);
+    OFF(AegisConfig, far_aim_threshold);
     SIZE(AegisAlert);
     OFF(AegisAlert, tick);
     OFF(AegisAlert, player);
@@ -51,6 +54,8 @@ static void layout(void) {
     OFF(AegisStats, fast);
     OFF(AegisStats, glimpsed);
     OFF(AegisStats, foreseen);
+    OFF(AegisStats, far);
+    OFF(AegisStats, far_inside);
 }
 
 #define CHECK(expr, want)                                                                                    \
@@ -92,8 +97,8 @@ int main(int argc, char **argv) {
         CHECK(aegis_monitor_accepted(m, t, 1, false) >= 0, 1);
         CHECK(aegis_monitor_accepted(m, t, 2, false) >= 0, 1);
         if (t % 30 == 15) {
-            CHECK(aegis_monitor_shot(m, t, 1, t % 60 == 15, 0.12f, 15) >= 0, 1);
-            CHECK(aegis_monitor_shot(m, t, 2, true, 0.002f, 0) >= 0, 1);
+            CHECK(aegis_monitor_shot(m, t, 1, t % 60 == 15, 0.12f, 15, 0.2f) >= 0, 1);
+            CHECK(aegis_monitor_shot(m, t, 2, true, 0.002f, 0, 0.2f) >= 0, 1);
         }
     }
 

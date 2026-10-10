@@ -25,7 +25,7 @@
 extern "C" {
 #endif
 
-#define AEGIS_ABI_VERSION 1u
+#define AEGIS_ABI_VERSION 2u
 
 #define AEGIS_OK 0
 #define AEGIS_ERR_NULL (-1)       /* a required pointer was null */
@@ -40,6 +40,7 @@ extern "C" {
 #define AEGIS_REASON_ANOMALY_RATE 2
 #define AEGIS_REASON_REACTION 3
 #define AEGIS_REASON_FORESIGHT 4
+#define AEGIS_REASON_FAR_AIM 5
 
 /* Every line the detectors draw. Angles in radians, fast_ticks in the
  * game's ticks, thresholds are shares in [0, 1). Start from
@@ -60,6 +61,9 @@ typedef struct AegisConfig {
     float foresight_clear_rad;
     uint32_t foresight_min_foreseen;
     float foresight_threshold;
+    float far_aim_rad;       /* a target smaller than this angular radius is far */
+    uint32_t far_aim_min_far;
+    float far_aim_threshold;
 } AegisConfig;
 
 typedef struct AegisAlert {
@@ -81,6 +85,8 @@ typedef struct AegisStats {
     uint32_t fast;
     uint32_t glimpsed;
     uint32_t foreseen;
+    uint32_t far;        /* shots at a far target */
+    uint32_t far_inside; /* far shots whose aim passed through it */
 } AegisStats;
 
 typedef struct AegisMonitor AegisMonitor;
@@ -105,8 +111,10 @@ int32_t aegis_monitor_accepted(AegisMonitor *m, uint32_t tick, uint8_t player, b
 int32_t aegis_monitor_rejected(AegisMonitor *m, uint32_t tick, uint8_t player);
 /* aim_err: radians from the aim to the nearest enemy. react: ticks from
  * that enemy coming into sight, first shot of a non-prefire engagement
- * only; negative when not timed. */
-int32_t aegis_monitor_shot(AegisMonitor *m, uint32_t tick, uint8_t player, bool hit, float aim_err, int32_t react);
+ * only; negative when not timed. size: the enemy's angular radius in
+ * radians, asin(hitbox radius / distance) (AegisShotEvidence.size). */
+int32_t aegis_monitor_shot(AegisMonitor *m, uint32_t tick, uint8_t player, bool hit, float aim_err, int32_t react,
+                           float size);
 /* ahead: radians to the nearest enemy only a newer snapshot than the
  * claimed one showed. claimed (read only when has_claimed): radians to the
  * nearest enemy the claimed snapshot showed. */
@@ -217,7 +225,7 @@ typedef int32_t (*AegisSeesFn)(void *ctx, float fx, float fy, float tx, float ty
 
 typedef struct AegisShotEvidence {
     bool live;        /* false: no evidence (shooter dead now or in its picture) */
-    bool has_aim;     /* write aegis_monitor_shot(aim_err, react) */
+    bool has_aim;     /* write aegis_monitor_shot(aim_err, react, size) */
     bool has_glimpse; /* write aegis_monitor_glimpse(has_claimed, claimed, ahead) */
     bool has_claimed;
     uint8_t enemy;    /* the nearest enemy in the shooter's picture */
@@ -225,6 +233,7 @@ typedef struct AegisShotEvidence {
     int32_t react;    /* negative: not timed */
     float claimed;
     float ahead;
+    float size;       /* the enemy's angular radius, asin(point_blank / distance) */
 } AegisShotEvidence;
 
 typedef struct AegisEvidence AegisEvidence;

@@ -52,10 +52,15 @@ pub fn monitor_layout() -> Vec<String> {
         foresight_fit_rad,
         foresight_clear_rad,
         foresight_min_foreseen,
-        foresight_threshold
+        foresight_threshold,
+        far_aim_rad,
+        far_aim_min_far,
+        far_aim_threshold
     );
     layout!(want, AegisAlert, tick, player, reason, value, threshold, samples);
-    layout!(want, AegisStats, accepted, anomalies, shots, hits, exact, timed, fast, glimpsed, foreseen);
+    layout!(
+        want, AegisStats, accepted, anomalies, shots, hits, exact, timed, fast, glimpsed, foreseen, far, far_inside
+    );
     want
 }
 
@@ -83,7 +88,8 @@ pub fn client_layout_and_consts() -> Vec<String> {
         AEGIS_REASON_AIM_EXACT,
         AEGIS_REASON_ANOMALY_RATE,
         AEGIS_REASON_REACTION,
-        AEGIS_REASON_FORESIGHT
+        AEGIS_REASON_FORESIGHT,
+        AEGIS_REASON_FAR_AIM
     );
     want.push(format!("const AEGIS_CLIENT_KEYS_LEN {AEGIS_CLIENT_KEYS_LEN}"));
     want.push(format!("const AEGIS_NAME_MAX {AEGIS_NAME_MAX}"));
@@ -105,7 +111,20 @@ pub fn client_layout_and_consts() -> Vec<String> {
 
 pub fn evidence_layout() -> Vec<String> {
     let mut want = Vec::new();
-    layout!(want, AegisShotEvidence, live, has_aim, has_glimpse, has_claimed, enemy, aim_err, react, claimed, ahead);
+    layout!(
+        want,
+        AegisShotEvidence,
+        live,
+        has_aim,
+        has_glimpse,
+        has_claimed,
+        enemy,
+        aim_err,
+        react,
+        claimed,
+        ahead,
+        size
+    );
     want
 }
 

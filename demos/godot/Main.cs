@@ -5,16 +5,28 @@
 // an AegisMonitor, whose alerts are shown on screen.
 //
 // Free-for-all in a walled arena. Player 1 is you (WASD, mouse, left
-// click). Bots: "honest" ones react like people (270-530 ms, a little
-// off); "aimbot" ones fire the tick an enemy comes into sight, dead on.
+// click). Bots, honest:
+//   honest     reacts like a person: 270-530 ms, 0.05 rad off;
+//   pro        the hardest honest player to tell from a cheat: 130-270 ms,
+//              67-133 ms when it heard the enemy coming (within 200 px as
+//              it appears), 0.03 rad off.
+// Bots, cheating:
+//   aimbot     fires the tick an enemy comes into sight, dead on;
+//   humanized  an aimbot that waits like a person (200-400 ms) and adds
+//              0.012 rad of noise: never "exact", never "fast";
+//   trigger    aims like a person (turns toward the target, jittery), but
+//              fires the instant its aim crosses an enemy.
 //
 // Headless, as a test:
-//   godot --headless --fixed-fps 30 --path demos/godot -- --ticks 9000 --seed 7
-// prints every alert and each player's stats, then exits 0 if every aimbot
-// was flagged and no honest bot was, else 1.
+//   godot --headless --fixed-fps 30 --path demos/godot -- --ticks 9000 --seed 7 [--roster honest,pro,aimbot]
+// prints every alert, each player's stats and, per cheat, CAUGHT or MISSED;
+// exits 0 if every plain aimbot was flagged and no honest or pro bot was,
+// else 1. A missed humanized or trigger bot is reported, not failed: what
+// Aegis does not catch yet is a finding, not a broken build.
 
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Runtime.InteropServices;
 using Aegis;
@@ -28,7 +40,9 @@ public partial class Main : Node2D
     const uint WallMask = 1;
     static readonly Vector2 Arena = new Vector2(960, 640);
 
-    enum Kind { Human, Honest, Aimbot }
+    enum Kind { Human, Honest, Pro, Aimbot, Humanized, Trigger }
+
+    static bool Cheats(Kind k) => k is Kind.Aimbot or Kind.Humanized or Kind.Trigger;
 
     sealed class Actor
     {
@@ -37,6 +51,9 @@ public partial class Main : Node2D
         public Vector2 Pos;
         public Vector2 Goal;
         public float Aim;
+        // What Aegis measured on its shots, for the report.
+        public readonly List<float> AimErrs = new();
+        public readonly List<int> Reacts = new();
         public int Health = 100;
         public uint DeadUntil;
         public uint ReadyAt;
@@ -111,7 +128,11 @@ public partial class Main : Node2D
         try
         {
             _evidence = new AegisEvidence(HitRadius);
-            _monitor = new AegisMonitor(Aegis.Config.AtTickRate(TickRate));
+            var cfg = Aegis.Config.AtTickRate(TickRate);
+            // A game tunes its own lines; these let a sweep try others.
+            if (args.TryGetValue("far-rad", out var fr)) cfg.FarAimRad = float.Parse(fr, CultureInfo.InvariantCulture);
+            if (args.TryGetValue("far-line", out var fl)) cfg.FarAimThreshold = float.Parse(fl, CultureInfo.InvariantCulture);
+            _monitor = new AegisMonitor(cfg);
         }
         catch (DllNotFoundException)
         {
@@ -127,8 +148,10 @@ public partial class Main : Node2D
         bool headless = DisplayServer.GetName() == "headless";
         byte id = 1;
         if (!headless) _actors.Add(Spawn(id++, Kind.Human));
-        foreach (var k in new[] { Kind.Honest, Kind.Honest, Kind.Honest, Kind.Honest, Kind.Aimbot, Kind.Honest })
-            _actors.Add(Spawn(id++, k));
+        var roster = args.TryGetValue("roster", out var names)
+            ? names.Split(',').Select(k => Enum.Parse<Kind>(k, ignoreCase: true)).ToArray()
+            : new[] { Kind.Honest, Kind.Honest, Kind.Honest, Kind.Honest, Kind.Aimbot, Kind.Honest };
+        foreach (var k in roster) _actors.Add(Spawn(id++, k));
     }
 
     Actor Spawn(byte id, Kind kind) => new Actor { Id = id, Kind = kind, Pos = FreeSpot(), Goal = FreeSpot() };
@@ -142,10 +165,19 @@ public partial class Main : Node2D
         }
     }
 
+    // One query, reused: a new PhysicsRayQueryParameters2D per ray is a
+    // RefCounted object per ray (tens of thousands a minute here) left to
+    // the finalizer, and finalizing them at shutdown crashed Godot 4.7.2
+    // (FATAL in csharp_script.cpp, _instance_binding_free_callback) after
+    // the run had finished: a nonzero exit on a passing run.
+    readonly PhysicsRayQueryParameters2D _ray = new() { CollisionMask = WallMask };
+
     bool Sees(float fx, float fy, float tx, float ty)
     {
-        var q = PhysicsRayQueryParameters2D.Create(new Vector2(fx, fy), new Vector2(tx, ty), WallMask);
-        return _space.IntersectRay(q).Count == 0;
+        _ray.From = new Vector2(fx, fy);
+        _ray.To = new Vector2(tx, ty);
+        using var hit = _space.IntersectRay(_ray);
+        return hit.Count == 0;
     }
 
     bool Sees(Actor a, Actor b) => Sees(a.Pos.X, a.Pos.Y, b.Pos.X, b.Pos.Y);
@@ -185,9 +217,20 @@ public partial class Main : Node2D
                 continue;
             }
             var target = Choose(a);
+            if (a.Kind == Kind.Trigger)
+            {
+                Trigger(a, target);
+                continue;
+            }
             if (target == null || _tick < a.ReadyAt) continue;
             float aim = (target.Pos - a.Pos).Angle();
-            if (a.Kind == Kind.Honest) aim += Gaussian() * 0.05f;
+            aim += Gaussian() * a.Kind switch
+            {
+                Kind.Honest => 0.05f,
+                Kind.Pro => 0.03f,
+                Kind.Humanized => 0.012f,
+                _ => 0f,
+            };
             Fire(a, aim);
         }
 
@@ -254,13 +297,48 @@ public partial class Main : Node2D
             }
             if (!a.Seen.TryGetValue(e.Id, out var s))
             {
-                uint delay = a.Kind == Kind.Aimbot ? 0u : (uint)_rng.Next(8, 17);
-                a.Seen[e.Id] = s = (_tick, delay);
+                a.Seen[e.Id] = s = (_tick, Delay(a, e));
             }
             if (_tick - s.since >= s.delay && (best == null || a.Pos.DistanceTo(e.Pos) < a.Pos.DistanceTo(best.Pos)))
                 best = e;
         }
         return best;
+    }
+
+    /// Ticks from an enemy coming into sight to the first shot at it.
+    uint Delay(Actor a, Actor e) => a.Kind switch
+    {
+        Kind.Aimbot => 0u,
+        // Heard coming: it is close as it appears, and the pro was ready.
+        Kind.Pro => a.Pos.DistanceTo(e.Pos) < 200 ? (uint)_rng.Next(2, 5) : (uint)_rng.Next(4, 9),
+        Kind.Humanized => (uint)_rng.Next(6, 13),
+        // Honest, and the trigger bot's human hand.
+        _ => (uint)_rng.Next(8, 17),
+    };
+
+    /// A human hand on the mouse — it turns toward the target at most
+    /// 0.2 rad a tick, jittery — and a program on the trigger: a shot the
+    /// tick the aim crosses an enemy.
+    void Trigger(Actor a, Actor target)
+    {
+        if (target != null)
+        {
+            float want = (target.Pos - a.Pos).Angle();
+            float turn = Mathf.Clamp(Mathf.AngleDifference(a.Aim, want), -0.2f, 0.2f);
+            a.Aim = Mathf.Wrap(a.Aim + turn + Gaussian() * 0.04f, -Mathf.Pi, Mathf.Pi);
+        }
+        if (_tick < a.ReadyAt) return;
+        var dir = Vector2.FromAngle(a.Aim);
+        foreach (var e in _actors)
+        {
+            if (e == a || !e.Alive) continue;
+            var to = e.Pos - a.Pos;
+            if (to.Dot(dir) > 0 && Mathf.Abs(to.Cross(dir)) < HitRadius * 0.8f && Sees(a, e))
+            {
+                Fire(a, a.Aim);
+                return;
+            }
+        }
     }
 
     /// The game resolves the shot: the first player along the aim within
@@ -283,7 +361,12 @@ public partial class Main : Node2D
             hitAt = along;
         }
         if (ev.HasGlimpse) _monitor.Glimpse(_tick, a.Id, ev);
-        if (ev.HasAim) _monitor.Shot(_tick, a.Id, hit != null, ev);
+        if (ev.HasAim)
+        {
+            _monitor.Shot(_tick, a.Id, hit != null, ev);
+            a.AimErrs.Add(ev.AimErr);
+            if (ev.React >= 0) a.Reacts.Add(ev.React);
+        }
         _tracers.Add((a.Pos, a.Pos + dir * (hit != null ? hitAt : 1200), 0.15f));
         if (hit != null && (hit.Health -= 34) <= 0) hit.DeadUntil = _tick + 2 * TickRate;
     }
@@ -305,6 +388,9 @@ public partial class Main : Node2D
             {
                 Kind.Human => new Color(0.3f, 0.8f, 1f),
                 Kind.Aimbot => new Color(1f, 0.35f, 0.3f),
+                Kind.Humanized => new Color(1f, 0.6f, 0.2f),
+                Kind.Trigger => new Color(0.9f, 0.4f, 0.9f),
+                Kind.Pro => new Color(0.95f, 0.95f, 0.5f),
                 _ => new Color(0.5f, 0.9f, 0.5f),
             };
             if (!a.Alive)
@@ -326,9 +412,13 @@ public partial class Main : Node2D
         {
             _monitor.TryStats(a.Id, false, out var s);
             bool flagged = _flagged.Contains(a.Id);
-            GD.Print($"player {a.Id} {a.Kind}: {s.Shots} shots, {s.Hits} hits, {s.Timed} timed, {s.Fast} fast, {s.Exact} exact, flagged {flagged}");
+            GD.Print($"player {a.Id} {a.Kind}: {s.Shots} shots, {s.Hits} hits, {s.Timed} timed, {s.Fast} fast, " +
+                     $"{s.Exact} exact, aim err median {Pct(a.AimErrs, 0.5):F4} p90 {Pct(a.AimErrs, 0.9):F4} rad, " +
+                     $"react median {Pct(a.Reacts.Select(x => (float)x).ToList(), 0.5):F1} ticks, " +
+                     $"far {s.FarInside}/{s.Far} inside, flagged {flagged}");
             if (a.Kind == Kind.Aimbot && !flagged) ok = false;
-            if (a.Kind == Kind.Honest && flagged) ok = false;
+            if (a.Kind is Kind.Honest or Kind.Pro && flagged) ok = false;
+            if (Cheats(a.Kind)) GD.Print($"cheat {a.Kind} (player {a.Id}): {(flagged ? "CAUGHT" : "MISSED")}");
         }
         GD.Print(ok ? "VERDICT ok" : "VERDICT wrong");
         GetTree().Quit(ok ? 0 : 1);
@@ -338,6 +428,14 @@ public partial class Main : Node2D
     {
         _evidence?.Dispose();
         _monitor?.Dispose();
+        _ray.Dispose();
+    }
+
+    static float Pct(List<float> xs, double p)
+    {
+        if (xs.Count == 0) return float.NaN;
+        var s = xs.OrderBy(x => x).ToList();
+        return s[(int)Math.Min(s.Count - 1, Math.Floor(p * s.Count))];
     }
 
     static Dictionary<string, string> ParseArgs(string[] args)

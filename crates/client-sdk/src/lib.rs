@@ -11,6 +11,7 @@
 use aegis_protocol::{frame, ClientMsg, PlayerId, PlayerState, Vec2, PROTOCOL_VERSION};
 
 pub mod aimbot;
+pub mod aimtrigger;
 pub mod badversion;
 pub mod burst;
 pub mod camper;

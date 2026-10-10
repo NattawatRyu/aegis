@@ -22,12 +22,12 @@ pub mod visibility;
 pub mod world;
 
 pub use cull::{Cull, MAX_MARGIN_TICKS};
-pub use evidence::{Evidence, ShotEvidence};
+pub use evidence::{Aim, Evidence, ShotEvidence};
 pub use guards::session::Session;
 pub use guards::{ClientInput, GuardCtx, GuardVerdict, Pipeline, RejectReason};
 pub use net::NetServer;
 pub use server::{NetStats, Reply, Server, TickOutcome};
-pub use sim::{ShotResult, Sim, Wall, ARENA_WALLS};
+pub use sim::{angular_radius, ShotResult, Sim, Wall, ARENA_WALLS};
 pub use visibility::Visibility;
 pub use world::World;
 

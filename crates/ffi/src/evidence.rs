@@ -27,10 +27,10 @@ pub type AegisSeesFn = extern "C" fn(ctx: *mut c_void, fx: f32, fy: f32, tx: f32
 
 /// What one shot says. `live` false: no evidence at all (the shooter was
 /// dead now, or in the picture it fired on). `has_aim`: write
-/// `aegis_monitor_shot` with `aim_err` and `react` (negative: not timed)
-/// once the hit is known. `has_glimpse`: write `aegis_monitor_glimpse` with
-/// `has_claimed`, `claimed`, `ahead` — before the shot, as the Aegis server
-/// does.
+/// `aegis_monitor_shot` with `aim_err`, `react` (negative: not timed) and
+/// `size` once the hit is known. `has_glimpse`: write
+/// `aegis_monitor_glimpse` with `has_claimed`, `claimed`, `ahead` — before
+/// the shot, as the Aegis server does.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct AegisShotEvidence {
@@ -43,16 +43,19 @@ pub struct AegisShotEvidence {
     pub react: i32,
     pub claimed: f32,
     pub ahead: f32,
+    /// The enemy's angular radius in radians, `asin(point_blank / distance)`.
+    pub size: f32,
 }
 
 impl From<aegis_server::ShotEvidence> for AegisShotEvidence {
     fn from(s: aegis_server::ShotEvidence) -> Self {
         let mut out = Self { live: s.live, react: -1, ..Self::default() };
-        if let Some((err, enemy, react)) = s.aim {
+        if let Some(a) = s.aim {
             out.has_aim = true;
-            out.aim_err = err;
-            out.enemy = enemy;
-            out.react = react.map_or(-1, |r| i32::try_from(r).unwrap_or(i32::MAX));
+            out.aim_err = a.err;
+            out.enemy = a.enemy;
+            out.react = a.react.map_or(-1, |r| i32::try_from(r).unwrap_or(i32::MAX));
+            out.size = a.size;
         }
         if let Some(g) = s.glimpse {
             out.has_glimpse = true;

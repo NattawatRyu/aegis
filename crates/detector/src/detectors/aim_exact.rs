@@ -103,7 +103,7 @@ mod tests {
     fn player(exact: usize, rest: usize, off: f32) -> PlayerStats {
         let mut s = PlayerStats::new(3);
         let shots = std::iter::repeat_n(0.0, exact).chain(std::iter::repeat_n(off, rest));
-        shots.for_each(|aim_err| s.record(&Outcome::Shot { hit: false, aim_err, react: None }));
+        shots.for_each(|aim_err| s.record(&Outcome::Shot { hit: false, aim_err, react: None, size: 0.5 }));
         s
     }
 

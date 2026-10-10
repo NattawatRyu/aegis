@@ -25,6 +25,11 @@
 //! (window, clear) rules — the measurement `foresight::MIN_FORESEEN` and its
 //! radii are set from.
 //!
+//! `aegis-harness far [seeds] [max_rtt]` runs [`Scenario::aim_mix`] crowds
+//! (12 honest, 4 aimtriggers) at every round trip and prints, per kind of
+//! player, its far shots, how many were aimed inside the target, and how
+//! often far_aim flagged it — the lab's measurement of `far_aim`.
+//!
 //! `aegis-harness cull [lobbies] [max_lag]` replays honest lobbies and prints,
 //! per culling margin, what it leaks and how late a lagging client sees an
 //! enemy — the measurement `MAX_MARGIN_TICKS` is set from.
@@ -57,6 +62,11 @@ fn main() -> std::io::Result<()> {
     if args.get(1).map(String::as_str) == Some("foresight") {
         let seeds = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8);
         foresight(seeds, args.get(3).and_then(|s| s.parse().ok()).unwrap_or(6));
+        return Ok(());
+    }
+    if args.get(1).map(String::as_str) == Some("far") {
+        let seeds = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8);
+        far(seeds, args.get(3).and_then(|s| s.parse().ok()).unwrap_or(6));
         return Ok(());
     }
     if args.get(1).map(String::as_str) == Some("cull") {
@@ -215,6 +225,66 @@ fn scale(crowds: u32) {
     }
     println!("\nviews% = share of all server time spent building culled snapshots");
     println!("rooms/core = budget / p99 tick: rooms one core runs at 30 Hz, if nothing else ran on it");
+}
+
+fn far(seeds: u32, max_rtt: u32) {
+    use aegis_detector::detectors::far_aim;
+    use aegis_detector::FlagReason;
+    use aegis_telemetry::Outcome;
+    use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    struct Row {
+        players: u32,
+        shots: u32,
+        far: u32,
+        inside: u32,
+        far_aim: u32,
+        any: u32,
+    }
+    println!("aim_mix crowds: {seeds} per round trip, 12 honest + 4 aimtriggers, {} ticks", aegis_harness::CROWD_TICKS);
+    println!("far = shots at a target under far_aim::FAR_RAD; inside = aimed through it; flag columns = players\n");
+    println!(
+        "{:>3} {:<10} {:>7} {:>6} {:>6} {:>7} {:>7} {:>4}",
+        "rtt", "player", "players", "shots", "far", "inside%", "far_aim", "any"
+    );
+    let cfg = far_aim::Config::DEFAULT;
+    for rtt in 0..=max_rtt {
+        let mut rows: BTreeMap<&str, Row> = BTreeMap::new();
+        for seed in 0..seeds {
+            let r = run(Scenario::aim_mix(seed, rtt));
+            for b in &r.bots {
+                let Some(id) = b.id else { continue };
+                let row = rows.entry(b.name).or_default();
+                row.players += 1;
+                for x in r.telemetry.records().iter().filter(|x| x.player == id) {
+                    if let Outcome::Shot { aim_err, size, .. } = x.outcome {
+                        row.shots += 1;
+                        if cfg.is_far(size) {
+                            row.far += 1;
+                            row.inside += u32::from(far_aim::is_inside(aim_err, size));
+                        }
+                    }
+                }
+                row.far_aim += u32::from(b.alerts.iter().any(|a| a.flag.reason == FlagReason::FarAim));
+                row.any += u32::from(!b.alerts.is_empty());
+            }
+        }
+        for (name, row) in rows {
+            println!(
+                "{:>3} {:<10} {:>7} {:>6} {:>6} {:>6.0}% {:>7} {:>4}",
+                rtt,
+                name,
+                row.players,
+                row.shots,
+                row.far,
+                100.0 * row.inside as f32 / row.far.max(1) as f32,
+                row.far_aim,
+                row.any
+            );
+        }
+        println!();
+    }
 }
 
 fn lag(seeds: u32, max_rtt: u32, stale: bool) {
@@ -404,6 +474,10 @@ fn sweep(crowds: u32, rtt: u32) {
             ("aim_exact*", col(&|p| p.peak.aim_exact)),
             ("anomaly_rate*", col(&|p| p.peak.anomaly_rate)),
             ("reaction*", col(&|p| p.peak.reaction)),
+            ("far", col(&|p| p.life.far as f32)),
+            ("far_inside", col(&|p| ratio(p.life.far_inside, p.life.far))),
+            ("far_inside*", col(&|p| p.peak.far_aim)),
+            ("far_bound*", col(&|p| p.peak.far_aim_bound)),
         ];
         let flagged = players.iter().filter(|p| !p.alerts.is_empty()).count();
 

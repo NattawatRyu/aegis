@@ -26,6 +26,8 @@ use aegis_protocol::{PlayerId, Vec2};
 
 use crate::history::{Glimpse, History};
 use crate::reaction::Reaction;
+#[cfg(doc)]
+use crate::sim::angular_radius;
 use crate::sim::HIT_RADIUS;
 use crate::{Visibility, World};
 
@@ -35,12 +37,24 @@ pub struct ShotEvidence {
     /// The shooter was alive now and in the picture it fired on. A shot
     /// that is not live is no evidence and starts no run of fire.
     pub live: bool,
-    /// Aim error (radians) to the nearest enemy in the shooter's picture,
-    /// that enemy, and the reaction time if this shot is timed. `None`: no
-    /// enemy in the picture, one point-blank, or a degenerate aim.
-    pub aim: Option<(f32, PlayerId, Option<u32>)>,
+    /// The aim against the nearest enemy in the shooter's picture. `None`:
+    /// no enemy in the picture, one point-blank, or a degenerate aim.
+    pub aim: Option<Aim>,
     /// The aim against enemies only a newer snapshot showed.
     pub glimpse: Option<Glimpse>,
+}
+
+/// A shot's aim against the nearest enemy in the shooter's picture.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Aim {
+    /// Radians between the aim and the bearing to the enemy.
+    pub err: f32,
+    pub enemy: PlayerId,
+    /// The reaction time, if this shot is timed.
+    pub react: Option<u32>,
+    /// How big the enemy looked: the [`angular_radius`] of the point-blank
+    /// radius at its distance. `err <= size` is an aim through it.
+    pub size: f32,
 }
 
 pub struct Evidence {
@@ -92,10 +106,12 @@ impl Evidence {
         }
         self.react.fired(seen, shooter);
         let glimpse = self.history.glimpse(seen, tick, shooter, aim);
-        let aim = self
-            .history
-            .aim_evidence(seen, shooter, aim)
-            .map(|(err, enemy)| (err, enemy, self.react.engage(shooter, enemy, seen)));
+        let aim = self.history.aim_evidence(seen, shooter, aim).map(|(err, enemy, size)| Aim {
+            err,
+            enemy,
+            react: self.react.engage(shooter, enemy, seen),
+            size,
+        });
         ShotEvidence { live, aim, glimpse }
     }
 
@@ -147,11 +163,11 @@ mod tests {
         ev.begin_tick(2, &w);
         let s = ev.shot(2, 2, 1, true, EAST);
         assert_eq!(
-            (s.live, s.aim.map(|(e, id, r)| (e < 1e-6, id, r)), s.glimpse),
+            (s.live, s.aim.map(|a| (a.err < 1e-6, a.enemy, a.react)), s.glimpse),
             (true, Some((true, 2, Some(0))), None)
         );
         let s = ev.shot(2, 2, 1, true, EAST);
-        assert_eq!(s.aim.map(|(_, _, r)| r), Some(None), "the second shot of an engagement is not timed");
+        assert_eq!(s.aim.map(|a| a.react), Some(None), "the second shot of an engagement is not timed");
 
         let mut ev = Evidence::default();
         let mut w = Fog(vec![at(1, 0.0), at(2, 40.0)]);
@@ -188,6 +204,19 @@ mod tests {
         assert!(!ev.shot(2, 1, 1, true, EAST).live, "dead in the picture it fired on");
         assert!(!ev.shot(2, 2, 1, false, EAST).live, "dead now");
         let s = ev.shot(2, 2, 1, true, EAST);
-        assert_eq!(s.aim.map(|(_, _, r)| r), Some(Some(0)), "the dead shots started no run: this one is timed");
+        assert_eq!(s.aim.map(|a| a.react), Some(Some(0)), "the dead shots started no run: this one is timed");
+    }
+
+    /// `size` is the game's hitbox as an angle at the enemy's range in the
+    /// picture: asin(r / d). Just outside point-blank it is nearly π/2.
+    #[test]
+    fn size_is_the_hitbox_as_an_angle_at_its_range() {
+        for (radius, x, want) in [(1.0, 20.0, 0.05f32.asin()), (10.0, 20.0, 0.5f32.asin()), (10.0, 10.001, 1.5563)] {
+            let w = Fog(vec![at(1, 0.0), at(2, x)]);
+            let mut ev = Evidence::with_point_blank(radius);
+            ev.begin_tick(1, &w);
+            let size = ev.shot(1, 1, 1, true, EAST).aim.expect("evidence").size;
+            assert!((size - want).abs() < 1e-3, "r {radius} at {x}: {size} vs {want}");
+        }
     }
 }

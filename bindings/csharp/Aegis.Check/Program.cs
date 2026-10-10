@@ -130,6 +130,7 @@ static class Program
         m.Left(141, 4);
         Expect(!m.TryStats(4, false, out _), "gone after Left");
         Expect(AegisMonitor.Label(Reason.Foresight) == "foresight", AegisMonitor.Label(Reason.Foresight));
+        Expect(AegisMonitor.Label(Reason.FarAim) == "far_aim", AegisMonitor.Label(Reason.FarAim));
         Expect(AegisMonitor.Label((Reason)200) == "unknown", "unknown reason");
         while (m.Poll(out _)) { }
         Expect(!m.Poll(out _), "drained");

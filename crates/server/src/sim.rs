@@ -97,6 +97,13 @@ pub(crate) fn dist2(a: Vec2, b: Vec2) -> f32 {
     dx * dx + dy * dy
 }
 
+/// The angular radius in radians of a hitbox of `radius` at `to`, seen from
+/// `from`: `asin(radius / distance)`, so an aim within it of the bearing
+/// passes through the hitbox. π/2 when `from` is inside it.
+pub fn angular_radius(radius: f32, from: Vec2, to: Vec2) -> f32 {
+    (radius / dist2(from, to).sqrt()).min(1.0).asin()
+}
+
 /// Angle in radians between `aim` and the bearing from `from` to `to`;
 /// `None` for an aim with no direction. `atan2(cross, dot)`, not
 /// `acos(dot)`: see [`Sim::aim_error`].

@@ -112,7 +112,11 @@ Stride, any .NET): `bindings/csharp`, a netstandard2.1 wrapper over the
 same library (`AegisMonitor`, `AegisClient`, `AegisEvidence`,
 `NoiseHandshake`), held to it by the same kind of test. `demos/godot` is a
 Godot 4 game using it on its own world (Godot raycasts answer line of
-sight): the aimbot is flagged within seconds, the honest bots never.
+sight): the aimbot is flagged within seconds, the honest bots never. Its
+harder bots found two cheats every detector missed — an aimbot that waits
+like a person and a triggerbot under a human hand — which `far_aim`
+(accuracy on small, far targets) now catches, at the cost of flagging an
+honest pro now and then (`demos/godot/README.md`).
 
 The edge key rotates in epochs (`Relay::add_edge`, `Relay::retire_edge`),
 so a leaked key exposes one epoch's traffic. Without a backend (LAN,

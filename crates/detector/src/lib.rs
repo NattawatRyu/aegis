@@ -57,6 +57,10 @@ pub struct PlayerStats {
     /// Glimpses that fit such an enemy and nothing shown
     /// (`foresight::is_foreseen`).
     pub foreseen: u32,
+    /// Shots at a target smaller than `far_aim::FAR_RAD` in the picture.
+    pub far: u32,
+    /// Far shots whose aim passed through the target (`far_aim::is_inside`).
+    pub far_inside: u32,
 }
 
 impl PlayerStats {
@@ -78,12 +82,15 @@ impl PlayerStats {
                 self.accepted += 1;
                 self.anomalies += anomaly as u32;
             }
-            Outcome::Shot { hit, aim_err, react } => {
+            Outcome::Shot { hit, aim_err, react, size } => {
                 self.shots += 1;
                 self.hits += hit as u32;
                 self.exact += cfg.aim_exact.is_exact(aim_err) as u32;
                 self.timed += react.is_some() as u32;
                 self.fast += react.is_some_and(|k| cfg.reaction.is_fast(k)) as u32;
+                let far = cfg.far_aim.is_far(size);
+                self.far += far as u32;
+                self.far_inside += (far && detectors::far_aim::is_inside(aim_err, size)) as u32;
             }
             Outcome::Glimpse { claimed, ahead } => {
                 self.glimpsed += 1;
@@ -120,13 +127,19 @@ pub enum FlagReason {
     AnomalyRate,
     Reaction,
     Foresight,
+    FarAim,
 }
 
 impl FlagReason {
     /// Every reason [`Suite::standard`] can raise, for coverage checks ("does
     /// some bot trip each detector?"). Not `Accuracy`: see [`Suite::standard`].
-    pub const STANDARD: [FlagReason; 4] =
-        [FlagReason::AimExact, FlagReason::AnomalyRate, FlagReason::Reaction, FlagReason::Foresight];
+    pub const STANDARD: [FlagReason; 5] = [
+        FlagReason::AimExact,
+        FlagReason::AnomalyRate,
+        FlagReason::Reaction,
+        FlagReason::Foresight,
+        FlagReason::FarAim,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -135,6 +148,7 @@ impl FlagReason {
             FlagReason::AnomalyRate => "anomaly_rate",
             FlagReason::Reaction => "reaction",
             FlagReason::Foresight => "foresight",
+            FlagReason::FarAim => "far_aim",
         }
     }
 }
@@ -173,8 +187,8 @@ impl Suite {
     /// 900-tick crowds its online peak reached 0.985, above the humanized
     /// aimbot's 0.98. No line separates them, so accuracy stays as evidence
     /// (`detectors::accuracy`, the harness sweep's `accuracy*`) until it is
-    /// normalised by range. The humanized aimbot it caught is caught by
-    /// reaction instead.
+    /// normalised by range — which `far_aim` is (2026-10-10). The humanized
+    /// aimbot it caught is caught by reaction instead.
     pub fn standard() -> Self {
         Self::with_config(Config::DEFAULT).expect("the defaults are valid")
     }
@@ -189,6 +203,7 @@ impl Suite {
                 Box::new(detectors::anomaly_rate::AnomalyRateDetector { cfg: cfg.anomaly_rate }),
                 Box::new(detectors::reaction::ReactionDetector { cfg: cfg.reaction }),
                 Box::new(detectors::foresight::ForesightDetector { cfg: cfg.foresight }),
+                Box::new(detectors::far_aim::FarAimDetector { cfg: cfg.far_aim }),
             ],
             cfg,
         })
@@ -226,8 +241,8 @@ mod tests {
         t.accept(1, 1, false);
         t.accept(2, 1, true);
         t.reject(2, 1, "replay");
-        t.shot(2, 1, true, 0.0, None);
-        t.shot(3, 1, false, 0.2, None);
+        t.shot(2, 1, true, 0.0, None, 0.02);
+        t.shot(3, 1, false, 0.2, None, 0.5);
         t.accept(1, 2, false);
         let m = stats(t.records());
         let p1 = &m[&1];

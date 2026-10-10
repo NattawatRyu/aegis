@@ -43,7 +43,7 @@ static int shoot(AegisEvidence *ev, AegisMonitor *m, uint32_t tick, const AegisP
     }
     if (s.has_aim) {
         bool hit = off < 0.05f; /* the engine resolves the hit; here, a stand-in */
-        CHECK(aegis_monitor_shot(m, tick, me->id, hit, s.aim_err, s.react) >= 0, 1);
+        CHECK(aegis_monitor_shot(m, tick, me->id, hit, s.aim_err, s.react, s.size) >= 0, 1);
     }
     return 0;
 }
@@ -60,6 +60,7 @@ int main(int argc, char **argv) {
         OFF(AegisShotEvidence, react);
         OFF(AegisShotEvidence, claimed);
         OFF(AegisShotEvidence, ahead);
+        OFF(AegisShotEvidence, size);
     }
     float radius = 30.0f;
     AegisEvidence *ev = NULL;

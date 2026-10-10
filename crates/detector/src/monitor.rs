@@ -29,6 +29,7 @@ use std::collections::BTreeMap;
 
 use aegis_telemetry::{Outcome, Record};
 
+use crate::detectors::far_aim;
 use crate::{Config, ConfigError, Flag, FlagReason, PlayerStats, Suite};
 
 /// Samples per window: shots for the shot detectors, accepted inputs for the
@@ -55,9 +56,10 @@ fn push(plane: &mut u128, bit: bool) {
 }
 
 /// The last [`WINDOW`] shots, accepted inputs and glimpses, one bit per
-/// sample per signal: a fixed 96 bytes of planes per player however long it
+/// sample per signal: a fixed 128 bytes of planes per player however long it
 /// plays. Counts are read off the planes into a [`PlayerStats`] so the
-/// detectors read it like any other.
+/// detectors read it like any other. Far shots are those among the last
+/// [`WINDOW`] shots, not the last [`WINDOW`] far ones.
 #[derive(Debug)]
 struct Window {
     shots: u32,
@@ -65,6 +67,8 @@ struct Window {
     exact: u128,
     timed: u128,
     fast: u128,
+    far: u128,
+    far_inside: u128,
     inputs: u32,
     anomaly: u128,
     glimpses: u32,
@@ -80,6 +84,8 @@ impl Window {
             exact: 0,
             timed: 0,
             fast: 0,
+            far: 0,
+            far_inside: 0,
             inputs: 0,
             anomaly: 0,
             glimpses: 0,
@@ -103,17 +109,22 @@ impl Window {
                 s.accepted = self.inputs;
                 s.anomalies = self.anomaly.count_ones();
             }
-            Outcome::Shot { hit, aim_err, react } => {
+            Outcome::Shot { hit, aim_err, react, size } => {
                 self.shots = (self.shots + 1).min(WINDOW as u32);
                 push(&mut self.hit, hit);
                 push(&mut self.exact, cfg.aim_exact.is_exact(aim_err));
                 push(&mut self.timed, react.is_some());
                 push(&mut self.fast, react.is_some_and(|k| cfg.reaction.is_fast(k)));
+                let far = cfg.far_aim.is_far(size);
+                push(&mut self.far, far);
+                push(&mut self.far_inside, far && far_aim::is_inside(aim_err, size));
                 s.shots = self.shots;
                 s.hits = self.hit.count_ones();
                 s.exact = self.exact.count_ones();
                 s.timed = self.timed.count_ones();
                 s.fast = self.fast.count_ones();
+                s.far = self.far.count_ones();
+                s.far_inside = self.far_inside.count_ones();
             }
             // Foresight in bursts: a liar who foresees a few times in a row
             // and then plays straight is diluted over a life, not here.
@@ -231,7 +242,7 @@ mod tests {
     /// `n` misses from `player` at `aim_err`, one per tick from `*tick`.
     fn shoot(t: &mut Telemetry, tick: &mut u32, player: u8, n: u32, aim_err: f32) {
         for _ in 0..n {
-            t.shot(*tick, player, false, aim_err, None);
+            t.shot(*tick, player, false, aim_err, None, 0.5);
             *tick += 1;
         }
     }
@@ -284,7 +295,7 @@ mod tests {
         use crate::detectors::reaction::MIN_TIMED;
         let mut t = Telemetry::new();
         for k in 0..MIN_TIMED {
-            t.shot(k, 6, false, WIDE, Some(5));
+            t.shot(k, 6, false, WIDE, Some(5), 0.5);
         }
         assert_eq!(Monitor::standard().run(t.records()), vec![]);
         let at60 = Monitor::with_config(Config::at_tick_rate(60)).unwrap().run(t.records());
@@ -393,7 +404,7 @@ mod tests {
     /// The window as it was before the bit planes (2026-10-08): a deque of
     /// samples with running counts. Kept as the rewrite's oracle.
     struct DequeWindow {
-        shots: std::collections::VecDeque<(bool, bool, bool, bool)>,
+        shots: std::collections::VecDeque<(bool, bool, bool, bool, bool, bool)>,
         inputs: std::collections::VecDeque<bool>,
         stats: PlayerStats,
     }
@@ -416,22 +427,28 @@ mod tests {
                     s.accepted += 1;
                     s.anomalies += anomaly as u32;
                 }
-                Outcome::Shot { hit, aim_err, react } => {
+                Outcome::Shot { hit, aim_err, react, size } => {
                     if self.shots.len() == WINDOW {
-                        let (h, e, t, f) = self.shots.pop_front().expect("full window");
+                        let (h, e, t, f, r, i) = self.shots.pop_front().expect("full window");
                         s.shots -= 1;
                         s.hits -= h as u32;
                         s.exact -= e as u32;
                         s.timed -= t as u32;
                         s.fast -= f as u32;
+                        s.far -= r as u32;
+                        s.far_inside -= i as u32;
                     }
                     let (e, t, f) = (is_exact(aim_err), react.is_some(), react.is_some_and(is_fast));
-                    self.shots.push_back((hit, e, t, f));
+                    let r = size < far_aim::FAR_RAD;
+                    let i = r && aim_err <= size;
+                    self.shots.push_back((hit, e, t, f, r, i));
                     s.shots += 1;
                     s.hits += hit as u32;
                     s.exact += e as u32;
                     s.timed += t as u32;
                     s.fast += f as u32;
+                    s.far += r as u32;
+                    s.far_inside += i as u32;
                 }
                 Outcome::Glimpse { .. } | Outcome::Rejected { .. } | Outcome::Left => {}
             }
@@ -495,7 +512,7 @@ mod tests {
             let a = m.observe(&Record {
                 tick: n,
                 player: 5,
-                outcome: Outcome::Shot { hit: true, aim_err: WIDE, react: None },
+                outcome: Outcome::Shot { hit: true, aim_err: WIDE, react: None, size: 0.5 },
             });
             assert_eq!(
                 reasons(&a),
@@ -509,7 +526,7 @@ mod tests {
             let a = m.observe(&Record {
                 tick: n,
                 player: 5,
-                outcome: Outcome::Shot { hit: false, aim_err: EXACT, react: None },
+                outcome: Outcome::Shot { hit: false, aim_err: EXACT, react: None, size: 0.5 },
             });
             assert_eq!(
                 reasons(&a),
@@ -557,7 +574,9 @@ mod tests {
                 _ => {
                     // Untimed mostly; timed ones from instant to slow.
                     let react = (next() % 3 == 0).then(|| (next() % 10) as u32);
-                    t.shot(tick, p, next() % 3 == 0, if next() % 4 == 0 { 0.0 } else { 0.05 }, react)
+                    // Far (inside or not, by the aim) and near targets.
+                    let size = [0.02, 0.03, 0.06, 0.5][(next() % 4) as usize];
+                    t.shot(tick, p, next() % 3 == 0, if next() % 4 == 0 { 0.0 } else { 0.05 }, react, size)
                 }
             }
         }

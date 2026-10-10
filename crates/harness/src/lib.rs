@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use aegis_client_sdk::{
     aimbot::AimbotBot,
+    aimtrigger::AimTrigger,
     badversion::BadVersionBot,
     burst::BurstBot,
     camper::CamperBot,
@@ -210,6 +211,17 @@ impl Scenario {
             sc.bots.push(Box::new(StaleLiar::named(name, behind)));
         }
         Self { name: "stale_mix", ticks: CROWD_TICKS, rtt, ..sc }
+    }
+
+    /// The same crowd with four [`AimTrigger`]s instead — a human hand, a
+    /// machine trigger — what far_aim is measured on in the lab.
+    pub fn aim_mix(seed: u32, rtt: u32) -> Self {
+        let mut sc = Self::honest_crowd_of(seed, CROWD_SIZE - 4);
+        for k in 1..=4 {
+            sc.bots
+                .push(Box::new(AimTrigger::with_seed(seed.wrapping_mul(4).wrapping_add(k).wrapping_mul(0x9E37_79B9))));
+        }
+        Self { name: "aim_mix", ticks: CROWD_TICKS, rtt, ..sc }
     }
 }
 
@@ -415,11 +427,19 @@ pub struct Peak {
     pub aim_exact: f32,
     pub anomaly_rate: f32,
     pub reaction: f32,
+    /// far_aim: the raw share of far shots aimed inside, and its Wilson
+    /// lower bound (what the detector compares with its line).
+    pub far_aim: f32,
+    pub far_aim_bound: f32,
 }
 
 impl Peak {
     fn raise(&mut self, s: &PlayerStats) {
-        use aegis_detector::detectors::{accuracy, aim_exact, anomaly_rate, reaction};
+        use aegis_detector::detectors::{accuracy, aim_exact, anomaly_rate, far_aim, reaction};
+        if s.far >= far_aim::MIN_FAR {
+            self.far_aim = self.far_aim.max(s.far_inside as f32 / s.far as f32);
+            self.far_aim_bound = self.far_aim_bound.max(reaction::wilson_lower(s.far_inside, s.far, far_aim::Z));
+        }
         if s.timed >= reaction::MIN_TIMED {
             self.reaction = self.reaction.max(s.fast as f32 / s.timed as f32);
         }
@@ -1579,7 +1599,7 @@ mod tests {
             }
         }
         assert_eq!(flagged(r.bot("aimbot")), vec![FlagReason::AimExact, FlagReason::Reaction]);
-        assert_eq!(flagged(r.bot("humanized")), vec![FlagReason::Reaction]);
+        assert_eq!(flagged(r.bot("humanized")), vec![FlagReason::Reaction, FlagReason::FarAim]);
         let honest_flagged: Vec<_> = r.bots.iter().filter(|b| !b.alerts.is_empty()).map(|b| b.name).collect();
         assert!(
             honest_flagged.iter().all(|n| ["aimbot", "humanized", "triggerbot", "burst"].contains(n)),
@@ -1647,6 +1667,28 @@ mod tests {
         r
     }
 
+    /// The triggerbot as sold — human hand, machine trigger — is never exact
+    /// and reacts as fast as its hand turns, so far_aim is what names it, in
+    /// the lab as in the Godot demo (2026-10-10). At 0 and at a 100 ms round
+    /// trip: every aimtrigger flagged by far_aim and nothing else, nobody
+    /// honest by anything. `aegis-harness far 8 6`: 222 of 224 caught at
+    /// round trips 0–6 (the lab's hitbox is generous: 100% inside), 0 of 672
+    /// honest flagged.
+    #[test]
+    fn aimtrigger_is_caught_by_far_aim_and_nobody_honest_is() {
+        for rtt in [0, 3] {
+            let r = run(Scenario::aim_mix(0, rtt));
+            for b in &r.bots {
+                if b.name == "aimtrigger" {
+                    // far_aim alone: without it, nothing would name this bot.
+                    assert_eq!(flagged(b), vec![FlagReason::FarAim], "rtt {rtt}: {:?}", b.alerts);
+                } else {
+                    assert!(b.alerts.is_empty(), "rtt {rtt}: {} flagged {:?}", b.name, b.alerts);
+                }
+            }
+        }
+    }
+
     /// Coverage, pillar C: every detector is tripped by some bot. A detector
     /// no bot trips is a detector nobody has seen fire. Foresight needs a
     /// client that claims an older snapshot, which the standard scenario
@@ -1663,10 +1705,10 @@ mod tests {
     #[test]
     fn detector_names_each_cheat_and_nobody_else() {
         let r = standard();
-        assert_eq!(flagged(r.bot("aimbot")), vec![FlagReason::AimExact, FlagReason::Reaction]);
+        assert_eq!(flagged(r.bot("aimbot")), vec![FlagReason::AimExact, FlagReason::Reaction, FlagReason::FarAim]);
         assert_eq!(flagged(r.bot("speedhack")), vec![FlagReason::AnomalyRate]);
         assert_eq!(flagged(r.bot("burst")), vec![FlagReason::AimExact, FlagReason::Reaction]);
-        assert_eq!(flagged(r.bot("humanized")), vec![FlagReason::Reaction]);
+        assert_eq!(flagged(r.bot("humanized")), vec![FlagReason::Reaction, FlagReason::FarAim]);
         assert_eq!(flagged(r.bot("triggerbot")), vec![FlagReason::Reaction]);
         let cheats = ["aimbot", "speedhack", "burst", "humanized", "triggerbot"];
         for b in r.bots.iter().filter(|b| !cheats.contains(&b.name)) {
@@ -1696,15 +1738,17 @@ mod tests {
     /// Jitter hides the humanized aimbot from aim_exact, no guard sees it,
     /// and its hit rate is no longer a flag, because an honest rusher's
     /// reaches it too (accuracy left the suite 2026-10-08). What gives it
-    /// away is the trigger: it fires the tick it sees you.
+    /// away is the trigger — it fires the tick it sees you — and, since
+    /// 2026-10-10, that it does not miss far targets (far_aim, which a
+    /// point-blank rusher does not inflate).
     #[test]
-    fn humanized_aimbot_is_caught_by_reaction() {
+    fn humanized_aimbot_is_caught_by_reaction_and_far_aim() {
         let r = standard();
         let b = r.bot("humanized");
         assert_eq!(b.totals.total_rejected(), 0);
         assert_eq!(b.totals.anomalies, 0);
         assert!(b.accuracy() > 0.9, "humanized hit {:.2}: the evidence is still there", b.accuracy());
-        assert_eq!(flagged(b), vec![FlagReason::Reaction]);
+        assert_eq!(flagged(b), vec![FlagReason::Reaction, FlagReason::FarAim]);
     }
 
     /// The triggerbot plays like an honest walker with one difference: no

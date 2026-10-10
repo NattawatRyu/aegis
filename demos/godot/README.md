@@ -32,7 +32,10 @@ godot --headless --fixed-fps 30 --path demos/godot -- --ticks 9000 --seed 7
 
 This prints every alert and each player's stats. It exits 0 when the
 aimbot was flagged and no honest bot was. `crates/ffi/tests/godot.rs` runs
-3 seeds of it when `AEGIS_GODOT` points at the editor's console executable.
+3 seeds of it when `AEGIS_GODOT` points at the editor's console executable,
+plus 2 seeds of the harder roster. CI's `godot` job runs it on Linux with
+a pinned, SHA512-checked Godot 4.7.2 (`AEGIS_REQUIRE_GODOT`, so it cannot
+pass by skipping).
 
 What it showed that the lab could not, over 12 seeds of 5 minutes each:
 - **The aimbot** was flagged every time, within 7–22 s.

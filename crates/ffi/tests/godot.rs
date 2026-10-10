@@ -4,7 +4,8 @@
 //! honest bot may be (the demo's own VERDICT, exit 0).
 //!
 //! Needs the Godot .NET editor: set AEGIS_GODOT to its (console) executable.
-//! Unset, the test is skipped.
+//! Unset, the test is skipped — unless AEGIS_REQUIRE_GODOT is set, as in
+//! CI's `godot` job, which downloads a pinned, hash-checked editor.
 
 mod common;
 
@@ -16,6 +17,9 @@ use common::deps_dir;
 #[test]
 fn the_godot_demo_flags_the_aimbot_and_no_honest_bot() {
     let Some(godot) = std::env::var_os("AEGIS_GODOT").map(PathBuf::from) else {
+        // CI's godot job sets this, so a lost AEGIS_GODOT fails instead of
+        // passing on a skip.
+        assert!(std::env::var_os("AEGIS_REQUIRE_GODOT").is_none(), "AEGIS_REQUIRE_GODOT set but AEGIS_GODOT is not");
         eprintln!("skipped: AEGIS_GODOT not set");
         return;
     };

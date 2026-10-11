@@ -6,10 +6,12 @@
 //! ```text
 //! begin_tick  -> idle sessions end, respawns, then the snapshot clients act on
 //! receive     -> once per datagram:
-//!                address + token?  yes -> player budget -> decode -> tick proof -> pipeline
+//!                address + token?  yes -> player budget -> decode -> tick proof -> replay
+//!                                         -> stale tick -> pipeline -> lane (input_rate)
 //!                                  no  -> IP budget -> decode -> Join only
 //!                                         (no cookie -> Challenge; cookie -> admit)
-//! end_tick    -> shots against the pre-move world, then moves
+//! end_tick    -> one input per player off its lane (still in the history?),
+//!                shots against the pre-move world, then moves
 //! ```
 //!
 //! Identity is the source address **and** the session token issued to it. A
@@ -31,16 +33,23 @@ use aegis_telemetry::Telemetry;
 
 use crate::evidence::Evidence;
 use crate::guards::cookie::CookieJar;
+use crate::guards::replay::Replay;
 use crate::guards::session::{self, Session};
 use crate::guards::source_rate::SourceRate;
-use crate::guards::stale_tick::StaleTick;
+use crate::guards::stale_tick::{self, StaleTick};
 use crate::guards::tick_proof::TickProof;
-use crate::guards::{ip_sessions, joined, packet, version};
+use crate::guards::{input_rate, ip_sessions, joined, packet, version};
 use crate::history::Glimpse;
+use crate::inbox::Inbox;
 use crate::{ClientInput, GuardCtx, GuardVerdict, Pipeline, RejectReason, Sim, Visibility, Wall};
 
 /// [`NetStats`] label for a legal join refused because all 255 ids are taken.
 pub const SERVER_FULL: &str = "server_full";
+
+/// [`NetStats`] label for an authenticated input whose seq was already seen
+/// — a copy, or one overtaken on the way. Not a violation, so not on the
+/// player's record ([`crate::guards::replay`]).
+pub const LATE: &str = "late";
 
 /// A session with no authenticated datagram for longer than this (5 s) is
 /// ended: removed from the world, its id freed, a `Left` record written. A
@@ -62,6 +71,9 @@ pub struct TickOutcome {
     /// One entry per live shot whose aim can be held against an enemy only
     /// a newer snapshot than the claimed one showed ([`History::glimpse`]).
     pub glimpses: Vec<(PlayerId, Glimpse)>,
+    /// One entry per input taken off a lane: whose, and the ticks it waited
+    /// there ([`Inbox`]). 0 on a lockstep link.
+    pub waits: Vec<(PlayerId, u32)>,
 }
 
 /// Datagrams dropped without a player to pin them on: rate-budget drops
@@ -126,8 +138,11 @@ pub struct Server {
     proofs: TickProof,
     /// Player `id` enters at `spawns[(id - 1) % len]`.
     spawns: Vec<Vec2>,
-    /// Inputs accepted this tick, in arrival order, waiting for `end_tick`.
-    pending: Vec<(PlayerId, ClientInput)>,
+    /// Accepted inputs waiting to be folded in, one per player per
+    /// `end_tick` ([`Inbox`]).
+    inbox: Inbox,
+    /// Tells a replay from an input merely overtaken on the way ([`Replay`]).
+    replay: Replay,
 }
 
 /// What [`Server::receive`] asks the transport to send back to the source.
@@ -178,7 +193,8 @@ impl Server {
             token_key: LinkKey::random(),
             proofs: TickProof::new(),
             spawns,
-            pending: Vec::new(),
+            inbox: Inbox::default(),
+            replay: Replay::default(),
         }
     }
 
@@ -220,7 +236,8 @@ impl Server {
                 self.sim.despawn(s.player_id);
                 self.pipe.forget(s.player_id);
                 self.tokens[s.player_id as usize] = 0;
-                self.pending.retain(|&(p, _)| p != s.player_id);
+                self.inbox.forget(s.player_id);
+                self.replay.forget(s.player_id);
                 self.tel.left(tick, s.player_id);
             }
         }
@@ -335,6 +352,8 @@ impl Server {
         // A new session: proofs and claims start here, whatever the id held.
         self.tokens[player_id as usize] = s.token;
         self.stale.admitted(player_id, tick);
+        self.inbox.forget(player_id);
+        self.replay.forget(player_id);
         Some(s)
     }
 
@@ -366,21 +385,39 @@ impl Server {
                 }
             },
             ClientMsg::Input { seq, tick: client_tick, proof, move_dir, aim, shoot } => {
-                let claim = self
-                    .proofs
-                    .verify(player, s.token, client_tick, proof)
-                    .and_then(|()| self.stale.check(player, tick, client_tick));
-                if let Err(r) = claim {
+                if let Err(r) = self.proofs.verify(player, s.token, client_tick, proof) {
+                    self.tel.reject(tick, player, r.label());
+                    return None;
+                }
+                // Seen before: a copy or overtaken, dropped unrecorded —
+                // unless it is a run of them (a replay).
+                match self.replay.check(player, self.inbox.is_late(player, seq)) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.net.drop(LATE);
+                        return None;
+                    }
+                    Err(r) => {
+                        self.tel.reject(tick, player, r.label());
+                        return None;
+                    }
+                }
+                let (below, above) = self.inbox.neighbours(player, seq);
+                if let Err(r) = self.stale.check(player, tick, client_tick, below, above) {
                     self.tel.reject(tick, player, r.label());
                     return None;
                 }
                 let mut input = ClientInput { seq, tick: client_tick, move_dir, aim, shoot };
-                match self.pipe.run(&GuardCtx { tick, player }, &mut input) {
-                    GuardVerdict::Ok { anomaly } => {
+                let verdict = match self.pipe.run(&GuardCtx { tick, player }, &mut input) {
+                    GuardVerdict::Ok { anomaly } => input_rate::check(self.inbox.len(player)).map(|()| anomaly),
+                    GuardVerdict::Rejected(r) => Err(r),
+                };
+                match verdict {
+                    Ok(anomaly) => {
                         self.tel.accept(tick, player, anomaly);
-                        self.pending.push((player, input));
+                        self.inbox.push(player, input, tick);
                     }
-                    GuardVerdict::Rejected(r) => self.tel.reject(tick, player, r.label()),
+                    Err(r) => self.tel.reject(tick, player, r.label()),
                 }
                 None
             }
@@ -407,8 +444,17 @@ impl Server {
     /// trigger held through a respawn it had not seen yet) is no evidence
     /// and starts no run of fire: it was not aimed at anything.
     pub fn end_tick(&mut self, tick: u32) -> TickOutcome {
-        let pending = std::mem::take(&mut self.pending);
+        // One input per player off its lane. One that waited past the
+        // history has no frame left to be judged in.
         let mut out = TickOutcome::default();
+        let mut pending = Vec::new();
+        for (p, input, waited) in self.inbox.pop_all(tick) {
+            out.waits.push((p, waited));
+            match stale_tick::fresh(tick, input.tick) {
+                Ok(()) => pending.push((p, input)),
+                Err(r) => self.tel.reject(tick, p, r.label()),
+            }
+        }
         // Two end_ticks with no begin_tick between (only tests do this).
         if self.vis_stale {
             self.ev.begin_tick(tick, &self.sim);
@@ -915,7 +961,8 @@ mod tests {
 
     /// The edge: datagram MAX_PER_TICK from one player is decoded, the next is
     /// not — it never reaches the pipeline, so input_rate never sees it and
-    /// there is no record of it, only a counter.
+    /// there is no record of it, only a counter. Of the decoded ones, the
+    /// lane holds `DEPTH`.
     #[test]
     fn source_rate_drops_past_the_cap_before_decode() {
         let (mut s, t1, _) = joined_pair();
@@ -923,9 +970,47 @@ mod tests {
             s.receive(1, addr(1), &input(&s, t1, seq, Vec2::ZERO, Vec2::ZERO, false));
         }
         let t = s.telemetry().per_player(1);
-        assert_eq!((t.accepted, t.rejected.get("rate_exceeded").copied()), (1, Some(MAX_PER_TICK - 1)));
+        let lane = input_rate::DEPTH as u32;
+        assert_eq!((t.accepted, t.rejected.get("rate_exceeded").copied()), (lane, Some(MAX_PER_TICK - lane)));
         assert_eq!(s.net_stats().get("source_rate"), 1);
         assert_eq!(s.telemetry().len(), MAX_PER_TICK as usize);
+    }
+
+    /// The history edge again, where an input leaves the lane (B1): four
+    /// inputs claiming one snapshot arrive together `HISTORY - 3` ticks after
+    /// it, all fine at the door. Taken one a tick, the fourth is `HISTORY`
+    /// old by its turn — no frame left to judge it in — and is refused then.
+    #[test]
+    fn an_input_that_waits_past_the_history_is_refused_when_taken() {
+        let (mut s, t1, _) = joined_pair();
+        let (claimed, arrive) = (5, 5 + HISTORY - 3);
+        for t in 1..arrive {
+            s.begin_tick(t);
+            s.end_tick(t);
+        }
+        s.begin_tick(arrive);
+        let proof = s.tick_proof(1, claimed);
+        for seq in 1..=4 {
+            let m = ClientMsg::Input {
+                seq,
+                tick: claimed,
+                proof,
+                move_dir: Vec2::new(1.0, 0.0),
+                aim: Vec2::new(1.0, 0.0),
+                shoot: false,
+            };
+            s.receive(arrive, addr(1), &frame(t1, &m));
+        }
+        let mut moved = Vec::new();
+        for t in arrive..arrive + 4 {
+            if t > arrive {
+                s.begin_tick(t);
+            }
+            moved.push(s.end_tick(t).steps.len());
+        }
+        assert_eq!(moved, vec![1, 1, 1, 0]);
+        let p1 = s.telemetry().per_player(1);
+        assert_eq!((p1.accepted, p1.rejected.get("stale_tick").copied()), (4, Some(1)));
     }
 
     #[test]

@@ -1,75 +1,61 @@
 //! G4 input-rate guard
-//! STOPS: speedhack / action-spam via more than one input per player per tick
-//! HOW:   record the last tick each player was accepted; a second input in the
-//!        same tick is rejected. The sim folds at most one input per tick, so
-//!        flooding buys the attacker nothing.
-//! EDGE:  first input in a tick accepted; 2nd/3rd in the SAME tick rejected;
-//!        the next tick accepts again.
+//! STOPS: speedhack / action-spam via more inputs than ticks, and a client
+//!        banking inputs to spend later
+//! HOW:   inputs wait in the player's [`crate::inbox::Inbox`] lane, and the
+//!        sim folds at most one per tick, so flooding buys no extra
+//!        movement. The lane holds at most `DEPTH`; an input arriving to a
+//!        full one is rejected.
+//! EDGE:  `DEPTH - 1` waiting -> accepted | `DEPTH` waiting -> rejected |
+//!        the next pop makes room again.
+//!
+//! Stage guard (B1): runs after the pipeline, at the queue. Before B1 it
+//! refused a second input on one tick, which on a jittery link refused an
+//! honest player's — two inputs land together and the next tick none does.
+//! `DEPTH` 4 rides out 3 ticks (100 ms) of jitter; what waits longer lags
+//! only the player who sent it.
 
-use super::{ClientInput, GuardCtx, GuardVerdict, InputGuard, RejectReason};
-use std::collections::HashMap;
+use super::RejectReason;
 
-#[derive(Default)]
-pub struct InputRateGuard {
-    /// player -> last tick for which an input was accepted
-    last_tick: HashMap<u8, u32>,
-}
+/// Inputs one player may have waiting.
+pub const DEPTH: usize = 4;
 
-impl InputRateGuard {
-    pub fn new() -> Self {
-        Self::default()
+/// May an input join a lane with `waiting` inputs in it?
+pub fn check(waiting: usize) -> Result<(), RejectReason> {
+    if waiting >= DEPTH {
+        return Err(RejectReason::RateExceeded);
     }
-}
-
-impl InputGuard for InputRateGuard {
-    fn name(&self) -> &'static str {
-        "input_rate"
-    }
-
-    fn forget(&mut self, player: u8) {
-        self.last_tick.remove(&player);
-    }
-
-    fn check(&mut self, ctx: &GuardCtx, _input: &mut ClientInput) -> GuardVerdict {
-        match self.last_tick.get(&ctx.player) {
-            Some(&t) if t == ctx.tick => GuardVerdict::Rejected(RejectReason::RateExceeded),
-            _ => {
-                self.last_tick.insert(ctx.player, ctx.tick);
-                GuardVerdict::Ok { anomaly: false }
-            }
-        }
-    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inbox::Inbox;
+    use crate::ClientInput;
     use aegis_protocol::Vec2;
 
-    fn input() -> ClientInput {
-        ClientInput { seq: 1, tick: 1, move_dir: Vec2::ZERO, aim: Vec2::new(1.0, 0.0), shoot: false }
+    #[test]
+    fn depth_edge() {
+        assert_eq!(check(DEPTH - 1), Ok(()));
+        assert_eq!(check(DEPTH), Err(RejectReason::RateExceeded));
     }
 
+    /// A flood of 100 inputs in one tick: `DEPTH` wait, the rest are
+    /// refused, and each tick folds exactly one of them.
     #[test]
-    fn one_per_tick_accepted_extras_rejected() {
-        let mut g = InputRateGuard::new();
-        let ctx = GuardCtx { tick: 7, player: 1 };
-        assert_eq!(g.check(&ctx, &mut input()), GuardVerdict::Ok { anomaly: false });
-        assert_eq!(g.check(&ctx, &mut input()), GuardVerdict::Rejected(RejectReason::RateExceeded));
-        assert_eq!(g.check(&ctx, &mut input()), GuardVerdict::Rejected(RejectReason::RateExceeded));
-    }
-
-    #[test]
-    fn next_tick_accepts_again() {
-        let mut g = InputRateGuard::new();
-        assert_eq!(g.check(&GuardCtx { tick: 7, player: 1 }, &mut input()), GuardVerdict::Ok { anomaly: false });
-        assert_eq!(g.check(&GuardCtx { tick: 8, player: 1 }, &mut input()), GuardVerdict::Ok { anomaly: false });
-    }
-
-    #[test]
-    fn different_players_are_independent() {
-        let mut g = InputRateGuard::new();
-        assert_eq!(g.check(&GuardCtx { tick: 7, player: 1 }, &mut input()), GuardVerdict::Ok { anomaly: false });
-        assert_eq!(g.check(&GuardCtx { tick: 7, player: 2 }, &mut input()), GuardVerdict::Ok { anomaly: false });
+    fn a_flood_waits_at_most_depth_and_drains_one_a_tick() {
+        let mut b = Inbox::default();
+        let mut refused = 0;
+        for seq in 1..=100 {
+            match check(b.len(1)) {
+                Ok(()) => {
+                    b.push(1, ClientInput { seq, tick: 1, move_dir: Vec2::ZERO, aim: Vec2::ZERO, shoot: false }, 1)
+                }
+                Err(_) => refused += 1,
+            }
+        }
+        assert_eq!((b.len(1), refused), (DEPTH, 100 - DEPTH));
+        assert_eq!(b.pop_all(1).len(), 1);
+        assert_eq!(check(b.len(1)), Ok(()), "a pop makes room");
     }
 }

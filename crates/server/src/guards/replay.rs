@@ -1,76 +1,91 @@
 //! G5 replay guard
-//! STOPS: replay / seq reuse — resending a captured old input, or reordering
-//! HOW:   require the per-player `seq` to be strictly increasing; a seq <= the
-//!        last accepted one is a stale/replayed packet and is rejected.
-//! EDGE:  first seq (any value) accepted; equal seq rejected; lower seq
-//!        rejected; strictly higher seq accepted.
+//! STOPS: replay — resending a captured input, over and over
+//! HOW:   an input whose seq was already seen (taken, older than taken, or
+//!        waiting: [`crate::inbox::Inbox::is_late`]) is dropped either way;
+//!        it changes nothing. A run of `STALE_RUN` of them in a row, with no
+//!        new seq between, is a replay and is rejected — every one from
+//!        then until a new seq arrives.
+//! EDGE:  `STALE_RUN - 1` stale in a row -> dropped silently |
+//!        `STALE_RUN`th -> rejected | a new seq resets the run.
+//!
+//! Stage guard (B1): runs after the tick proof, before the queue. Before B1
+//! every stale seq was rejected, so a datagram merely overtaken on the way
+//! went on an honest player's record. Overtaken ones come singly, or a few
+//! at a time — never `STALE_RUN` in a row while new inputs are still
+//! arriving — up to 3 ticks of jitter (100 ms), past which an honest
+//! player could trip it.
 
-use super::{ClientInput, GuardCtx, GuardVerdict, InputGuard, RejectReason};
-use std::collections::HashMap;
+use super::RejectReason;
+use aegis_protocol::PlayerId;
 
-#[derive(Default)]
-pub struct ReplayGuard {
-    /// player -> highest seq accepted so far
-    last_seq: HashMap<u8, u32>,
+/// Stale inputs in a row that make a replay.
+pub const STALE_RUN: u8 = 4;
+
+pub struct Replay {
+    run: Box<[u8; 256]>,
 }
 
-impl ReplayGuard {
-    pub fn new() -> Self {
-        Self::default()
+impl Default for Replay {
+    fn default() -> Self {
+        Self { run: Box::new([0; 256]) }
     }
 }
 
-impl InputGuard for ReplayGuard {
-    fn name(&self) -> &'static str {
-        "replay"
-    }
-
-    fn forget(&mut self, player: u8) {
-        self.last_seq.remove(&player);
-    }
-
-    fn check(&mut self, ctx: &GuardCtx, input: &mut ClientInput) -> GuardVerdict {
-        match self.last_seq.get(&ctx.player) {
-            Some(&s) if input.seq <= s => GuardVerdict::Rejected(RejectReason::Replay),
-            _ => {
-                self.last_seq.insert(ctx.player, input.seq);
-                GuardVerdict::Ok { anomaly: false }
-            }
+impl Replay {
+    /// An input from `player` arrived, `late` or not. `Ok(true)`: new, go on.
+    /// `Ok(false)`: stale, drop it unrecorded. `Err`: a replay.
+    pub fn check(&mut self, player: PlayerId, late: bool) -> Result<bool, RejectReason> {
+        let run = &mut self.run[player as usize];
+        if !late {
+            *run = 0;
+            return Ok(true);
         }
+        *run = run.saturating_add(1);
+        if *run >= STALE_RUN {
+            return Err(RejectReason::Replay);
+        }
+        Ok(false)
+    }
+
+    /// `player`'s session ended: whoever holds the id next starts clean.
+    pub fn forget(&mut self, player: PlayerId) {
+        self.run[player as usize] = 0;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aegis_protocol::Vec2;
 
-    fn input_seq(seq: u32) -> ClientInput {
-        ClientInput { seq, tick: 1, move_dir: Vec2::ZERO, aim: Vec2::new(1.0, 0.0), shoot: false }
+    #[test]
+    fn run_edge() {
+        let mut g = Replay::default();
+        assert_eq!(g.check(1, false), Ok(true));
+        for _ in 1..STALE_RUN {
+            assert_eq!(g.check(1, true), Ok(false));
+        }
+        assert_eq!(g.check(1, true), Err(RejectReason::Replay));
+        assert_eq!(g.check(1, true), Err(RejectReason::Replay), "still a replay");
     }
 
     #[test]
-    fn strictly_increasing_seq_accepted() {
-        let mut g = ReplayGuard::new();
-        let ctx = GuardCtx { tick: 1, player: 1 };
-        assert_eq!(g.check(&ctx, &mut input_seq(1)), GuardVerdict::Ok { anomaly: false });
-        assert_eq!(g.check(&ctx, &mut input_seq(2)), GuardVerdict::Ok { anomaly: false });
-        assert_eq!(g.check(&ctx, &mut input_seq(3)), GuardVerdict::Ok { anomaly: false });
+    fn a_new_seq_resets_the_run() {
+        let mut g = Replay::default();
+        for _ in 1..STALE_RUN {
+            g.check(1, true).unwrap();
+        }
+        assert_eq!(g.check(1, false), Ok(true));
+        assert_eq!(g.check(1, true), Ok(false));
     }
 
     #[test]
-    fn replayed_equal_seq_rejected() {
-        let mut g = ReplayGuard::new();
-        let ctx = GuardCtx { tick: 1, player: 1 };
-        assert_eq!(g.check(&ctx, &mut input_seq(5)), GuardVerdict::Ok { anomaly: false });
-        assert_eq!(g.check(&ctx, &mut input_seq(5)), GuardVerdict::Rejected(RejectReason::Replay));
-    }
-
-    #[test]
-    fn out_of_order_lower_seq_rejected() {
-        let mut g = ReplayGuard::new();
-        let ctx = GuardCtx { tick: 1, player: 1 };
-        assert_eq!(g.check(&ctx, &mut input_seq(10)), GuardVerdict::Ok { anomaly: false });
-        assert_eq!(g.check(&ctx, &mut input_seq(4)), GuardVerdict::Rejected(RejectReason::Replay));
+    fn forget_and_players_are_independent() {
+        let mut g = Replay::default();
+        for _ in 1..STALE_RUN {
+            g.check(1, true).unwrap();
+        }
+        assert_eq!(g.check(2, true), Ok(false));
+        g.forget(1);
+        assert_eq!(g.check(1, true), Ok(false));
     }
 }

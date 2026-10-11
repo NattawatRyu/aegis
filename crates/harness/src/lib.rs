@@ -82,6 +82,13 @@ pub struct Scenario {
     /// bot sends reaches the server `rtt / 2` ticks after. 0 = lockstep.
     /// In-process run only ([`run`]).
     pub rtt: u32,
+    /// On top of `rtt / 2`, each datagram a bot sends takes 0..=`jitter`
+    /// more ticks to land, drawn per datagram — so two can land on one tick,
+    /// a tick can get none, and a later one can overtake. In-process only.
+    pub jitter: u32,
+    /// Per mille of the datagrams a bot sends after the handshake that never
+    /// land. In-process only.
+    pub loss: u32,
 }
 
 impl Scenario {
@@ -94,6 +101,8 @@ impl Scenario {
             name: "standard",
             ticks: CROWD_TICKS,
             rtt: 0,
+            jitter: 0,
+            loss: 0,
             bots: vec![
                 Box::new(HonestBot::new()),
                 Box::new(SpeedhackBot::new()),
@@ -143,6 +152,8 @@ impl Scenario {
             name: "honest_lobby",
             ticks: 300,
             rtt: 0,
+            jitter: 0,
+            loss: 0,
             bots: (0..LOBBY_SIZE)
                 .map(|k| {
                     Box::new(HonestBot::with_seed(seed.wrapping_mul(LOBBY_SIZE).wrapping_add(k + 1))) as Box<dyn Bot>
@@ -174,6 +185,8 @@ impl Scenario {
             name: "honest_crowd",
             ticks: 300,
             rtt: 0,
+            jitter: 0,
+            loss: 0,
             bots: (0..size)
                 .map(|k| {
                     let s = seed.wrapping_mul(size).wrapping_add(k + 1);
@@ -248,6 +261,8 @@ impl Scenario {
             ticks: 60,
             bots: vec![Box::new(HonestBot::new()), Box::new(DirectBot::new())],
             rtt: 0,
+            jitter: 0,
+            loss: 0,
         }
     }
 
@@ -262,6 +277,8 @@ impl Scenario {
             ticks: 60,
             bots: vec![Box::new(SniffBot::new()), Box::new(HonestBot::new())],
             rtt: 0,
+            jitter: 0,
+            loss: 0,
         }
     }
 
@@ -276,6 +293,8 @@ impl Scenario {
             ticks: 60,
             bots: vec![Box::new(HonestBot::new()), Box::new(TickLiar::new()), Box::new(StaleLiar::ancient())],
             rtt: 0,
+            jitter: 0,
+            loss: 0,
         }
     }
 
@@ -319,6 +338,17 @@ pub struct BotReport {
     /// ticks — what an uncull'd snapshot would have leaked. `hidden` of
     /// `walled` is how much of it got out.
     pub walled: u32,
+    /// Inputs the sim folded into the world for this player (one per tick at
+    /// most) — against the inputs it sent, how much of what it pressed the
+    /// world felt.
+    pub moved: u32,
+    /// Datagrams it put on the wire after the handshake, and of those, ones
+    /// the lag sim dropped ([`Scenario::loss`]).
+    pub sent: u32,
+    pub lost: u32,
+    /// Ticks its inputs waited in the server's lane before being folded in,
+    /// summed (B1). 0 on a lockstep link.
+    pub waited: u64,
     /// What the online detector raised on this player, fed the run's telemetry
     /// one record at a time in stream order (what a live server would feed
     /// it), each with the tick it fired.
@@ -653,6 +683,10 @@ struct Lab {
     max_step: Vec<f32>,
     hidden: Vec<u32>,
     walled: Vec<u32>,
+    moved: Vec<u32>,
+    sent: Vec<u32>,
+    lost: Vec<u32>,
+    waited: Vec<u64>,
     bystander: Traffic,
 }
 
@@ -667,6 +701,10 @@ impl Lab {
             max_step: vec![0.0; n],
             hidden: vec![0; n],
             walled: vec![0; n],
+            moved: vec![0; n],
+            sent: vec![0; n],
+            lost: vec![0; n],
+            waited: vec![0; n],
             bystander: Traffic::default(),
         }
     }
@@ -705,6 +743,11 @@ impl Lab {
         for (p, d) in out.steps {
             let s = self.slot(p);
             self.max_step[s] = self.max_step[s].max(d);
+            self.moved[s] += 1;
+        }
+        for (p, w) in out.waits {
+            let s = self.slot(p);
+            self.waited[s] += u64::from(w);
         }
         for (p, shown) in out.hits {
             let s = self.slot(p);
@@ -741,6 +784,10 @@ impl Lab {
                     max_step: self.max_step[i],
                     hidden: self.hidden[i],
                     walled: self.walled[i],
+                    moved: self.moved[i],
+                    sent: self.sent[i],
+                    lost: self.lost[i],
+                    waited: self.waited[i],
                     alerts,
                 }
             })
@@ -790,7 +837,9 @@ pub fn run(mut sc: Scenario) -> Report {
     // bot's proof and view), and the datagrams on their way up: (tick it
     // lands, bot, port, bytes).
     let mut sent: VecDeque<Vec<(u32, Vec<PlayerState>)>> = VecDeque::new();
-    let mut inflight: VecDeque<(u32, usize, u16, Vec<u8>)> = VecDeque::new();
+    // Keyed by landing tick; within one, in the order sent.
+    let mut inflight: BTreeMap<u32, Vec<(usize, u16, Vec<u8>)>> = BTreeMap::new();
+    let lockstep = up == 0 && sc.jitter == 0 && sc.loss == 0;
     for tick in 1..=sc.ticks {
         let mut c = TickCost::default();
         let t = Instant::now();
@@ -815,8 +864,7 @@ pub fn run(mut sc: Scenario) -> Report {
         let mut retry = Vec::new();
         // What went out `up` ticks ago lands now, before anything sent this
         // tick.
-        while inflight.front().is_some_and(|&(at, ..)| at == tick) {
-            let (_, i, k, d) = inflight.pop_front().expect("checked");
+        for (i, k, d) in inflight.remove(&tick).unwrap_or_default() {
             hand_over(&mut server, &mut lab, &mut retry, &mut c, tick, &route, i, k, &d);
         }
         sent.push_back(views);
@@ -841,13 +889,20 @@ pub fn run(mut sc: Scenario) -> Report {
             if down == 0 {
                 lab.count_hidden(i, server.sim(), seen);
             }
-            for (k, d) in bot.routed(&lab.ctx(i, seen_tick, proof, seen)) {
+            for (j, (k, d)) in bot.routed(&lab.ctx(i, seen_tick, proof, seen)).into_iter().enumerate() {
                 wire[i].push(d.clone());
-                if up == 0 {
+                lab.sent[i] += 1;
+                if lockstep {
                     hand_over(&mut server, &mut lab, &mut retry, &mut c, tick, &route, i, k, &d);
-                } else {
-                    inflight.push_back((tick + up, i, k, d));
+                    continue;
                 }
+                let r = link_draw(tick, i, j);
+                if (r % 1000) < u64::from(sc.loss) {
+                    lab.lost[i] += 1;
+                    continue;
+                }
+                let late = (r >> 32) % (u64::from(sc.jitter) + 1);
+                inflight.entry(tick + up + late as u32).or_default().push((i, k, d));
             }
         }
         finish(&mut server, &mut lab, &mut cost, c, tick, retry);
@@ -855,6 +910,16 @@ pub fn run(mut sc: Scenario) -> Report {
 
     let (tel, net) = server.into_parts();
     Report { frames, cost, ..lab.report(&sc, tel, net) }
+}
+
+/// The lag sim's draw for the `j`th datagram bot `i` sent on `tick`:
+/// splitmix64 of the three, so a run is the same every time and one
+/// datagram's fate does not shift another's.
+fn link_draw(tick: u32, i: usize, j: usize) -> u64 {
+    let mut z = (u64::from(tick) << 32 | (i as u64) << 16 | j as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 /// Hand the server datagram `d`, which bot `i` sent from its port `k`, on
@@ -926,7 +991,7 @@ pub fn run_relay(sc: Scenario) -> io::Result<Report> {
 }
 
 fn run_net(mut sc: Scenario, relayed: bool) -> io::Result<Report> {
-    assert_eq!(sc.rtt, 0, "lag is simulated in-process only");
+    assert_eq!((sc.rtt, sc.jitter, sc.loss), (0, 0, 0), "lag is simulated in-process only");
     let n = sc.bots.len();
     let mut net = NetServer::bind((Ipv4Addr::LOCALHOST, 0), Server::with_walls(spawns(n), &ARENA_WALLS))?;
     let origin = net.local_addr()?;
@@ -1414,14 +1479,17 @@ mod tests {
     }
 
     /// Two layers: source_rate drops everything past the cap undecoded (a
-    /// counter, no record), then input_rate lets one of the rest through.
+    /// counter, no record), then input_rate lets the rest wait only while
+    /// the lane has room: it fills to `DEPTH` on the first tick and gets
+    /// one in a tick after. Either way the sim folds one a tick.
     #[test]
     fn flood_gets_exactly_one_input_per_tick_and_most_is_never_decoded() {
         let r = standard();
         let b = r.bot("flood");
-        assert_eq!(b.totals.accepted, r.ticks);
-        assert_eq!(rejected(b, "rate_exceeded"), (MAX_PER_TICK - 1) * r.ticks);
-        assert_eq!(b.totals.total_rejected(), (MAX_PER_TICK - 1) * r.ticks);
+        let lane = aegis_server::guards::input_rate::DEPTH as u32;
+        assert_eq!((b.totals.accepted, b.moved), (r.ticks + lane - 1, r.ticks));
+        assert_eq!(rejected(b, "rate_exceeded"), MAX_PER_TICK * r.ticks - b.totals.accepted);
+        assert_eq!(b.totals.total_rejected(), rejected(b, "rate_exceeded"));
     }
 
     /// Every source-rate drop is accounted for: the flood's excess over its
@@ -1446,12 +1514,17 @@ mod tests {
         assert_eq!(aegis_relay::join_rate::MAX_PER_WINDOW, MAX_PER_TICK);
     }
 
+    /// The first copy is new and folded in; the next `STALE_RUN - 1` are
+    /// dropped as late, unrecorded (B1: could be overtaken on the way); from
+    /// then on every one is a replay.
     #[test]
     fn replay_gets_only_its_first_input() {
         let r = standard();
         let b = r.bot("replay");
-        assert_eq!(b.totals.accepted, 1);
-        assert_eq!(rejected(b, "replay"), r.ticks - 1);
+        let quiet = u32::from(aegis_server::guards::replay::STALE_RUN) - 1;
+        assert_eq!((b.totals.accepted, b.moved), (1, 1));
+        assert_eq!(rejected(b, "replay"), r.ticks - 1 - quiet);
+        assert_eq!(r.net.get(aegis_server::server::LATE), u64::from(quiet));
     }
 
     /// Forged datagrams from the victim's address get nothing: the victim
@@ -1578,6 +1651,43 @@ mod tests {
             out.entry(b.name).or_default().extend(ks);
         }
         out
+    }
+
+    /// The lag sim's link (B0): loss drops about its share of what each bot
+    /// sends and nothing else, jitter drops nothing, and both are the same
+    /// on every run — a baseline that moved between runs could not be
+    /// compared against.
+    #[test]
+    fn link_drops_its_share_and_runs_the_same_twice() {
+        let clean = run(Scenario::lag_mix(0, 4));
+        let lossy = run(Scenario { loss: 100, ..Scenario::lag_mix(0, 4) });
+        let jittery = || run(Scenario { jitter: 2, ..Scenario::lag_mix(0, 4) });
+        let (j1, j2) = (jittery(), jittery());
+        for (((c, l), a), b) in clean.bots.iter().zip(&lossy.bots).zip(&j1.bots).zip(&j2.bots) {
+            assert_eq!(c.lost, 0, "{}", c.name);
+            assert_eq!((c.sent, a.sent, a.lost), (l.sent, c.sent, 0), "{}", c.name);
+            let share = l.lost as f32 / l.sent.max(1) as f32;
+            assert!(l.sent < 100 || (0.07..0.13).contains(&share), "{}: lost {share}", c.name);
+            assert_eq!((&a.totals, a.moved, &a.alerts), (&b.totals, b.moved, &b.alerts), "{}", a.name);
+        }
+        assert_eq!(format!("{:?}", j1.telemetry.records()), format!("{:?}", j2.telemetry.records()));
+    }
+
+    /// B1's point: up to 3 ticks of upstream jitter cost an honest player
+    /// nothing — no input refused, none put on its record, nobody flagged,
+    /// and every input it sent folded into the world but the few overtaken
+    /// past their turn. Before the lane, this crowd had 44.7% of its honest
+    /// input refused (`rate_exceeded`, `stale_tick`; `aegis-harness net`).
+    #[test]
+    fn jitter_costs_an_honest_player_nothing() {
+        const CHEATS: [&str; 4] = ["aimbot", "humanized", "triggerbot", "burst"];
+        let r = run(Scenario { jitter: 3, ..Scenario::lag_mix(0, 4) });
+        for b in r.bots.iter().filter(|b| !CHEATS.contains(&b.name)) {
+            assert_eq!(b.totals.total_rejected(), 0, "{}: {:?}", b.name, b.totals);
+            assert!(b.alerts.is_empty(), "{}: {:?}", b.name, b.alerts);
+            assert!(b.moved as f32 >= 0.98 * b.sent as f32, "{}: felt {} of {}", b.name, b.moved, b.sent);
+        }
+        assert!(r.bots.iter().filter(|b| CHEATS.contains(&b.name)).all(|b| !b.alerts.is_empty()));
     }
 
     /// Lag no longer hides an instant bot or makes an honest player look
@@ -1997,7 +2107,8 @@ mod tests {
     /// relay, an on-path attacker reads the honest player's token and seq off
     /// the wire and takes its player: from the tick after it first overhears,
     /// its forgery reaches the server first and is accepted under the
-    /// victim's id, and the victim's own input that tick is refused — the
+    /// victim's id, and the victim's own input that tick is refused or
+    /// dropped as late — the
     /// player walks where the sniffer says and never fires. Behind a relay it
     /// reads the sid and noise: every forgery dies at the edge as
     /// `bad_token`, and the victim plays the whole match untouched.
@@ -2009,8 +2120,13 @@ mod tests {
             [("in-process", run(Scenario::sniff_probe())), ("udp", run_udp(Scenario::sniff_probe()).unwrap())]
         {
             let v = open.bot(sniff::VICTIM);
-            assert_eq!(v.totals.accepted, ticks, "{transport}: {:?}", v.totals); // its first + every forgery
-            assert_eq!(v.totals.total_rejected(), forged, "{transport}: the victim kept its player: {:?}", v.totals);
+            // Its first + every forgery.
+            assert_eq!(v.totals.accepted, ticks, "{transport}: {:?}", v.totals);
+            // Refused every tick: its seq is behind the forgery's, so late
+            // (dropped unrecorded, B1), or its claim is newer than the
+            // waiting forgery's (stale_tick).
+            let refused = u64::from(v.totals.total_rejected()) + open.net.get(aegis_server::server::LATE);
+            assert_eq!(refused, u64::from(forged), "{transport}: the victim kept its player: {:?}", v.totals);
             assert_eq!(v.shots, 0, "{transport}: the victim fired, so it was still playing");
         }
         let sealed = run_relay(Scenario::sniff_probe()).unwrap();

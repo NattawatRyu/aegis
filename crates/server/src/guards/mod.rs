@@ -5,8 +5,8 @@
 //! function, for guards that don't run per-input), and add one line to
 //! [`Pipeline::standard`]. Nothing else in the server needs to change.
 //!
-//! Nine guards run at their own stage rather than in the per-input pipeline,
-//! because they act on data the pipeline never sees:
+//! Eleven guards run at their own stage rather than in the per-input
+//! pipeline, because they act on data the pipeline never sees:
 //!   - [`session`] — runs first, on the source address + token header.
 //!   - [`source_rate`] — then, per player or per source IP, before any decode.
 //!   - [`packet`]  — runs at decode, on the raw datagram bytes.
@@ -17,7 +17,11 @@
 //!   - [`joined`]  — runs before the pipeline, on the admitted source addresses.
 //!   - [`tick_proof`] — runs before the pipeline, on the snapshot tick an
 //!     input claims and that snapshot's proof.
-//!   - [`stale_tick`] — then, on how old that claimed tick is.
+//!   - [`replay`] — then, on whether the input's seq is new, against the
+//!     player's [`crate::inbox::Inbox`] lane.
+//!   - [`stale_tick`] — then, on how old that claimed tick is, and against
+//!     its neighbours' claims in seq order; again when it leaves the lane.
+//!   - [`input_rate`] — after the pipeline, on how full the lane is.
 //!
 //! Hit / movement authority is NOT a guard: the protocol gives a client no way
 //! to assert a position or a hit, so there is nothing to reject. That defense
@@ -146,14 +150,7 @@ impl Pipeline {
     /// The standard chain, in run order. This list IS the documentation of what
     /// the server defends against per input.
     pub fn standard() -> Self {
-        Self {
-            guards: vec![
-                Box::new(sanity::SanityGuard),
-                Box::new(input_rate::InputRateGuard::new()),
-                Box::new(replay::ReplayGuard::new()),
-                Box::new(move_speed::MoveSpeedGuard),
-            ],
-        }
+        Self { guards: vec![Box::new(sanity::SanityGuard), Box::new(move_speed::MoveSpeedGuard)] }
     }
 
     /// Names in run order — handy for tests and for a `/defenses` endpoint.
@@ -195,9 +192,9 @@ mod tests {
     }
 
     #[test]
-    fn standard_pipeline_runs_all_four_in_order() {
+    fn standard_pipeline_runs_both_in_order() {
         let p = Pipeline::standard();
-        assert_eq!(p.names(), vec!["sanity", "input_rate", "replay", "move_speed"]);
+        assert_eq!(p.names(), vec!["sanity", "move_speed"]);
     }
 
     #[test]
@@ -206,29 +203,5 @@ mod tests {
         let mut i = input();
         let v = p.run(&GuardCtx { tick: 1, player: 1 }, &mut i);
         assert_eq!(v, GuardVerdict::Ok { anomaly: false });
-    }
-
-    /// A reused id starts clean: after `forget`, a fresh client's first input
-    /// (seq 1, same tick as the old player's last) is not a "replay" and not
-    /// "over rate".
-    #[test]
-    fn forgotten_player_starts_clean() {
-        let mut p = Pipeline::standard();
-        let ctx = GuardCtx { tick: 5, player: 1 };
-        let mut old = ClientInput { seq: 500, ..input() };
-        assert_eq!(p.run(&ctx, &mut old), GuardVerdict::Ok { anomaly: false });
-        p.forget(1);
-        let mut fresh = input(); // seq 1
-        assert_eq!(p.run(&ctx, &mut fresh), GuardVerdict::Ok { anomaly: false });
-    }
-
-    #[test]
-    fn second_input_same_tick_is_rejected_rate() {
-        let mut p = Pipeline::standard();
-        let ctx = GuardCtx { tick: 1, player: 1 };
-        let mut a = input();
-        assert_eq!(p.run(&ctx, &mut a), GuardVerdict::Ok { anomaly: false });
-        let mut b = ClientInput { seq: 2, ..input() };
-        assert_eq!(p.run(&ctx, &mut b), GuardVerdict::Rejected(RejectReason::RateExceeded));
     }
 }

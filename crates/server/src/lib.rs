@@ -6,7 +6,8 @@
 //!   - [`guards`] — the input-trust pipeline. Each cheat class is one module;
 //!     see [`guards`] for the full list and how to add more.
 //!
-//! [`server`] ties them into a tick (receive -> guards -> sim -> telemetry)
+//! [`server`] ties them into a tick (receive -> guards -> [`inbox`] -> sim ->
+//! telemetry)
 //! without owning a socket; [`net`] puts it behind a UDP socket. The
 //! in-process harness and the UDP loop drive the exact same code.
 
@@ -14,6 +15,7 @@ pub mod cull;
 pub mod evidence;
 pub mod guards;
 pub mod history;
+pub mod inbox;
 pub mod net;
 pub mod reaction;
 pub mod server;
@@ -61,24 +63,27 @@ mod integration {
         assert_eq!(sim.player(1).unwrap().pos, sim.player(2).unwrap().pos);
     }
 
-    /// A flood of inputs in one tick advances the player exactly once: the sim
-    /// only ever folds the first accepted input; input_rate rejects the rest.
+    /// A flood of inputs in one tick advances the player exactly once that
+    /// tick: input_rate lets `DEPTH` wait, and the sim folds one a tick.
     #[test]
     fn input_flood_advances_only_one_tick_of_movement() {
         let mut pipe = Pipeline::standard();
+        let mut inbox = inbox::Inbox::default();
         let mut sim = Sim::new();
         sim.spawn(1, Vec2::ZERO);
 
         let ctx = GuardCtx { tick: 1, player: 1 };
-        let mut accepted = 0;
         for seq in 1..=100 {
             let mut i = ClientInput { seq, tick: 1, move_dir: Vec2::new(1.0, 0.0), aim: Vec2::ZERO, shoot: false };
-            if let GuardVerdict::Ok { .. } = pipe.run(&ctx, &mut i) {
-                sim.apply_move(1, i.move_dir);
-                accepted += 1;
+            if let (GuardVerdict::Ok { .. }, Ok(())) = (pipe.run(&ctx, &mut i), guards::input_rate::check(inbox.len(1)))
+            {
+                inbox.push(1, i, 1);
             }
         }
-        assert_eq!(accepted, 1);
+        assert_eq!(inbox.len(1), guards::input_rate::DEPTH);
+        for (p, i, _) in inbox.pop_all(1) {
+            sim.apply_move(p, i.move_dir);
+        }
         assert_eq!(sim.player(1).unwrap().pos, Vec2::new(sim::MOVE_SPEED, 0.0));
     }
 }

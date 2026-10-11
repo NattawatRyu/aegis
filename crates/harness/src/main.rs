@@ -59,6 +59,11 @@ fn main() -> std::io::Result<()> {
         lag(seeds, args.get(3).and_then(|s| s.parse().ok()).unwrap_or(6), stale);
         return Ok(());
     }
+    if args.get(1).map(String::as_str) == Some("net") {
+        let seeds = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8);
+        net(seeds, args.get(3).and_then(|s| s.parse().ok()).unwrap_or(4));
+        return Ok(());
+    }
     if args.get(1).map(String::as_str) == Some("foresight") {
         let seeds = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8);
         foresight(seeds, args.get(3).and_then(|s| s.parse().ok()).unwrap_or(6));
@@ -398,6 +403,72 @@ fn lag(seeds: u32, max_rtt: u32, stale: bool) {
             );
         }
         println!();
+    }
+}
+
+/// What an imperfect link does to honest play: lag_mix crowds at round
+/// trip `rtt`, over a grid of jitter and loss on the way up. Pillar B's
+/// baseline — what the netcode is there to fix.
+fn net(seeds: u32, rtt: u32) {
+    use std::collections::BTreeMap;
+
+    const CHEATS: [&str; 4] = ["aimbot", "humanized", "triggerbot", "burst"];
+
+    println!("lag_mix crowds: {seeds} per cell, rtt {rtt}, {} ticks", aegis_harness::CROWD_TICKS);
+    println!("jitter = up to that many extra ticks per datagram on the way up; loss in per mille");
+    println!("lost/rejected/felt as % of the inputs honest players sent");
+    println!("late = inputs dropped as already seen (overtaken), % of what every player sent (counted unattributed)");
+    println!("wait = mean ticks an honest input sat in the server's lane");
+    println!("felt = inputs the sim folded in; flagged = honest players any detector raised; caught = cheats raised\n");
+    println!(
+        "{:>6} {:>5} {:>7} {:>6} {:>9} {:>6} {:>6} {:>5} {:>8} {:>8}  rejected by reason",
+        "jitter", "loss", "sent", "lost%", "rejected%", "late%", "felt%", "wait", "flagged", "caught"
+    );
+    for jitter in 0..=3 {
+        for loss in [0, 20, 50, 100] {
+            let (mut sent, mut lost, mut felt, mut rejected, mut late, mut waited) =
+                (0u32, 0u32, 0u32, 0u32, 0u64, 0u64);
+            let (mut flagged, mut honest, mut caught, mut cheats, mut all_sent) = (0u32, 0u32, 0u32, 0u32, 0u64);
+            let mut why: BTreeMap<&str, u32> = BTreeMap::new();
+            for seed in 0..seeds {
+                let r = run(Scenario { jitter, loss, ..Scenario::lag_mix(seed, rtt) });
+                late += r.net.get(aegis_server::server::LATE);
+                all_sent += r.bots.iter().map(|b| u64::from(b.sent)).sum::<u64>();
+                for b in r.bots.iter().filter(|b| b.id.is_some()) {
+                    if CHEATS.contains(&b.name) {
+                        cheats += 1;
+                        caught += u32::from(!b.alerts.is_empty());
+                        continue;
+                    }
+                    honest += 1;
+                    flagged += u32::from(!b.alerts.is_empty());
+                    sent += b.sent;
+                    lost += b.lost;
+                    felt += b.moved;
+                    waited += b.waited;
+                    rejected += b.totals.total_rejected();
+                    for (&k, &v) in &b.totals.rejected {
+                        *why.entry(k).or_default() += v;
+                    }
+                }
+            }
+            let pct = |x: u32| 100.0 * x as f32 / sent.max(1) as f32;
+            let why: Vec<String> = why.iter().map(|(k, v)| format!("{k} {v}")).collect();
+            println!(
+                "{:>6} {:>5} {:>7} {:>5.1}% {:>8.1}% {:>5.1}% {:>5.1}% {:>5.2} {:>8} {:>8}  {}",
+                jitter,
+                loss,
+                sent,
+                pct(lost),
+                pct(rejected),
+                100.0 * late as f32 / all_sent.max(1) as f32,
+                pct(felt),
+                waited as f32 / felt.max(1) as f32,
+                format!("{flagged}/{honest}"),
+                format!("{caught}/{cheats}"),
+                why.join(", ")
+            );
+        }
     }
 }
 

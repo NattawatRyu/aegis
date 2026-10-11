@@ -47,7 +47,15 @@ impl Bot for HumanizedAimbot {
             Some(e) => (rotate(unit_towards(me, e.pos), jitter(&mut self.rng) * JITTER_RAD), true),
             None => (Vec2::new(1.0, 0.0), false),
         };
-        vec![ClientMsg::Input { seq: self.seq, tick: ctx.tick, proof: ctx.proof, move_dir: Vec2::ZERO, aim, shoot }]
+        vec![ClientMsg::Input {
+            seq: self.seq,
+            tick: ctx.tick,
+            proof: ctx.proof,
+            move_dir: Vec2::ZERO,
+            aim,
+            shoot,
+            older: Vec::new(),
+        }]
     }
 }
 

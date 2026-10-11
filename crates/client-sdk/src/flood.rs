@@ -45,6 +45,7 @@ impl Bot for FloodBot {
                 move_dir: Vec2::new(1.0, 0.0),
                 aim: Vec2::new(1.0, 0.0),
                 shoot: false,
+                older: Vec::new(),
             });
         }
         out

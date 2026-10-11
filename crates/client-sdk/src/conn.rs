@@ -13,14 +13,17 @@
 //!   4. every [`Received::Snapshot`] carries a proof of its tick; an input
 //!      names the tick it was chosen on — the one the client *displayed* —
 //!      and [`Connection::input`] echoes that tick's proof. The server keeps
-//!      16 ticks, so so does this.
+//!      16 ticks, so so does this;
+//!   5. every input also carries the last [`MAX_OLDER`] the server has not
+//!      acknowledged (a snapshot's `ack`), so a lost datagram is resent
+//!      inside the next ones — no timer, no retransmit of its own.
 //!
 //! Through a relay every datagram is sealed under the [`ClientKeys`] the
 //! game's backend issued; directly to an origin, nothing is.
 
 use aegis_protocol::{
-    decode, frame, open_down, seal_up, ClientKeys, ClientMsg, EdgeError, EventKind, PlayerId, PlayerState, ServerMsg,
-    Vec2, NO_TOKEN, PROTOCOL_VERSION,
+    decode, frame, open_down, seal_up, ClientKeys, ClientMsg, EdgeError, EventKind, InputFrame, PlayerId, PlayerState,
+    ServerMsg, Vec2, MAX_OLDER, NO_TOKEN, PROTOCOL_VERSION,
 };
 
 /// Snapshots whose proofs are kept: as many as the server judges against
@@ -85,6 +88,11 @@ pub struct Connection {
     newest: Option<u32>,
     claimed: Option<u32>,
     players: Vec<PlayerState>,
+    /// The newest inputs sent and not yet acknowledged, oldest first, at
+    /// most [`MAX_OLDER`]: what the next input carries along.
+    unacked: Vec<InputFrame>,
+    /// The highest `ack` seen.
+    ack: u32,
 }
 
 impl Connection {
@@ -101,6 +109,8 @@ impl Connection {
             newest: None,
             claimed: None,
             players: Vec::new(),
+            unacked: Vec::new(),
+            ack: 0,
         }
     }
 
@@ -128,7 +138,18 @@ impl Connection {
         }
         self.claimed = Some(tick);
         self.seq += 1;
-        Ok(self.wire(frame(token, &ClientMsg::Input { seq: self.seq, tick, proof, move_dir, aim, shoot })))
+        let f = InputFrame { seq: self.seq, tick, proof, move_dir, aim, shoot };
+        let msg = ClientMsg::input_with(f, self.unacked.clone());
+        self.unacked.push(f);
+        if self.unacked.len() > MAX_OLDER {
+            self.unacked.remove(0);
+        }
+        Ok(self.wire(frame(token, &msg)))
+    }
+
+    /// The seq of the last input the server says it took (0: none yet).
+    pub fn ack(&self) -> u32 {
+        self.ack
     }
 
     /// Read one datagram from the server (opened in place when sealed).
@@ -147,8 +168,12 @@ impl Connection {
                 self.cookie = Some(cookie);
                 Received::Challenge
             }
-            ServerMsg::Snapshot { tick, proof, players } => {
+            ServerMsg::Snapshot { tick, proof, ack, players } => {
                 self.proofs[tick as usize % PROOFS] = Some((tick, proof));
+                // An older snapshot's ack is older too: never go back.
+                self.ack = self.ack.max(ack);
+                let acked = self.ack;
+                self.unacked.retain(|f| f.seq > acked);
                 if self.newest.is_none_or(|n| tick > n) {
                     self.newest = Some(tick);
                     self.players = players;
@@ -186,7 +211,7 @@ mod tests {
     use aegis_protocol::{encode, mint_connect, open_up, seal_down, split_frame, EdgeKey};
 
     fn snap(tick: u32) -> Vec<u8> {
-        encode(&ServerMsg::Snapshot { tick, proof: tick * 7 + 1, players: Vec::new() })
+        encode(&ServerMsg::Snapshot { tick, proof: tick * 7 + 1, ack: 0, players: Vec::new() })
     }
 
     fn input_of(wire: &[u8]) -> (u64, ClientMsg) {
@@ -238,12 +263,39 @@ mod tests {
         ));
     }
 
+    fn seqs(wire: &[u8]) -> Vec<u32> {
+        input_of(wire).1.frames().iter().map(|f| f.seq).collect()
+    }
+
+    /// Every input carries the last MAX_OLDER unacknowledged ones, oldest
+    /// first; an ack prunes at and below it, and an older ack never undoes
+    /// a newer one.
+    #[test]
+    fn inputs_carry_what_is_not_acknowledged() {
+        let mut c = Connection::new("riw", None);
+        c.receive(&mut encode(&ServerMsg::Joined { player_id: 1, token: 9, tick: 0 })).unwrap();
+        c.receive(&mut snap(1)).unwrap();
+        let send = |c: &mut Connection| seqs(&c.input(None, Vec2::ZERO, Vec2::ZERO, false).unwrap());
+        assert_eq!(send(&mut c), [1]);
+        assert_eq!(send(&mut c), [1, 2]);
+        assert_eq!(send(&mut c), [1, 2, 3]);
+        assert_eq!(send(&mut c), [2, 3, 4], "never more than MAX_OLDER along");
+        let acked = |tick, ack| encode(&ServerMsg::Snapshot { tick, proof: tick * 7 + 1, ack, players: Vec::new() });
+        c.receive(&mut acked(2, 3)).unwrap();
+        assert_eq!((c.ack(), send(&mut c)), (3, vec![4, 5]));
+        c.receive(&mut acked(1, 1)).unwrap();
+        assert_eq!((c.ack(), send(&mut c)), (3, vec![4, 5, 6]), "an older ack is ignored");
+        c.receive(&mut acked(3, 6)).unwrap();
+        assert_eq!(send(&mut c), [7]);
+    }
+
     #[test]
     fn an_older_snapshot_is_a_proof_not_the_picture() {
         let mut c = Connection::new("riw", None);
         let me = |x| ServerMsg::Snapshot {
             tick: x as u32,
             proof: 0,
+            ack: 0,
             players: vec![PlayerState { id: 1, pos: Vec2::new(x, 0.0), health: 100, alive: true }],
         };
         c.receive(&mut encode(&me(5.0))).unwrap();

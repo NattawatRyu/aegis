@@ -36,6 +36,7 @@ use aegis_client_sdk::{
     humanized::HumanizedAimbot,
     joinflood::JoinFloodBot,
     nan::NanBot,
+    redundant::Redundant,
     reflect::{ReflectBot, BYSTANDER},
     replay::ReplayBot,
     rusher::RusherBot,
@@ -48,6 +49,13 @@ use aegis_client_sdk::{
     zeroflood::ZeroFloodBot,
     Bot, BotCtx,
 };
+
+/// A bot that plays like a real client sends like one: every input with the
+/// unacknowledged ones before it (v5). A bot attacking a guard's edge stays
+/// raw — its one frame per datagram is the attack.
+fn real<B: Bot + 'static>(bot: B) -> Box<dyn Bot> {
+    Box::new(Redundant::new(bot))
+}
 use aegis_detector::{Alert, Monitor, PlayerStats};
 use aegis_protocol::{
     decode, encode, frame, mint_connect, open_down, seal_up, split_frame, ClientKeys, ClientMsg, EdgeKey, LinkKey,
@@ -104,22 +112,22 @@ impl Scenario {
             jitter: 0,
             loss: 0,
             bots: vec![
-                Box::new(HonestBot::new()),
+                real(HonestBot::new()),
                 Box::new(SpeedhackBot::new()),
                 Box::new(FloodBot::default()),
                 Box::new(ReplayBot::new()),
                 Box::new(BadVersionBot::new()),
                 Box::new(GarbageBot::new()),
                 Box::new(NanBot::new()),
-                Box::new(AimbotBot::new()),
-                Box::new(HumanizedAimbot::new()),
+                real(AimbotBot::new()),
+                real(HumanizedAimbot::new()),
                 Box::new(SpoofBot::new()),
                 Box::new(JoinFloodBot::new()),
                 Box::new(ReflectBot::new()),
-                Box::new(EspBot::new()),
+                real(EspBot::new()),
                 Box::new(ZeroFloodBot::new()),
-                Box::new(BurstBot::new()),
-                Box::new(TriggerBot::new()),
+                real(BurstBot::new()),
+                real(TriggerBot::new()),
             ],
         }
     }
@@ -155,9 +163,7 @@ impl Scenario {
             jitter: 0,
             loss: 0,
             bots: (0..LOBBY_SIZE)
-                .map(|k| {
-                    Box::new(HonestBot::with_seed(seed.wrapping_mul(LOBBY_SIZE).wrapping_add(k + 1))) as Box<dyn Bot>
-                })
+                .map(|k| real(HonestBot::with_seed(seed.wrapping_mul(LOBBY_SIZE).wrapping_add(k + 1))) as Box<dyn Bot>)
                 .collect(),
         }
     }
@@ -191,9 +197,9 @@ impl Scenario {
                 .map(|k| {
                     let s = seed.wrapping_mul(size).wrapping_add(k + 1);
                     match k % 4 {
-                        0 => Box::new(HonestBot::with_seed(s)) as Box<dyn Bot>,
-                        2 => Box::new(CamperBot::with_seed(s)),
-                        _ => Box::new(RusherBot::with_seed(s)),
+                        0 => real(HonestBot::with_seed(s)) as Box<dyn Bot>,
+                        2 => real(CamperBot::with_seed(s)),
+                        _ => real(RusherBot::with_seed(s)),
                     }
                 })
                 .collect(),
@@ -208,10 +214,10 @@ impl Scenario {
     /// reaction detector on, as latency grows.
     pub fn lag_mix(seed: u32, rtt: u32) -> Self {
         let mut sc = Self::honest_crowd_of(seed, CROWD_SIZE - 4);
-        sc.bots.push(Box::new(AimbotBot::new()));
-        sc.bots.push(Box::new(HumanizedAimbot::new()));
-        sc.bots.push(Box::new(TriggerBot::new()));
-        sc.bots.push(Box::new(BurstBot::new()));
+        sc.bots.push(real(AimbotBot::new()));
+        sc.bots.push(real(HumanizedAimbot::new()));
+        sc.bots.push(real(TriggerBot::new()));
+        sc.bots.push(real(BurstBot::new()));
         Self { name: "lag_mix", ticks: CROWD_TICKS, rtt, ..sc }
     }
 
@@ -231,8 +237,7 @@ impl Scenario {
     pub fn aim_mix(seed: u32, rtt: u32) -> Self {
         let mut sc = Self::honest_crowd_of(seed, CROWD_SIZE - 4);
         for k in 1..=4 {
-            sc.bots
-                .push(Box::new(AimTrigger::with_seed(seed.wrapping_mul(4).wrapping_add(k).wrapping_mul(0x9E37_79B9))));
+            sc.bots.push(real(AimTrigger::with_seed(seed.wrapping_mul(4).wrapping_add(k).wrapping_mul(0x9E37_79B9))));
         }
         Self { name: "aim_mix", ticks: CROWD_TICKS, rtt, ..sc }
     }
@@ -259,7 +264,7 @@ impl Scenario {
         Self {
             name: "relay_probe",
             ticks: 60,
-            bots: vec![Box::new(HonestBot::new()), Box::new(DirectBot::new())],
+            bots: vec![real(HonestBot::new()), Box::new(DirectBot::new())],
             rtt: 0,
             jitter: 0,
             loss: 0,
@@ -275,7 +280,7 @@ impl Scenario {
         Self {
             name: "sniff_probe",
             ticks: 60,
-            bots: vec![Box::new(SniffBot::new()), Box::new(HonestBot::new())],
+            bots: vec![Box::new(SniffBot::new()), real(HonestBot::new())],
             rtt: 0,
             jitter: 0,
             loss: 0,
@@ -291,7 +296,7 @@ impl Scenario {
         Self {
             name: "proof_probe",
             ticks: 60,
-            bots: vec![Box::new(HonestBot::new()), Box::new(TickLiar::new()), Box::new(StaleLiar::ancient())],
+            bots: vec![real(HonestBot::new()), Box::new(TickLiar::new()), Box::new(StaleLiar::ancient())],
             rtt: 0,
             jitter: 0,
             loss: 0,
@@ -836,7 +841,7 @@ pub fn run(mut sc: Scenario) -> Report {
     // The snapshots sent on the last `down + 1` ticks, oldest first (each
     // bot's proof and view), and the datagrams on their way up: (tick it
     // lands, bot, port, bytes).
-    let mut sent: VecDeque<Vec<(u32, Vec<PlayerState>)>> = VecDeque::new();
+    let mut sent: VecDeque<Vec<(u32, u32, Vec<PlayerState>)>> = VecDeque::new();
     // Keyed by landing tick; within one, in the order sent.
     let mut inflight: BTreeMap<u32, Vec<(usize, u16, Vec<u8>)>> = BTreeMap::new();
     let lockstep = up == 0 && sc.jitter == 0 && sc.loss == 0;
@@ -849,17 +854,21 @@ pub fn run(mut sc: Scenario) -> Report {
         // Each admitted address is sent its player's view, all taken before
         // any input this tick (as the UDP run sends them all first).
         let t = Instant::now();
-        let views: Vec<(u32, Vec<PlayerState>)> = (0..n)
+        let views: Vec<(u32, u32, Vec<PlayerState>)> = (0..n)
             .map(|i| match server.player_id(mem_addr(i, 0)) {
-                Some(p) => (server.tick_proof(p, tick), server.view(p)),
-                None => (0, Vec::new()),
+                Some(p) => (server.tick_proof(p, tick), server.ack(p), server.view(p)),
+                None => (0, 0, Vec::new()),
             })
             .collect();
         c.views = t.elapsed();
         if let Some(p) = server.player_id(bystander) {
-            lab.bystander.rx +=
-                encode(&ServerMsg::Snapshot { tick, proof: server.tick_proof(p, tick), players: server.view(p) }).len()
-                    as u64;
+            lab.bystander.rx += encode(&ServerMsg::Snapshot {
+                tick,
+                proof: server.tick_proof(p, tick),
+                ack: server.ack(p),
+                players: server.view(p),
+            })
+            .len() as u64;
         }
         let mut retry = Vec::new();
         // What went out `up` ticks ago lands now, before anything sent this
@@ -885,7 +894,8 @@ pub fn run(mut sc: Scenario) -> Report {
             if let Some(v) = taps[i] {
                 heard[v].iter().for_each(|w| bot.overheard(w));
             }
-            let (proof, seen) = (views[i].0, &views[i].1);
+            let (proof, seen) = (views[i].0, &views[i].2);
+            bot.acked(views[i].1);
             if down == 0 {
                 lab.count_hidden(i, server.sim(), seen);
             }
@@ -1093,10 +1103,11 @@ fn run_net(mut sc: Scenario, relayed: bool) -> io::Result<Report> {
             }
             // The server's word on who is admitted decides only whether to
             // wait for a snapshot; what is in it is read off the socket.
-            let (proof, snapshot) = match net.server().player_id(socks[i][0].local_addr()?) {
+            let (proof, ack, snapshot) = match net.server().player_id(socks[i][0].local_addr()?) {
                 Some(_) => read_snapshot(&socks[i][0], to, keys[i].as_ref(), tick, &mut lab.sessions[i])?,
-                None => (0, Vec::new()),
+                None => (0, 0, Vec::new()),
             };
+            bot.acked(ack);
             lab.count_hidden(i, net.server().sim(), &snapshot);
             for (k, d) in bot.routed(&lab.ctx(i, tick, proof, &snapshot)) {
                 if route[i] == n {
@@ -1372,11 +1383,11 @@ fn read_snapshot(
     keys: Option<&ClientKeys>,
     tick: u32,
     session: &mut Option<Session>,
-) -> io::Result<(u32, Vec<PlayerState>)> {
+) -> io::Result<(u32, u32, Vec<PlayerState>)> {
     loop {
         match decode::<ServerMsg>(&recv_from_server(sock, server, keys)?) {
             Ok(ServerMsg::Joined { player_id, token, .. }) => *session = Some(Session { player_id, token }),
-            Ok(ServerMsg::Snapshot { tick: t, proof, players }) if t == tick => return Ok((proof, players)),
+            Ok(ServerMsg::Snapshot { tick: t, proof, ack, players }) if t == tick => return Ok((proof, ack, players)),
             other => {
                 let msg = format!("tick {tick}: expected a snapshot, got {other:?}");
                 return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
@@ -1687,6 +1698,25 @@ mod tests {
             assert!(b.alerts.is_empty(), "{}: {:?}", b.name, b.alerts);
             assert!(b.moved as f32 >= 0.98 * b.sent as f32, "{}: felt {} of {}", b.name, b.moved, b.sent);
         }
+        assert!(r.bots.iter().filter(|b| CHEATS.contains(&b.name)).all(|b| !b.alerts.is_empty()));
+    }
+
+    /// B2's point: with 10% of datagrams lost on top of 3 ticks of jitter,
+    /// an honest player still feels at least 98% of what it sent — each
+    /// input rides in three datagrams — with nothing refused, nobody honest
+    /// flagged and every cheat caught. One frame a datagram (B1) felt 80.6%
+    /// in the same crowd (`aegis-harness net`) and caught 18 cheats in 32.
+    #[test]
+    fn redundancy_recovers_what_loss_and_jitter_drop() {
+        const CHEATS: [&str; 4] = ["aimbot", "humanized", "triggerbot", "burst"];
+        let r = run(Scenario { jitter: 3, loss: 100, ..Scenario::lag_mix(0, 4) });
+        for b in r.bots.iter().filter(|b| !CHEATS.contains(&b.name)) {
+            assert_eq!(b.totals.total_rejected(), 0, "{}: {:?}", b.name, b.totals);
+            assert!(b.alerts.is_empty(), "{}: {:?}", b.name, b.alerts);
+            assert!(b.lost > 0, "{}: the link lost nothing", b.name);
+            assert!(b.moved as f32 >= 0.98 * b.sent as f32, "{}: felt {} of {}", b.name, b.moved, b.sent);
+        }
+        assert!(r.net.recovered > 0);
         assert!(r.bots.iter().filter(|b| CHEATS.contains(&b.name)).all(|b| !b.alerts.is_empty()));
     }
 
@@ -2007,7 +2037,15 @@ mod tests {
         let (token, body) = split_frame(&retry).unwrap();
         assert_eq!((token, decode::<ClientMsg>(body).unwrap()), (NO_TOKEN, join(Some(42))));
         assert_eq!(with_cookie(&frame(NO_TOKEN, &join(Some(7))), 42), None); // already has one
-        let input = ClientMsg::Input { seq: 1, tick: 1, proof: 0, move_dir: Vec2::ZERO, aim: Vec2::ZERO, shoot: false };
+        let input = ClientMsg::Input {
+            seq: 1,
+            tick: 1,
+            proof: 0,
+            move_dir: Vec2::ZERO,
+            aim: Vec2::ZERO,
+            shoot: false,
+            older: Vec::new(),
+        };
         assert_eq!(with_cookie(&frame(9, &input), 42), None);
         assert_eq!(with_cookie(&[1, 2, 3], 42), None); // not even a frame
     }

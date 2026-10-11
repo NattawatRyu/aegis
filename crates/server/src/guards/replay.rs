@@ -1,19 +1,21 @@
 //! G5 replay guard
 //! STOPS: replay — resending a captured input, over and over
-//! HOW:   an input whose seq was already seen (taken, older than taken, or
-//!        waiting: [`crate::inbox::Inbox::is_late`]) is dropped either way;
-//!        it changes nothing. A run of `STALE_RUN` of them in a row, with no
-//!        new seq between, is a replay and is rejected — every one from
-//!        then until a new seq arrives.
+//! HOW:   a datagram with no input frame whose seq is new (each one taken,
+//!        older than taken, waiting or refused:
+//!        [`crate::inbox::Inbox::is_late`]) is dropped either way; it changes
+//!        nothing. A run of `STALE_RUN` such datagrams in a row, with no new
+//!        seq between, is a replay and is rejected — every one from then
+//!        until a new seq arrives.
 //! EDGE:  `STALE_RUN - 1` stale in a row -> dropped silently |
 //!        `STALE_RUN`th -> rejected | a new seq resets the run.
 //!
-//! Stage guard (B1): runs after the tick proof, before the queue. Before B1
-//! every stale seq was rejected, so a datagram merely overtaken on the way
-//! went on an honest player's record. Overtaken ones come singly, or a few
-//! at a time — never `STALE_RUN` in a row while new inputs are still
-//! arriving — up to 3 ticks of jitter (100 ms), past which an honest
-//! player could trip it.
+//! Stage guard (B1): runs after the frames are judged. Before B1 every
+//! stale seq was rejected, so a datagram merely overtaken on the way went
+//! on an honest player's record. Overtaken ones come singly, or a few at a
+//! time — never `STALE_RUN` in a row while new inputs are still arriving —
+//! up to 3 ticks of jitter (100 ms), past which an honest player could
+//! trip it. Counted per datagram, not per frame (B2): an honest client
+//! resends every unacknowledged input, so most of its frames are copies.
 
 use super::RejectReason;
 use aegis_protocol::PlayerId;

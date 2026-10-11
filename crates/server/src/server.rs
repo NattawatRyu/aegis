@@ -6,8 +6,9 @@
 //! ```text
 //! begin_tick  -> idle sessions end, respawns, then the snapshot clients act on
 //! receive     -> once per datagram:
-//!                address + token?  yes -> player budget -> decode -> tick proof -> replay
-//!                                         -> stale tick -> pipeline -> lane (input_rate)
+//!                address + token?  yes -> player budget -> decode -> per frame, oldest first:
+//!                                         seen? skip | tick proof -> stale tick -> pipeline
+//!                                         -> lane (input_rate); then replay (nothing new?)
 //!                                  no  -> IP budget -> decode -> Join only
 //!                                         (no cookie -> Challenge; cookie -> admit)
 //! end_tick    -> one input per player off its lane (still in the history?),
@@ -28,7 +29,9 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 
-use aegis_protocol::{split_frame, ClientMsg, LinkKey, PlayerId, PlayerState, ServerMsg, Vec2, NO_TOKEN, TICK_HZ};
+use aegis_protocol::{
+    split_frame, ClientMsg, InputFrame, LinkKey, PlayerId, PlayerState, ServerMsg, Vec2, NO_TOKEN, TICK_HZ,
+};
 use aegis_telemetry::Telemetry;
 
 use crate::evidence::Evidence;
@@ -83,6 +86,9 @@ pub struct TickOutcome {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct NetStats {
     pub dropped: BTreeMap<&'static str, u64>,
+    /// Not a drop: input frames taken in from a datagram's `older` copies —
+    /// each one an input its own datagram did not deliver.
+    pub recovered: u64,
 }
 
 impl NetStats {
@@ -384,44 +390,60 @@ impl Server {
                     None
                 }
             },
-            ClientMsg::Input { seq, tick: client_tick, proof, move_dir, aim, shoot } => {
-                if let Err(r) = self.proofs.verify(player, s.token, client_tick, proof) {
-                    self.tel.reject(tick, player, r.label());
-                    return None;
+            msg @ ClientMsg::Input { .. } => {
+                // Oldest first, each frame judged once: one seen before (a
+                // copy, or overtaken) is skipped before its proof is spent.
+                let frames = msg.frames();
+                let newest = frames.len() - 1;
+                let mut fresh = false;
+                for (i, f) in frames.into_iter().enumerate() {
+                    if self.inbox.is_late(player, f.seq) {
+                        continue;
+                    }
+                    fresh = true;
+                    match self.judge(tick, s, f) {
+                        Ok(()) if i < newest => self.net.recovered += 1,
+                        Ok(()) => {}
+                        Err(r) => {
+                            self.tel.reject(tick, player, r.label());
+                            self.inbox.refuse(player, f.seq);
+                        }
+                    }
                 }
-                // Seen before: a copy or overtaken, dropped unrecorded —
-                // unless it is a run of them (a replay).
-                match self.replay.check(player, self.inbox.is_late(player, seq)) {
+                // Nothing new: dropped unrecorded — unless it is a run of
+                // such datagrams (a replay).
+                match self.replay.check(player, !fresh) {
                     Ok(true) => {}
-                    Ok(false) => {
-                        self.net.drop(LATE);
-                        return None;
-                    }
-                    Err(r) => {
-                        self.tel.reject(tick, player, r.label());
-                        return None;
-                    }
-                }
-                let (below, above) = self.inbox.neighbours(player, seq);
-                if let Err(r) = self.stale.check(player, tick, client_tick, below, above) {
-                    self.tel.reject(tick, player, r.label());
-                    return None;
-                }
-                let mut input = ClientInput { seq, tick: client_tick, move_dir, aim, shoot };
-                let verdict = match self.pipe.run(&GuardCtx { tick, player }, &mut input) {
-                    GuardVerdict::Ok { anomaly } => input_rate::check(self.inbox.len(player)).map(|()| anomaly),
-                    GuardVerdict::Rejected(r) => Err(r),
-                };
-                match verdict {
-                    Ok(anomaly) => {
-                        self.tel.accept(tick, player, anomaly);
-                        self.inbox.push(player, input, tick);
-                    }
+                    Ok(false) => self.net.drop(LATE),
                     Err(r) => self.tel.reject(tick, player, r.label()),
                 }
                 None
             }
         }
+    }
+
+    /// One input frame not seen before: tick proof, stale tick, pipeline,
+    /// lane. Accepted onto the lane, or why not.
+    fn judge(&mut self, tick: u32, s: Session, f: InputFrame) -> Result<(), RejectReason> {
+        let player = s.player_id;
+        self.proofs.verify(player, s.token, f.tick, f.proof)?;
+        let (below, above) = self.inbox.neighbours(player, f.seq);
+        self.stale.check(player, tick, f.tick, below, above)?;
+        let mut input = ClientInput { seq: f.seq, tick: f.tick, move_dir: f.move_dir, aim: f.aim, shoot: f.shoot };
+        let anomaly = match self.pipe.run(&GuardCtx { tick, player }, &mut input) {
+            GuardVerdict::Ok { anomaly } => anomaly,
+            GuardVerdict::Rejected(r) => return Err(r),
+        };
+        input_rate::check(self.inbox.len(player))?;
+        self.tel.accept(tick, player, anomaly);
+        self.inbox.push(player, input, tick);
+        Ok(())
+    }
+
+    /// The `ack` for player `id`'s snapshot: the seq of the last input taken
+    /// from its lane, 0 for none ([`ServerMsg::Snapshot`]).
+    pub fn ack(&self, id: PlayerId) -> u32 {
+        self.inbox.taken(id)
     }
 
     /// Fold this tick's accepted inputs into the world. Shots resolve against
@@ -547,6 +569,7 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guards::replay::STALE_RUN;
     use crate::guards::source_rate::MAX_PER_TICK;
     use crate::history::HISTORY;
     use crate::sim::{MAX_HEALTH, MOVE_SPEED, SHOT_DAMAGE};
@@ -584,7 +607,7 @@ mod tests {
         let tick = s.ev.history().latest().unwrap_or(0);
         let player = s.sessions.values().find(|x| x.token == token).map(|x| x.player_id);
         let proof = player.map_or(0, |p| s.tick_proof(p, tick));
-        frame(token, &ClientMsg::Input { seq, tick, proof, move_dir, aim, shoot })
+        frame(token, &ClientMsg::Input { seq, tick, proof, move_dir, aim, shoot, older: Vec::new() })
     }
 
     fn walk(s: &Server, token: u64, seq: u32) -> Vec<u8> {
@@ -998,6 +1021,7 @@ mod tests {
                 move_dir: Vec2::new(1.0, 0.0),
                 aim: Vec2::new(1.0, 0.0),
                 shoot: false,
+                older: Vec::new(),
             };
             s.receive(arrive, addr(1), &frame(t1, &m));
         }
@@ -1048,6 +1072,92 @@ mod tests {
         assert_eq!(s.sim().player(1).unwrap().pos, Vec2::new(MOVE_SPEED, 0.0));
         // the queue drained: a second end_tick does nothing
         assert_eq!(s.end_tick(1), TickOutcome::default());
+    }
+
+    /// One datagram carrying `seqs` (oldest first, the last its own), each a
+    /// walk claiming the newest snapshot with its real proof.
+    fn walks(s: &Server, token: u64, seqs: &[u32]) -> Vec<u8> {
+        let tick = s.ev.history().latest().unwrap_or(0);
+        let p = s.sessions.values().find(|x| x.token == token).expect("a live session").player_id;
+        let proof = s.tick_proof(p, tick);
+        let f = |seq| InputFrame {
+            seq,
+            tick,
+            proof,
+            move_dir: Vec2::new(1.0, 0.0),
+            aim: Vec2::new(1.0, 0.0),
+            shoot: false,
+        };
+        let (&own, older) = seqs.split_last().expect("at least one frame");
+        frame(token, &ClientMsg::input_with(f(own), older.iter().copied().map(f).collect()))
+    }
+
+    /// A datagram lost on the way costs nothing: the next one carries it.
+    /// Copies of what already arrived are skipped, not judged again.
+    #[test]
+    fn older_frames_recover_a_lost_datagram_and_copies_are_skipped() {
+        let (mut s, t1, _) = joined_pair();
+        s.begin_tick(1);
+        s.receive(1, addr(1), &walks(&s, t1, &[1]));
+        s.end_tick(1);
+        assert_eq!(s.ack(1), 1);
+        s.begin_tick(2);
+        // [2] was lost; [1, 2, 3] brings 2 back, and 1 is a copy.
+        s.receive(2, addr(1), &walks(&s, t1, &[1, 2, 3]));
+        assert_eq!((s.inbox.len(1), s.net_stats().recovered, s.net_stats().get(LATE)), (2, 1, 0));
+        assert_eq!(s.telemetry().per_player(1).accepted, 3, "each frame on the record once");
+        s.end_tick(2);
+        assert_eq!(s.ack(1), 2, "one a tick still");
+    }
+
+    /// A datagram with nothing new is late; a run of them is a replay, and
+    /// one new frame anywhere in a datagram ends the run.
+    #[test]
+    fn a_run_of_datagrams_with_nothing_new_is_a_replay() {
+        let (mut s, t1, _) = joined_pair();
+        s.begin_tick(1);
+        s.receive(1, addr(1), &walks(&s, t1, &[1, 2, 3]));
+        for _ in 0..STALE_RUN - 1 {
+            s.receive(1, addr(1), &walks(&s, t1, &[1, 2, 3]));
+        }
+        assert_eq!((s.net_stats().get(LATE), rejected(&s, 1, "replay")), (STALE_RUN as u64 - 1, 0));
+        // A new tick, so the player's datagram budget is not what refuses.
+        s.begin_tick(2);
+        s.receive(2, addr(1), &walks(&s, t1, &[2, 3, 4]));
+        assert_eq!(rejected(&s, 1, "replay"), 0, "4 is new: the run starts over");
+        for _ in 0..STALE_RUN {
+            s.receive(2, addr(1), &walks(&s, t1, &[2, 3, 4]));
+        }
+        assert_eq!(rejected(&s, 1, "replay"), 1);
+    }
+
+    /// A refused frame is on the record once, however many datagrams carry
+    /// it until a later one is acknowledged.
+    #[test]
+    fn a_refused_frame_is_recorded_once() {
+        let (mut s, t1, _) = joined_pair();
+        s.begin_tick(1);
+        let tick = s.ev.history().latest().unwrap();
+        let proof = s.tick_proof(1, tick);
+        let good = |seq| InputFrame { seq, tick, proof, move_dir: Vec2::ZERO, aim: Vec2::new(1.0, 0.0), shoot: false };
+        let forged = InputFrame { proof: good(1).proof ^ 1, ..good(1) };
+        s.receive(1, addr(1), &frame(t1, &ClientMsg::input(forged)));
+        s.receive(1, addr(1), &frame(t1, &ClientMsg::input_with(good(2), vec![forged])));
+        s.receive(1, addr(1), &frame(t1, &ClientMsg::input_with(good(3), vec![forged, good(2)])));
+        let t = s.telemetry().per_player(1);
+        assert_eq!((t.rejected.values().sum::<u32>(), t.accepted), (1, 2));
+    }
+
+    #[test]
+    fn the_ack_is_the_last_input_taken() {
+        let (mut s, t1, _) = joined_pair();
+        assert_eq!(s.ack(1), 0, "none yet");
+        s.begin_tick(1);
+        s.receive(1, addr(1), &walk(&s, t1, 5));
+        s.receive(1, addr(1), &walk(&s, t1, 6));
+        assert_eq!(s.ack(1), 0, "waiting is not taken");
+        s.end_tick(1);
+        assert_eq!(s.ack(1), 5);
     }
 
     /// Ordering: shots resolve before anyone moves. Player 2 steps out of the
@@ -1134,7 +1244,7 @@ mod tests {
     fn claim(s: &Server, token: u64, seq: u32, seen: u32, aim: Vec2, shoot: bool) -> Vec<u8> {
         let p = s.sessions.values().find(|x| x.token == token).expect("a live session").player_id;
         let proof = s.tick_proof(p, seen);
-        frame(token, &ClientMsg::Input { seq, tick: seen, proof, move_dir: Vec2::ZERO, aim, shoot })
+        frame(token, &ClientMsg::Input { seq, tick: seen, proof, move_dir: Vec2::ZERO, aim, shoot, older: Vec::new() })
     }
 
     fn rejected(s: &Server, p: PlayerId, label: &str) -> u32 {

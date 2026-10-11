@@ -48,6 +48,7 @@ impl Bot for GarbageBot {
             move_dir: Vec2::new(1.0, 0.0),
             aim: Vec2::new(1.0, 0.0),
             shoot: false,
+            older: Vec::new(),
         });
         let bodies = [
             Vec::new(),                      // empty

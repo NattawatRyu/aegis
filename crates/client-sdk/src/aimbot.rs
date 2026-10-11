@@ -52,6 +52,7 @@ impl Bot for AimbotBot {
             move_dir: Vec2::ZERO, // stand still, just snap-aim
             aim,
             shoot,
+            older: Vec::new(),
         }]
     }
 }

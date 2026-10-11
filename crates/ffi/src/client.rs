@@ -312,8 +312,8 @@ mod tests {
         assert_eq!(recv(c, &ServerMsg::Joined { player_id: 4, token: 7, tick: 1 }, &mut rx), AEGIS_OK);
         assert_eq!(aegis_client_player_id(c), 4);
         assert_eq!(input(c, AEGIS_TICK_NEWEST), AEGIS_ERR_UNKNOWN_TICK);
-        recv(c, &ServerMsg::Snapshot { tick: 2, proof: 1, players: Vec::new() }, &mut rx);
-        recv(c, &ServerMsg::Snapshot { tick: 3, proof: 1, players: Vec::new() }, &mut rx);
+        recv(c, &ServerMsg::Snapshot { tick: 2, proof: 1, ack: 0, players: Vec::new() }, &mut rx);
+        recv(c, &ServerMsg::Snapshot { tick: 3, proof: 1, ack: 0, players: Vec::new() }, &mut rx);
         assert!(input(c, 3) > 0);
         assert_eq!(input(c, 2), AEGIS_ERR_TICK_REGRESSED);
         assert_eq!(aegis_client_receive(c, [9u8].as_ptr(), 1, &mut rx), AEGIS_ERR_MALFORMED);

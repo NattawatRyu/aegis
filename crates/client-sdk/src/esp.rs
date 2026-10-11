@@ -53,7 +53,15 @@ impl Bot for EspBot {
             }
             None => (Vec2::ZERO, Vec2::new(1.0, 0.0), false),
         };
-        vec![ClientMsg::Input { seq: self.seq, tick: ctx.tick, proof: ctx.proof, move_dir, aim, shoot }]
+        vec![ClientMsg::Input {
+            seq: self.seq,
+            tick: ctx.tick,
+            proof: ctx.proof,
+            move_dir,
+            aim,
+            shoot,
+            older: Vec::new(),
+        }]
     }
 }
 

@@ -14,7 +14,7 @@
 //! depth is capped by [`crate::guards::input_rate`]. On a lockstep link each
 //! input is popped on the tick it arrives, as before.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use aegis_protocol::PlayerId;
 
@@ -33,7 +33,16 @@ struct Lane {
     queued: BTreeMap<u32, (ClientInput, u64, u32)>,
     /// seq and claimed tick of the last input taken from this lane.
     taken: Option<(u32, u32)>,
+    /// Seqs above `taken` already refused and on the record. A client
+    /// resends an input until it is acknowledged, and a refused one never
+    /// is: judged again, it would be on the record three times.
+    refused: BTreeSet<u32>,
 }
+
+/// Refused seqs a lane remembers. Past it the lowest is forgotten, and a
+/// copy of that one is judged (and recorded) again — never let through
+/// unjudged, so a client cannot spend this memory to get anything past.
+pub const REFUSED_CAP: usize = 16;
 
 impl Inbox {
     /// Inputs waiting for `player`.
@@ -41,11 +50,31 @@ impl Inbox {
         self.lanes.get(&player).map_or(0, |l| l.queued.len())
     }
 
-    /// Has `seq` been seen already — taken, or older than the last taken, or
-    /// waiting? Such an input changes nothing: a copy, or one overtaken by
-    /// the inputs after it.
+    /// Has `seq` been seen already — taken, or older than the last taken,
+    /// waiting, or refused? Such an input changes nothing: a copy, or one
+    /// overtaken by the inputs after it.
     pub fn is_late(&self, player: PlayerId, seq: u32) -> bool {
-        self.lanes.get(&player).is_some_and(|l| l.taken.is_some_and(|(s, _)| seq <= s) || l.queued.contains_key(&seq))
+        self.lanes.get(&player).is_some_and(|l| {
+            l.taken.is_some_and(|(s, _)| seq <= s) || l.queued.contains_key(&seq) || l.refused.contains(&seq)
+        })
+    }
+
+    /// The seq of the last input taken from `player`'s lane, 0 for none —
+    /// the `ack` in its snapshot.
+    pub fn taken(&self, player: PlayerId) -> u32 {
+        self.lanes.get(&player).and_then(|l| l.taken).map_or(0, |(s, _)| s)
+    }
+
+    /// `seq` was judged and refused: a copy of it is late from now on.
+    pub fn refuse(&mut self, player: PlayerId, seq: u32) {
+        let l = self.lanes.entry(player).or_default();
+        if l.taken.is_some_and(|(s, _)| seq <= s) {
+            return;
+        }
+        l.refused.insert(seq);
+        if l.refused.len() > REFUSED_CAP {
+            l.refused.pop_first();
+        }
     }
 
     /// The snapshot ticks claimed by `player`'s nearest known inputs either
@@ -73,6 +102,7 @@ impl Inbox {
         for (&p, l) in &mut self.lanes {
             if let Some((_, (input, stamp, arrived))) = l.queued.pop_first() {
                 l.taken = Some((input.seq, input.tick));
+                l.refused.retain(|&s| s > input.seq);
                 out.push((stamp, p, input, now.saturating_sub(arrived)));
             }
         }
@@ -147,6 +177,40 @@ mod tests {
         assert_eq!(b.neighbours(1, 5), (Some(24), Some(27)));
         assert_eq!(b.neighbours(1, 3), (Some(20), Some(24)));
         assert_eq!(b.neighbours(1, 9), (Some(27), None));
+    }
+
+    #[test]
+    fn a_refused_seq_is_late_until_taken_passes_it() {
+        let mut b = Inbox::default();
+        b.refuse(1, 3);
+        assert!(b.is_late(1, 3) && !b.is_late(1, 2) && !b.is_late(1, 4));
+        b.push(1, input(4, 40), 0);
+        b.pop_all(1);
+        assert_eq!(b.taken(1), 4);
+        assert!(b.lanes[&1].refused.is_empty(), "pruned once taken passes it");
+        b.refuse(1, 2);
+        assert!(b.lanes[&1].refused.is_empty(), "at or below taken: late anyway");
+    }
+
+    /// At the cap the lowest is forgotten — judged again, never let through.
+    #[test]
+    fn refused_memory_is_capped() {
+        let mut b = Inbox::default();
+        for seq in 1..=REFUSED_CAP as u32 + 1 {
+            b.refuse(1, seq);
+        }
+        assert_eq!(b.lanes[&1].refused.len(), REFUSED_CAP);
+        assert!(!b.is_late(1, 1) && b.is_late(1, 2) && b.is_late(1, REFUSED_CAP as u32 + 1));
+    }
+
+    #[test]
+    fn taken_is_the_ack() {
+        let mut b = Inbox::default();
+        assert_eq!(b.taken(1), 0);
+        b.push(1, input(7, 70), 0);
+        b.push(1, input(8, 71), 0);
+        b.pop_all(1);
+        assert_eq!(b.taken(1), 7, "the one taken, not the newest waiting");
     }
 
     #[test]

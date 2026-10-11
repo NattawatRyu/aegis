@@ -127,7 +127,15 @@ impl Bot for HonestBot {
             }
             None => (self.walk, false),
         };
-        vec![ClientMsg::Input { seq: self.seq, tick: ctx.tick, proof: ctx.proof, move_dir: self.walk, aim, shoot }]
+        vec![ClientMsg::Input {
+            seq: self.seq,
+            tick: ctx.tick,
+            proof: ctx.proof,
+            move_dir: self.walk,
+            aim,
+            shoot,
+            older: Vec::new(),
+        }]
     }
 }
 

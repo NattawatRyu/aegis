@@ -24,6 +24,7 @@ pub mod honest;
 pub mod humanized;
 pub mod joinflood;
 pub mod nan;
+pub mod redundant;
 pub mod reflect;
 pub mod replay;
 pub mod rusher;
@@ -108,6 +109,11 @@ pub trait Bot {
     /// as it crossed — sealed, if it went through a relay. Called before this
     /// bot acts, so it can act on what it heard ahead of the bot it heard.
     fn overheard(&mut self, _wire: &[u8]) {}
+
+    /// The `ack` of the snapshot this bot acts on next, handed over before
+    /// it acts. Only a bot that resends what is unacknowledged
+    /// ([`redundant::Redundant`]) reads it.
+    fn acked(&mut self, _ack: u32) {}
 }
 
 /// This bot's own position from the last snapshot, if present.

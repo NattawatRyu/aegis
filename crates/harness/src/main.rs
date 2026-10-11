@@ -417,22 +417,25 @@ fn net(seeds: u32, rtt: u32) {
     println!("lag_mix crowds: {seeds} per cell, rtt {rtt}, {} ticks", aegis_harness::CROWD_TICKS);
     println!("jitter = up to that many extra ticks per datagram on the way up; loss in per mille");
     println!("lost/rejected/felt as % of the inputs honest players sent");
-    println!("late = inputs dropped as already seen (overtaken), % of what every player sent (counted unattributed)");
+    println!("late = datagrams with no input not seen before (copies, overtaken), % of what every player sent (counted unattributed)");
+    println!("rec = inputs taken from a later datagram's copies (v5), % of what every player sent");
     println!("wait = mean ticks an honest input sat in the server's lane");
     println!("felt = inputs the sim folded in; flagged = honest players any detector raised; caught = cheats raised\n");
     println!(
-        "{:>6} {:>5} {:>7} {:>6} {:>9} {:>6} {:>6} {:>5} {:>8} {:>8}  rejected by reason",
-        "jitter", "loss", "sent", "lost%", "rejected%", "late%", "felt%", "wait", "flagged", "caught"
+        "{:>6} {:>5} {:>7} {:>6} {:>9} {:>6} {:>6} {:>6} {:>5} {:>8} {:>8}  rejected by reason",
+        "jitter", "loss", "sent", "lost%", "rejected%", "late%", "rec%", "felt%", "wait", "flagged", "caught"
     );
     for jitter in 0..=3 {
         for loss in [0, 20, 50, 100] {
             let (mut sent, mut lost, mut felt, mut rejected, mut late, mut waited) =
                 (0u32, 0u32, 0u32, 0u32, 0u64, 0u64);
             let (mut flagged, mut honest, mut caught, mut cheats, mut all_sent) = (0u32, 0u32, 0u32, 0u32, 0u64);
+            let mut recovered = 0u64;
             let mut why: BTreeMap<&str, u32> = BTreeMap::new();
             for seed in 0..seeds {
                 let r = run(Scenario { jitter, loss, ..Scenario::lag_mix(seed, rtt) });
                 late += r.net.get(aegis_server::server::LATE);
+                recovered += r.net.recovered;
                 all_sent += r.bots.iter().map(|b| u64::from(b.sent)).sum::<u64>();
                 for b in r.bots.iter().filter(|b| b.id.is_some()) {
                     if CHEATS.contains(&b.name) {
@@ -455,13 +458,14 @@ fn net(seeds: u32, rtt: u32) {
             let pct = |x: u32| 100.0 * x as f32 / sent.max(1) as f32;
             let why: Vec<String> = why.iter().map(|(k, v)| format!("{k} {v}")).collect();
             println!(
-                "{:>6} {:>5} {:>7} {:>5.1}% {:>8.1}% {:>5.1}% {:>5.1}% {:>5.2} {:>8} {:>8}  {}",
+                "{:>6} {:>5} {:>7} {:>5.1}% {:>8.1}% {:>5.1}% {:>5.1}% {:>5.1}% {:>5.2} {:>8} {:>8}  {}",
                 jitter,
                 loss,
                 sent,
                 pct(lost),
                 pct(rejected),
                 100.0 * late as f32 / all_sent.max(1) as f32,
+                100.0 * recovered as f32 / all_sent.max(1) as f32,
                 pct(felt),
                 waited as f32 / felt.max(1) as f32,
                 format!("{flagged}/{honest}"),

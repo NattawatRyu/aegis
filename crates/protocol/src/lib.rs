@@ -33,7 +33,10 @@ pub mod noise;
 /// v4: every snapshot carries a `proof` of its tick, and every input echoes
 ///     the proof of the snapshot it was chosen on — reaction is timed from
 ///     what the client had, not from when its input arrived.
-pub const PROTOCOL_VERSION: u16 = 4;
+/// v5: every input carries up to two earlier unacknowledged ones, and every
+///     snapshot acknowledges the last input taken — loss costs a frame only
+///     when three datagrams in a row are lost.
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// Bytes of session token in front of every client datagram.
 pub const TOKEN_LEN: usize = 8;
@@ -107,7 +110,53 @@ pub enum ClientMsg {
     /// Nor one older than 16 ticks, from before it joined, or older than one
     /// it already claimed (the server's `stale_tick` guard): every shot is
     /// judged in the picture claimed, and only the last 16 are kept.
-    Input { seq: u32, tick: u32, proof: u32, move_dir: Vec2, aim: Vec2, shoot: bool },
+    ///
+    /// `older`: up to [`MAX_OLDER`] earlier inputs the server has not
+    /// acknowledged yet ([`ServerMsg::Snapshot`] `ack`), oldest first, each
+    /// with its own tick and proof — so one lost datagram costs nothing as
+    /// long as one of the next two arrives. More is a malformed packet.
+    Input { seq: u32, tick: u32, proof: u32, move_dir: Vec2, aim: Vec2, shoot: bool, older: Vec<InputFrame> },
+}
+
+/// Most earlier inputs one [`ClientMsg::Input`] may carry: with its own,
+/// every input crosses in up to three datagrams.
+pub const MAX_OLDER: usize = 2;
+
+/// One input as [`ClientMsg::Input`] carries it, for the copies in `older`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct InputFrame {
+    pub seq: u32,
+    pub tick: u32,
+    pub proof: u32,
+    pub move_dir: Vec2,
+    pub aim: Vec2,
+    pub shoot: bool,
+}
+
+impl ClientMsg {
+    /// An Input carrying `frame` alone.
+    pub fn input(frame: InputFrame) -> ClientMsg {
+        ClientMsg::input_with(frame, Vec::new())
+    }
+
+    /// An Input carrying `frame` and the earlier, unacknowledged `older`.
+    pub fn input_with(frame: InputFrame, older: Vec<InputFrame>) -> ClientMsg {
+        let InputFrame { seq, tick, proof, move_dir, aim, shoot } = frame;
+        ClientMsg::Input { seq, tick, proof, move_dir, aim, shoot, older }
+    }
+
+    /// Every input this message carries, oldest first: `older`, then its own.
+    /// Empty for a Join.
+    pub fn frames(&self) -> Vec<InputFrame> {
+        match self {
+            ClientMsg::Join { .. } => Vec::new(),
+            &ClientMsg::Input { seq, tick, proof, move_dir, aim, shoot, ref older } => {
+                let mut v = older.clone();
+                v.push(InputFrame { seq, tick, proof, move_dir, aim, shoot });
+                v
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -128,9 +177,13 @@ pub enum ServerMsg {
     /// holds: the client cannot compute it for a tick it has not been sent.
     /// Ticks count up one at a time, so without it any client could claim to
     /// have seen any tick.
+    ///
+    /// `ack`: the seq of the last input the server took from this client
+    /// (0: none yet). A client stops resending what is at or below it.
     Snapshot {
         tick: u32,
         proof: u32,
+        ack: u32,
         players: Vec<PlayerState>,
     },
     /// Answer to a Join without a valid cookie: send the Join again with this
@@ -992,16 +1045,19 @@ mod tests {
 
     #[test]
     fn clientmsg_input_roundtrip() {
-        let m = ClientMsg::Input {
-            seq: 7,
+        let f = |seq| InputFrame {
+            seq,
             tick: 100,
             proof: 0xDEAD_BEEF,
             move_dir: Vec2::new(0.3, -0.4),
             aim: Vec2::new(1.0, 0.0),
             shoot: true,
         };
+        let m = ClientMsg::input_with(f(7), vec![f(5), f(6)]);
         let back: ClientMsg = decode(&encode(&m)).unwrap();
         assert_eq!(m, back);
+        assert_eq!(back.frames().iter().map(|f| f.seq).collect::<Vec<_>>(), [5, 6, 7], "oldest first");
+        assert!(matches!(ClientMsg::input(f(1)), ClientMsg::Input { seq: 1, ref older, .. } if older.is_empty()));
     }
 
     #[test]
@@ -1009,6 +1065,7 @@ mod tests {
         let m = ServerMsg::Snapshot {
             tick: 42,
             proof: u32::MAX,
+            ack: 41,
             players: vec![
                 PlayerState { id: 1, pos: Vec2::new(1.0, 2.0), health: 100, alive: true },
                 PlayerState { id: 2, pos: Vec2::ZERO, health: 0, alive: false },

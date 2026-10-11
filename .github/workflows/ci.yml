@@ -11,11 +11,13 @@ env:
   CARGO_TERM_COLOR: always
   AEGIS_REQUIRE_DOTNET: 1
 
+# Ubuntu is pinned, not ubuntu-latest: the label moves to 26.04 on its own,
+# and a green run should only change when the code does.
 jobs:
   fmt:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: cargo fmt --all -- --check
 
   test:
@@ -26,17 +28,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-24.04, windows-latest]
     runs-on: ${{ matrix.os }}
     defaults:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
       # For aegis-ffi's test of the C# binding (bindings/csharp), which
       # AEGIS_REQUIRE_DOTNET turns from skipped-without-dotnet into required.
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: |
             6.0.x
@@ -69,15 +71,15 @@ jobs:
     # demos/godot run headless in a real engine: the aimbot, humanized and
     # triggerbot flagged and no honest or pro player (crates/ffi/tests/godot.rs).
     # The editor is pinned and checked against Godot's published SHA512.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       GODOT_ZIP: Godot_v4.7.2-stable_mono_linux_x86_64.zip
       GODOT_SHA512: 1855960b27ee3ef5e66e5e228cced69d55637b24334a7411162687dcd077d8f9f645348cdb8eae984bec8135d49ed855a1e3a16476786b8bce60774fd8402d13
       AEGIS_REQUIRE_GODOT: 1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 8.0.x
       - name: Godot 4.7.2 .NET

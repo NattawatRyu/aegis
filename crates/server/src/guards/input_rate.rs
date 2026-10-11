@@ -11,13 +11,20 @@
 //! Stage guard (B1): runs after the pipeline, at the queue. Before B1 it
 //! refused a second input on one tick, which on a jittery link refused an
 //! honest player's — two inputs land together and the next tick none does.
-//! `DEPTH` 4 rides out 3 ticks (100 ms) of jitter; what waits longer lags
-//! only the player who sent it.
+//! `DEPTH` 6 rides out 3 ticks (100 ms) of jitter on a lossy link; what
+//! waits longer lags only the player who sent it.
+//!
+//! 6, not the 4 B1 started with (B2, `aegis-harness net`, rtt 4): once
+//! lost inputs come back in the next datagrams, each loss on an empty lane
+//! leaves one more waiting, and with 3 ticks of jitter up to 4 datagrams
+//! land together on top of that backlog. At 4, jitter 2–3 with 2–10% loss
+//! refused up to 1.1% of an honest player's inputs; at 6 none, in every
+//! cell (8 was no different).
 
 use super::RejectReason;
 
 /// Inputs one player may have waiting.
-pub const DEPTH: usize = 4;
+pub const DEPTH: usize = 6;
 
 /// May an input join a lane with `waiting` inputs in it?
 pub fn check(waiting: usize) -> Result<(), RejectReason> {

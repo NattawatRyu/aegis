@@ -78,6 +78,7 @@ impl Bot for SniffBot {
                 move_dir: Vec2::new(0.0, -1.0), // walk the victim where it chooses
                 aim: Vec2::new(1.0, 0.0),
                 shoot: false,
+                older: Vec::new(),
             }],
             None => Vec::new(),
         }
@@ -104,8 +105,15 @@ mod tests {
     fn a_plain_input_gives_it_the_token_and_the_seq() {
         let mut b = SniffBot::new();
         assert!(b.datagrams(&ctx()).is_empty(), "nothing heard, nothing to say");
-        let victim =
-            ClientMsg::Input { seq: 41, tick: 9, proof: 5, move_dir: Vec2::ZERO, aim: Vec2::ZERO, shoot: true };
+        let victim = ClientMsg::Input {
+            seq: 41,
+            tick: 9,
+            proof: 5,
+            move_dir: Vec2::ZERO,
+            aim: Vec2::ZERO,
+            shoot: true,
+            older: Vec::new(),
+        };
         b.overheard(&frame(0x7070_7070, &victim));
         let out = b.datagrams(&ctx());
         assert_eq!(out.len(), 1);

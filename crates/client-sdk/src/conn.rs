@@ -21,6 +21,8 @@
 //! Through a relay every datagram is sealed under the [`ClientKeys`] the
 //! game's backend issued; directly to an origin, nothing is.
 
+use crate::predict::{PredictStats, Predictor};
+use aegis_protocol::movement::Wall;
 use aegis_protocol::{
     decode, frame, open_down, seal_up, ClientKeys, ClientMsg, EdgeError, EventKind, InputFrame, PlayerId, PlayerState,
     ServerMsg, Vec2, MAX_OLDER, NO_TOKEN, PROTOCOL_VERSION,
@@ -93,6 +95,9 @@ pub struct Connection {
     unacked: Vec<InputFrame>,
     /// The highest `ack` seen.
     ack: u32,
+    /// Predicts this player's position, once [`Connection::predict_in`]
+    /// names the arena.
+    predictor: Option<Predictor>,
 }
 
 impl Connection {
@@ -111,7 +116,25 @@ impl Connection {
             players: Vec::new(),
             unacked: Vec::new(),
             ack: 0,
+            predictor: None,
         }
+    }
+
+    /// Predict this player's position from now on, in an arena with
+    /// `walls` — the server's ([`Predictor`]).
+    pub fn predict_in(&mut self, walls: &[Wall]) {
+        self.predictor = Some(Predictor::new(walls));
+    }
+
+    /// Where this player is once every input sent so far is folded, if
+    /// predicting and a snapshot has shown it.
+    pub fn predicted(&self) -> Option<Vec2> {
+        self.predictor.as_ref()?.position()
+    }
+
+    /// How the predictions compared with the server so far.
+    pub fn prediction_stats(&self) -> Option<PredictStats> {
+        self.predictor.as_ref().map(Predictor::stats)
     }
 
     fn wire(&self, framed: Vec<u8>) -> Vec<u8> {
@@ -140,6 +163,9 @@ impl Connection {
         self.seq += 1;
         let f = InputFrame { seq: self.seq, tick, proof, move_dir, aim, shoot };
         let msg = ClientMsg::input_with(f, self.unacked.clone());
+        if let Some(p) = &mut self.predictor {
+            p.input(f.seq, move_dir, aim);
+        }
         self.unacked.push(f);
         if self.unacked.len() > MAX_OLDER {
             self.unacked.remove(0);
@@ -174,6 +200,9 @@ impl Connection {
                 self.ack = self.ack.max(ack);
                 let acked = self.ack;
                 self.unacked.retain(|f| f.seq > acked);
+                if let (Some(p), Some((id, _))) = (&mut self.predictor, self.joined) {
+                    p.snapshot(tick, ack, players.iter().find(|s| s.id == id).copied());
+                }
                 if self.newest.is_none_or(|n| tick > n) {
                     self.newest = Some(tick);
                     self.players = players;
@@ -287,6 +316,30 @@ mod tests {
         assert_eq!((c.ack(), send(&mut c)), (3, vec![4, 5, 6]), "an older ack is ignored");
         c.receive(&mut acked(3, 6)).unwrap();
         assert_eq!(send(&mut c), [7]);
+    }
+
+    /// Opted in, a Connection predicts its player from each snapshot and the
+    /// inputs it sent since, and scores the server's answer.
+    #[test]
+    fn a_connection_predicts_its_own_player() {
+        use aegis_protocol::movement::MOVE_SPEED;
+        let mut c = Connection::new("riw", None);
+        c.predict_in(&[]);
+        c.receive(&mut encode(&ServerMsg::Joined { player_id: 1, token: 9, tick: 0 })).unwrap();
+        let at = |tick, ack, x| {
+            let me = PlayerState { id: 1, pos: Vec2::new(x, 0.0), health: 100, alive: true };
+            encode(&ServerMsg::Snapshot { tick, proof: 0, ack, players: vec![me] })
+        };
+        assert_eq!(c.predicted(), None, "no snapshot yet");
+        c.receive(&mut at(1, 0, 0.0)).unwrap();
+        c.input(None, Vec2::new(1.0, 0.0), Vec2::ZERO, false).unwrap();
+        c.input(None, Vec2::new(1.0, 0.0), Vec2::ZERO, false).unwrap();
+        assert_eq!(c.predicted(), Some(Vec2::new(2.0 * MOVE_SPEED, 0.0)));
+        c.receive(&mut at(2, 1, MOVE_SPEED)).unwrap();
+        assert_eq!(c.predicted(), Some(Vec2::new(2.0 * MOVE_SPEED, 0.0)), "1 acked, 2 replayed");
+        let s = c.prediction_stats().unwrap();
+        assert_eq!((s.checked, s.exact), (1, 1));
+        assert!(Connection::new("x", None).prediction_stats().is_none(), "off unless asked");
     }
 
     #[test]

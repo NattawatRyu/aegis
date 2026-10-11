@@ -7,19 +7,30 @@
 //! The bots that attack a guard's edge stay raw: their one frame per
 //! datagram is the attack. Only for a bot that keeps the default
 //! `datagrams` / `routed` — the copies are added to what `act` returns.
+//!
+//! It also predicts the bot's own position as a real client would (B3,
+//! [`Predictor`]) and keeps score, so the lab measures prediction on the
+//! same crowds, links and inputs it measures everything else on. The bot
+//! itself still acts on the snapshot, not on the prediction.
 
+use super::predict::{PredictStats, Predictor};
 use super::{Bot, BotCtx};
+use aegis_protocol::movement::Wall;
 use aegis_protocol::{ClientMsg, InputFrame, MAX_OLDER};
 
 pub struct Redundant<B> {
     inner: B,
     /// The newest inputs sent and not yet acknowledged, oldest first.
     unacked: Vec<InputFrame>,
+    /// The `ack` of the snapshot about to be acted on.
+    ack: u32,
+    predictor: Predictor,
 }
 
 impl<B: Bot> Redundant<B> {
-    pub fn new(inner: B) -> Self {
-        Self { inner, unacked: Vec::new() }
+    /// `inner`, in an arena with `walls` (what its predictor steps against).
+    pub fn new(inner: B, walls: &[Wall]) -> Self {
+        Self { inner, unacked: Vec::new(), ack: 0, predictor: Predictor::new(walls) }
     }
 }
 
@@ -33,9 +44,12 @@ impl<B: Bot> Bot for Redundant<B> {
     }
 
     fn act(&mut self, ctx: &BotCtx) -> Vec<ClientMsg> {
+        let me = ctx.snapshot.iter().find(|p| p.id == ctx.my_id).copied();
+        self.predictor.snapshot(ctx.tick, self.ack, me);
         let mut out = self.inner.act(ctx);
         for m in &mut out {
             let Some(&own) = m.frames().last() else { continue };
+            self.predictor.input(own.seq, own.move_dir, own.aim);
             *m = ClientMsg::input_with(own, self.unacked.clone());
             self.unacked.push(own);
             if self.unacked.len() > MAX_OLDER {
@@ -62,7 +76,12 @@ impl<B: Bot> Bot for Redundant<B> {
     }
 
     fn acked(&mut self, ack: u32) {
+        self.ack = ack;
         self.unacked.retain(|f| f.seq > ack);
+    }
+
+    fn prediction(&self) -> Option<PredictStats> {
+        Some(self.predictor.stats())
     }
 }
 
@@ -84,7 +103,7 @@ mod tests {
     /// never more than MAX_OLDER along, pruned at and below the ack.
     #[test]
     fn carries_the_unacknowledged_and_prunes_on_ack() {
-        let mut b = Redundant::new(HonestBot::new());
+        let mut b = Redundant::new(HonestBot::new(), &[]);
         assert_eq!(b.name(), "honest");
         assert_eq!(seqs(&mut b, 1), [1]);
         assert_eq!(seqs(&mut b, 2), [1, 2]);
@@ -102,7 +121,7 @@ mod tests {
         let snap = [PlayerState { id: 1, pos: Vec2::ZERO, health: 100, alive: true }];
         let ctx = BotCtx { tick: 1, proof: 7, my_id: 1, token: 9, snapshot: &snap };
         let plain = HonestBot::new().act(&ctx);
-        let wrapped = Redundant::new(HonestBot::new()).act(&ctx);
+        let wrapped = Redundant::new(HonestBot::new(), &[]).act(&ctx);
         assert_eq!(plain, wrapped, "nothing unacknowledged yet: the same message");
     }
 }

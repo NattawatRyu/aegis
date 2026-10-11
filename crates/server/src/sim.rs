@@ -9,14 +9,15 @@
 //! position or a hit, so teleport / instant-hit / fake-damage have nothing to
 //! ride in on. See `guards/` for the input-trust defenses layered on top.
 
+use aegis_protocol::movement;
 use aegis_protocol::{PlayerId, PlayerState, Vec2};
 
 use crate::Visibility;
 
-/// Distance a player travels per tick along a unit direction.
-pub const MOVE_SPEED: f32 = 5.0;
-/// Half-width of the square arena; positions are clamped to it.
-pub const ARENA_HALF: f32 = 50.0;
+/// Movement is shared with clients, which predict their own position with
+/// the same code ([`aegis_protocol::movement`]).
+pub use aegis_protocol::movement::{Wall, ARENA_HALF, ARENA_WALLS, MOVE_SPEED};
+
 /// Max distance a shot travels.
 pub const SHOT_RANGE: f32 = 100.0;
 /// Radius of a player's hitbox for hitscan.
@@ -25,54 +26,6 @@ pub const HIT_RADIUS: f32 = 1.0;
 pub const SHOT_DAMAGE: u8 = 25;
 /// Player starting health.
 pub const MAX_HEALTH: u8 = 100;
-
-/// An axis-aligned box nothing can see, shoot or walk through. Its edges
-/// count as solid: a line that grazes a corner is blocked.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Wall {
-    pub min: Vec2,
-    pub max: Vec2,
-}
-
-impl Wall {
-    pub const fn new(min: Vec2, max: Vec2) -> Self {
-        Self { min, max }
-    }
-
-    /// Does the segment `a -> b` touch this box? Slab test: clip the segment's
-    /// parameter range to each axis's slab; it hits iff something is left.
-    pub fn blocks(&self, a: Vec2, b: Vec2) -> bool {
-        let (mut t0, mut t1) = (0.0f32, 1.0f32);
-        for (a, d, lo, hi) in [(a.x, b.x - a.x, self.min.x, self.max.x), (a.y, b.y - a.y, self.min.y, self.max.y)] {
-            if d == 0.0 {
-                if a < lo || a > hi {
-                    return false;
-                }
-                continue;
-            }
-            let (u, v) = ((lo - a) / d, (hi - a) / d);
-            t0 = t0.max(u.min(v));
-            t1 = t1.min(u.max(v));
-            if t0 > t1 {
-                return false;
-            }
-        }
-        true
-    }
-}
-
-/// The lab arena: a pillar in the middle, so players across the spawn ring
-/// cannot see each other, and one box in each corner. None touches the spawn
-/// ring (radius 20). Any wall that hides a player straight across the ring
-/// sits on a diameter, so some walk runs into the pillar — the honest bot
-/// turns when a step goes nowhere.
-pub const ARENA_WALLS: [Wall; 5] = [
-    Wall::new(Vec2 { x: -5.0, y: -5.0 }, Vec2 { x: 5.0, y: 5.0 }),
-    Wall::new(Vec2 { x: 26.0, y: 26.0 }, Vec2 { x: 34.0, y: 34.0 }),
-    Wall::new(Vec2 { x: -34.0, y: 26.0 }, Vec2 { x: -26.0, y: 34.0 }),
-    Wall::new(Vec2 { x: -34.0, y: -34.0 }, Vec2 { x: -26.0, y: -26.0 }),
-    Wall::new(Vec2 { x: 26.0, y: -34.0 }, Vec2 { x: 34.0, y: -26.0 }),
-];
 
 /// Outcome of an authoritative shot resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,7 +100,7 @@ impl Sim {
 
     /// Is the straight line `a -> b` clear of every wall?
     pub fn clear(&self, a: Vec2, b: Vec2) -> bool {
-        !self.walls.iter().any(|w| w.blocks(a, b))
+        movement::clear(&self.walls, a, b)
     }
 
     /// Can a player standing at `from` see any of a hitbox centred at `to`?
@@ -268,15 +221,11 @@ impl Sim {
     /// travel can never exceed `MOVE_SPEED`. Position is clamped to the arena.
     /// A step whose path touches a wall is not taken at all — the whole path,
     /// not just where it ends, so a step can never tunnel through a thin wall.
+    /// The step itself is [`movement::step`], which clients predict with.
     pub fn apply_move(&mut self, id: PlayerId, dir_unit: Vec2) {
         let Some(p) = self.player(id).filter(|p| p.alive) else { return };
-        let from = p.pos;
-        let nx = (from.x + dir_unit.x * MOVE_SPEED).clamp(-ARENA_HALF, ARENA_HALF);
-        let ny = (from.y + dir_unit.y * MOVE_SPEED).clamp(-ARENA_HALF, ARENA_HALF);
-        let to = Vec2::new(nx, ny);
-        if self.clear(from, to) {
-            self.player_mut(id).expect("checked above").pos = to;
-        }
+        let to = movement::step(&self.walls, p.pos, dir_unit);
+        self.player_mut(id).expect("checked above").pos = to;
     }
 
     /// Angle in radians between `aim` and the bearing from `shooter` to its

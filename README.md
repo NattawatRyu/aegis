@@ -133,7 +133,7 @@ cargo run -p aegis-harness              # every bot vs guards + detector
 cargo run -p aegis-harness -- --udp     # same, over real UDP on loopback
 cargo run -p aegis-harness -- --relay   # same, server hidden behind a relay
 cargo run -p aegis-harness -- sweep     # honest population per detector signal
-cargo run -p aegis-harness -- net       # honest play under upstream jitter + loss
+cargo run -p aegis-harness -- net       # honest play + client prediction under jitter + loss (net [seeds] [rtt] [down‰])
 ```
 
 Both network runs must write telemetry byte-identical to the in-process run

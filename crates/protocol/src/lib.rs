@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use siphasher::sip::SipHasher24;
 
+pub mod movement;
+
 #[cfg(feature = "noise")]
 pub mod noise;
 

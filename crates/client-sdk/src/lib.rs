@@ -24,6 +24,7 @@ pub mod honest;
 pub mod humanized;
 pub mod joinflood;
 pub mod nan;
+pub mod predict;
 pub mod redundant;
 pub mod reflect;
 pub mod replay;
@@ -114,6 +115,12 @@ pub trait Bot {
     /// it acts. Only a bot that resends what is unacknowledged
     /// ([`redundant::Redundant`]) reads it.
     fn acked(&mut self, _ack: u32) {}
+
+    /// How well this bot predicted its own position, if it predicts at all
+    /// ([`predict::Predictor`], run by [`redundant::Redundant`]).
+    fn prediction(&self) -> Option<predict::PredictStats> {
+        None
+    }
 }
 
 /// This bot's own position from the last snapshot, if present.

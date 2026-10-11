@@ -36,6 +36,7 @@ use aegis_client_sdk::{
     humanized::HumanizedAimbot,
     joinflood::JoinFloodBot,
     nan::NanBot,
+    predict::PredictStats,
     redundant::Redundant,
     reflect::{ReflectBot, BYSTANDER},
     replay::ReplayBot,
@@ -54,7 +55,7 @@ use aegis_client_sdk::{
 /// unacknowledged ones before it (v5). A bot attacking a guard's edge stays
 /// raw — its one frame per datagram is the attack.
 fn real<B: Bot + 'static>(bot: B) -> Box<dyn Bot> {
-    Box::new(Redundant::new(bot))
+    Box::new(Redundant::new(bot, &ARENA_WALLS))
 }
 use aegis_detector::{Alert, Monitor, PlayerStats};
 use aegis_protocol::{
@@ -97,6 +98,10 @@ pub struct Scenario {
     /// Per mille of the datagrams a bot sends after the handshake that never
     /// land. In-process only.
     pub loss: u32,
+    /// Per mille of the snapshots on their way down that never land. A bot
+    /// whose snapshot is lost acts on the last one it got — an older tick,
+    /// whose proof it still holds — as a real client would. In-process only.
+    pub down_loss: u32,
 }
 
 impl Scenario {
@@ -111,6 +116,7 @@ impl Scenario {
             rtt: 0,
             jitter: 0,
             loss: 0,
+            down_loss: 0,
             bots: vec![
                 real(HonestBot::new()),
                 Box::new(SpeedhackBot::new()),
@@ -162,6 +168,7 @@ impl Scenario {
             rtt: 0,
             jitter: 0,
             loss: 0,
+            down_loss: 0,
             bots: (0..LOBBY_SIZE)
                 .map(|k| real(HonestBot::with_seed(seed.wrapping_mul(LOBBY_SIZE).wrapping_add(k + 1))) as Box<dyn Bot>)
                 .collect(),
@@ -193,6 +200,7 @@ impl Scenario {
             rtt: 0,
             jitter: 0,
             loss: 0,
+            down_loss: 0,
             bots: (0..size)
                 .map(|k| {
                     let s = seed.wrapping_mul(size).wrapping_add(k + 1);
@@ -268,6 +276,7 @@ impl Scenario {
             rtt: 0,
             jitter: 0,
             loss: 0,
+            down_loss: 0,
         }
     }
 
@@ -284,6 +293,7 @@ impl Scenario {
             rtt: 0,
             jitter: 0,
             loss: 0,
+            down_loss: 0,
         }
     }
 
@@ -300,6 +310,7 @@ impl Scenario {
             rtt: 0,
             jitter: 0,
             loss: 0,
+            down_loss: 0,
         }
     }
 
@@ -354,6 +365,9 @@ pub struct BotReport {
     /// Ticks its inputs waited in the server's lane before being folded in,
     /// summed (B1). 0 on a lockstep link.
     pub waited: u64,
+    /// How well it predicted its own position: for a bot that plays like a
+    /// real client ([`Redundant`]), `None` for one that attacks (B3).
+    pub predict: Option<PredictStats>,
     /// What the online detector raised on this player, fed the run's telemetry
     /// one record at a time in stream order (what a live server would feed
     /// it), each with the tick it fired.
@@ -793,6 +807,7 @@ impl Lab {
                     sent: self.sent[i],
                     lost: self.lost[i],
                     waited: self.waited[i],
+                    predict: bot.prediction(),
                     alerts,
                 }
             })
@@ -845,6 +860,10 @@ pub fn run(mut sc: Scenario) -> Report {
     // Keyed by landing tick; within one, in the order sent.
     let mut inflight: BTreeMap<u32, Vec<(usize, u16, Vec<u8>)>> = BTreeMap::new();
     let lockstep = up == 0 && sc.jitter == 0 && sc.loss == 0;
+    // Each bot's last snapshot that landed (tick, proof, ack, view), when
+    // snapshots can be lost.
+    type Held = (u32, u32, u32, Vec<PlayerState>);
+    let mut held: Vec<Option<Held>> = vec![None; n];
     for tick in 1..=sc.ticks {
         let mut c = TickCost::default();
         let t = Instant::now();
@@ -894,8 +913,20 @@ pub fn run(mut sc: Scenario) -> Report {
             if let Some(v) = taps[i] {
                 heard[v].iter().for_each(|w| bot.overheard(w));
             }
-            let (proof, seen) = (views[i].0, &views[i].2);
-            bot.acked(views[i].1);
+            // A snapshot lost on the way down: act on the last one that
+            // landed — or, before any has, not at all.
+            let (seen_tick, proof, ack, seen) = if sc.down_loss == 0 {
+                (seen_tick, views[i].0, views[i].1, &views[i].2[..])
+            } else {
+                if link_draw(tick, i, DOWN_DRAW) % 1000 >= u64::from(sc.down_loss) {
+                    held[i] = Some((seen_tick, views[i].0, views[i].1, views[i].2.clone()));
+                }
+                match &held[i] {
+                    Some((t, p, a, v)) => (*t, *p, *a, &v[..]),
+                    None => continue,
+                }
+            };
+            bot.acked(ack);
             if down == 0 {
                 lab.count_hidden(i, server.sim(), seen);
             }
@@ -925,6 +956,10 @@ pub fn run(mut sc: Scenario) -> Report {
 /// The lag sim's draw for the `j`th datagram bot `i` sent on `tick`:
 /// splitmix64 of the three, so a run is the same every time and one
 /// datagram's fate does not shift another's.
+/// The `j` of a bot's snapshot on its way down in [`link_draw`] — past any
+/// count of datagrams a bot sends up in one tick.
+const DOWN_DRAW: usize = 0xFFFF;
+
 fn link_draw(tick: u32, i: usize, j: usize) -> u64 {
     let mut z = (u64::from(tick) << 32 | (i as u64) << 16 | j as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -1001,7 +1036,7 @@ pub fn run_relay(sc: Scenario) -> io::Result<Report> {
 }
 
 fn run_net(mut sc: Scenario, relayed: bool) -> io::Result<Report> {
-    assert_eq!((sc.rtt, sc.jitter, sc.loss), (0, 0, 0), "lag is simulated in-process only");
+    assert_eq!((sc.rtt, sc.jitter, sc.loss, sc.down_loss), (0, 0, 0, 0), "lag is simulated in-process only");
     let n = sc.bots.len();
     let mut net = NetServer::bind((Ipv4Addr::LOCALHOST, 0), Server::with_walls(spawns(n), &ARENA_WALLS))?;
     let origin = net.local_addr()?;
@@ -1797,6 +1832,36 @@ mod tests {
         assert!(a.hits > 0 && h.shots > 0);
         assert!(a.accuracy() > 0.9, "aimbot accuracy {}", a.accuracy());
         assert!(h.accuracy() < 0.6, "honest accuracy {}", h.accuracy());
+    }
+
+    /// B3's point: a client predicting its own position with the server's
+    /// movement code is right to the bit whenever none of its inputs is lost
+    /// — through a 133 ms round trip, 3 ticks of jitter up and 10% of
+    /// snapshots lost down (each costs only a later starting point). Every
+    /// honest player is checked, on hundreds of acked inputs (deaths and lost snapshots skip some).
+    #[test]
+    fn prediction_is_exact_when_no_input_is_lost() {
+        let r = run(Scenario { jitter: 3, down_loss: 100, ..Scenario::lag_mix(0, 4) });
+        let honest: Vec<_> =
+            r.bots.iter().filter(|b| !["aimbot", "humanized", "triggerbot", "burst"].contains(&b.name)).collect();
+        assert_eq!(honest.len(), 12);
+        for b in honest {
+            let p = b.predict.unwrap_or_else(|| panic!("{} does not predict", b.name));
+            assert!(p.checked > 200, "{}: only {} checked", b.name, p.checked);
+            assert_eq!((p.exact, p.max_err), (p.checked, 0.0), "{}: {p:?}", b.name);
+            assert_eq!(b.totals.total_rejected(), 0, "{}", b.name);
+        }
+    }
+
+    /// On a lockstep link the acked input is the one just sent: prediction
+    /// is checked every tick and is exact, and an attacking bot does not
+    /// predict at all.
+    #[test]
+    fn lockstep_prediction_is_exact_and_only_real_clients_predict() {
+        let r = run(Scenario::standard());
+        let p = r.bot("honest").predict.expect("honest predicts");
+        assert!(p.checked > 600 && p.exact == p.checked, "{p:?}");
+        assert!(r.bot("flood").predict.is_none() && r.bot("speedhack").predict.is_none());
     }
 
     /// The reasons raised on a bot, sorted — the order they fired in is the

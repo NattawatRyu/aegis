@@ -61,7 +61,8 @@ fn main() -> std::io::Result<()> {
     }
     if args.get(1).map(String::as_str) == Some("net") {
         let seeds = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8);
-        net(seeds, args.get(3).and_then(|s| s.parse().ok()).unwrap_or(4));
+        let down = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
+        net(seeds, args.get(3).and_then(|s| s.parse().ok()).unwrap_or(4), down);
         return Ok(());
     }
     if args.get(1).map(String::as_str) == Some("foresight") {
@@ -408,22 +409,42 @@ fn lag(seeds: u32, max_rtt: u32, stale: bool) {
 
 /// What an imperfect link does to honest play: lag_mix crowds at round
 /// trip `rtt`, over a grid of jitter and loss on the way up. Pillar B's
-/// baseline — what the netcode is there to fix.
-fn net(seeds: u32, rtt: u32) {
+/// baseline — what the netcode is there to fix. `down`: per mille of
+/// snapshots lost on the way down, in every cell.
+fn net(seeds: u32, rtt: u32, down: u32) {
+    use aegis_client_sdk::predict::PredictStats;
     use std::collections::BTreeMap;
 
     const CHEATS: [&str; 4] = ["aimbot", "humanized", "triggerbot", "burst"];
 
-    println!("lag_mix crowds: {seeds} per cell, rtt {rtt}, {} ticks", aegis_harness::CROWD_TICKS);
+    println!(
+        "lag_mix crowds: {seeds} per cell, rtt {rtt}, {down}‰ of snapshots lost, {} ticks",
+        aegis_harness::CROWD_TICKS
+    );
     println!("jitter = up to that many extra ticks per datagram on the way up; loss in per mille");
     println!("lost/rejected/felt as % of the inputs honest players sent");
     println!("late = datagrams with no input not seen before (copies, overtaken), % of what every player sent (counted unattributed)");
     println!("rec = inputs taken from a later datagram's copies (v5), % of what every player sent");
     println!("wait = mean ticks an honest input sat in the server's lane");
-    println!("felt = inputs the sim folded in; flagged = honest players any detector raised; caught = cheats raised\n");
+    println!("felt = inputs the sim folded in; flagged = honest players any detector raised; caught = cheats raised");
     println!(
-        "{:>6} {:>5} {:>7} {:>6} {:>9} {:>6} {:>6} {:>6} {:>5} {:>8} {:>8}  rejected by reason",
-        "jitter", "loss", "sent", "lost%", "rejected%", "late%", "rec%", "felt%", "wait", "flagged", "caught"
+        "exact = honest acked inputs whose predicted position was the server's to the bit; err = mean / max distance\n"
+    );
+    println!(
+        "{:>6} {:>5} {:>7} {:>6} {:>9} {:>6} {:>6} {:>6} {:>5} {:>7} {:>13} {:>8} {:>8}  rejected by reason",
+        "jitter",
+        "loss",
+        "sent",
+        "lost%",
+        "rejected%",
+        "late%",
+        "rec%",
+        "felt%",
+        "wait",
+        "exact%",
+        "err mean/max",
+        "flagged",
+        "caught"
     );
     for jitter in 0..=3 {
         for loss in [0, 20, 50, 100] {
@@ -431,9 +452,10 @@ fn net(seeds: u32, rtt: u32) {
                 (0u32, 0u32, 0u32, 0u32, 0u64, 0u64);
             let (mut flagged, mut honest, mut caught, mut cheats, mut all_sent) = (0u32, 0u32, 0u32, 0u32, 0u64);
             let mut recovered = 0u64;
+            let mut pred = PredictStats::default();
             let mut why: BTreeMap<&str, u32> = BTreeMap::new();
             for seed in 0..seeds {
-                let r = run(Scenario { jitter, loss, ..Scenario::lag_mix(seed, rtt) });
+                let r = run(Scenario { jitter, loss, down_loss: down, ..Scenario::lag_mix(seed, rtt) });
                 late += r.net.get(aegis_server::server::LATE);
                 recovered += r.net.recovered;
                 all_sent += r.bots.iter().map(|b| u64::from(b.sent)).sum::<u64>();
@@ -449,6 +471,9 @@ fn net(seeds: u32, rtt: u32) {
                     lost += b.lost;
                     felt += b.moved;
                     waited += b.waited;
+                    if let Some(p) = &b.predict {
+                        pred.add(p);
+                    }
                     rejected += b.totals.total_rejected();
                     for (&k, &v) in &b.totals.rejected {
                         *why.entry(k).or_default() += v;
@@ -458,7 +483,7 @@ fn net(seeds: u32, rtt: u32) {
             let pct = |x: u32| 100.0 * x as f32 / sent.max(1) as f32;
             let why: Vec<String> = why.iter().map(|(k, v)| format!("{k} {v}")).collect();
             println!(
-                "{:>6} {:>5} {:>7} {:>5.1}% {:>8.1}% {:>5.1}% {:>5.1}% {:>5.1}% {:>5.2} {:>8} {:>8}  {}",
+                "{:>6} {:>5} {:>7} {:>5.1}% {:>8.1}% {:>5.1}% {:>5.1}% {:>5.1}% {:>5.2} {:>6.2}% {:>13} {:>8} {:>8}  {}",
                 jitter,
                 loss,
                 sent,
@@ -468,6 +493,8 @@ fn net(seeds: u32, rtt: u32) {
                 100.0 * recovered as f32 / all_sent.max(1) as f32,
                 pct(felt),
                 waited as f32 / felt.max(1) as f32,
+                100.0 * pred.exact as f32 / pred.checked.max(1) as f32,
+                format!("{:.3}/{:.2}", pred.mean_err(), pred.max_err),
                 format!("{flagged}/{honest}"),
                 format!("{caught}/{cheats}"),
                 why.join(", ")

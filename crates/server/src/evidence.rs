@@ -94,6 +94,14 @@ impl Evidence {
         self.react.joined(tick, world, &self.vis, id);
     }
 
+    /// One of `shooter`'s inputs, claiming snapshot `seen`, is being folded
+    /// in — call for every input, firing or not, before its shot. Optional,
+    /// but it keeps a snapshot lost on the way down out of reaction times
+    /// ([`Reaction::input`]).
+    pub fn input(&mut self, shooter: PlayerId, seen: u32) {
+        self.react.input(shooter, seen);
+    }
+
     /// A shot by `shooter` at `aim`, chosen on snapshot `seen`, resolved on
     /// `tick`. `alive`: the shooter is alive now, in the game's world. Call
     /// once per shot, in resolution order, before the game resolves it or

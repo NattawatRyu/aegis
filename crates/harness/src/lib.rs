@@ -1834,6 +1834,29 @@ mod tests {
         assert!(h.accuracy() < 0.6, "honest accuracy {}", h.accuracy());
     }
 
+    /// C6.10: a snapshot lost on the way down hides no instant bot. With 10%
+    /// of snapshots lost at a 133 ms round trip, every cheat in 8 crowds is
+    /// caught and nobody honest is. Timed in ticks from the snapshot sent,
+    /// the lost ones broke the burst bot's runs — its target switches read
+    /// as 1–9 tick reactions — and it escaped 3 times in 8.
+    #[test]
+    fn a_lost_snapshot_hides_no_instant_bot() {
+        const CHEATS: [&str; 4] = ["aimbot", "humanized", "triggerbot", "burst"];
+        let mut caught = BTreeMap::<&str, u32>::new();
+        for seed in 0..8 {
+            let r = run(Scenario { down_loss: 100, ..Scenario::lag_mix(seed, 4) });
+            for b in &r.bots {
+                if CHEATS.contains(&b.name) {
+                    *caught.entry(b.name).or_default() += u32::from(!b.alerts.is_empty());
+                } else {
+                    assert!(b.alerts.is_empty(), "seed {seed}: honest {} flagged: {:?}", b.name, b.alerts);
+                }
+            }
+        }
+        assert_eq!(caught["burst"], 8, "{caught:?}");
+        assert!(caught.values().sum::<u32>() >= 30, "{caught:?}");
+    }
+
     /// B3's point: a client predicting its own position with the server's
     /// movement code is right to the bit whenever none of its inputs is lost
     /// — through a 133 ms round trip, 3 ticks of jitter up and 10% of

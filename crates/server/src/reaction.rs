@@ -18,6 +18,12 @@
 //! enemy that had just come into sight — and read as an instant reaction:
 //! at a 6-tick round trip, 14 of 24 honest walkers were flagged.
 //!
+//! Snapshots lost on the way down (C6.10): when the game reports every input
+//! ([`Reaction::input`], as the Aegis server does), a run of fire counts
+//! inputs, not ticks, and `since` moves up to the first snapshot the shooter
+//! claimed showing E — provided it was claiming older ones in between. The
+//! server knows what it sent; the claims are what the client had.
+//!
 //! In sight means: S alive, E alive, and S [`Visibility::sees`] E. So a
 //! respawn — either side — starts a new engagement, and a corpse never
 //! starts one.
@@ -72,10 +78,25 @@ pub struct Reaction {
     /// of firing — both in the shooter's ticks, the snapshots it acted on.
     last_shot: [Option<u32>; 256],
     streak_start: [u32; 256],
+    /// Per shooter, once the game reports its inputs ([`Reaction::input`]):
+    /// inputs folded so far, the input it last fired in and the one its run
+    /// started in. Runs then count inputs, not ticks: a snapshot lost on the
+    /// way down is a tick the client did not have, not one it held fire on.
+    inputs: [Option<u32>; 256],
+    last_fired: [Option<u32>; 256],
+    streak_input: [u32; 256],
+    /// The last [`CLAIMS`] distinct snapshot ticks each shooter's inputs
+    /// claimed, oldest first, and how many are kept.
+    claims: Box<[[u32; CLAIMS]; 256]>,
+    claimed: [u8; 256],
 }
 
 /// `since` for a pair that has no sight interval at all.
 const NONE: u32 = u32::MAX;
+
+/// Claimed ticks remembered per shooter: twice the history, so a reaction
+/// the history can still judge finds the claim it starts from.
+pub const CLAIMS: usize = 32;
 
 impl Default for Reaction {
     fn default() -> Self {
@@ -86,6 +107,11 @@ impl Default for Reaction {
             engaged: Box::new([[0; WORDS]; 256]),
             last_shot: [None; 256],
             streak_start: [0; 256],
+            inputs: [None; 256],
+            last_fired: [None; 256],
+            streak_input: [0; 256],
+            claims: Box::new([[0; CLAIMS]; 256]),
+            claimed: [0; 256],
         }
     }
 }
@@ -142,6 +168,9 @@ impl Reaction {
         let alive = alive(sim);
         let (i, (w, m)) = (id as usize, bit(id));
         self.last_shot[i] = None;
+        self.inputs[i] = None;
+        self.last_fired[i] = None;
+        self.claimed[i] = 0;
         self.seen[i] = [0; WORDS];
         self.engaged[i] = [0; WORDS];
         self.since[i] = [NONE; 256];
@@ -176,12 +205,63 @@ impl Reaction {
     /// A snapshot the client never got (lost on the way) is a tick it did
     /// not fire on, so it ends the run — on a lossy link a run can read as
     /// two, and the second one's first shot as a start.
+    ///
+    /// Once the game reports `s`'s inputs ([`Reaction::input`]), a run is
+    /// counted in inputs instead: it ends at an input that did not fire,
+    /// not at a tick the client never got.
     pub fn fired(&mut self, seen: u32, s: PlayerId) {
         let i = s as usize;
-        if !matches!(self.last_shot[i], Some(t) if t == seen || t.wrapping_add(1) == seen) {
+        if let Some(n) = self.inputs[i] {
+            if !matches!(self.last_fired[i], Some(f) if f == n || f.wrapping_add(1) == n) {
+                self.streak_input[i] = n;
+            }
+            self.last_fired[i] = Some(n);
+        } else if !matches!(self.last_shot[i], Some(t) if t == seen || t.wrapping_add(1) == seen) {
             self.streak_start[i] = seen;
         }
         self.last_shot[i] = Some(seen);
+    }
+
+    /// One of `s`'s inputs was folded in, claiming snapshot `seen` — call for
+    /// every input, firing or not, before its shot ([`Reaction::fired`]).
+    /// Optional: a game that never calls it gets runs in ticks and reactions
+    /// timed from the snapshot that first showed the enemy, as before.
+    ///
+    /// The claims are what the client provably had. Timing a reaction from
+    /// the first claim showing the enemy, not the first snapshot sent
+    /// showing it, keeps a snapshot lost on the way down out of the
+    /// reaction: at 10% loss, an instant bot read up to 9 ticks and escaped
+    /// the detector 3 times in 8 (`aegis-harness net 8 4 100`, 2026-10-12).
+    pub fn input(&mut self, s: PlayerId, seen: u32) {
+        let i = s as usize;
+        self.inputs[i] = Some(self.inputs[i].map_or(0, |n| n.wrapping_add(1)));
+        let k = self.claimed[i] as usize;
+        if k > 0 && self.claims[i][k - 1] == seen {
+            return;
+        }
+        if k == CLAIMS {
+            self.claims[i].copy_within(1.., 0);
+            self.claims[i][CLAIMS - 1] = seen;
+        } else {
+            self.claims[i][k] = seen;
+            self.claimed[i] += 1;
+        }
+    }
+
+    /// The first snapshot at or after `since` that `s` claimed — only when a
+    /// claim before `since` is kept too: the client was acting, on older
+    /// snapshots, while the ones it skipped went out. Without one (it sent
+    /// nothing, or the claims kept do not reach back) there is no evidence
+    /// it lacked them, and `since` stands: a reaction is never shortened on
+    /// a guess, which would make an honest player look fast.
+    fn first_claim(&self, s: PlayerId, since: u32) -> u32 {
+        let i = s as usize;
+        let kept = &self.claims[i][..self.claimed[i] as usize];
+        let covers = kept.first().is_some_and(|&c| c < since);
+        match kept.iter().find(|&&c| c >= since) {
+            Some(&c) if covers => c,
+            _ => since,
+        }
     }
 
     /// `s` put a shot on record against `e`, choosing it on the snapshot of
@@ -209,7 +289,10 @@ impl Reaction {
             return None;
         }
         self.engaged[si][w] |= m;
-        (self.streak_start[si] == seen).then_some(seen - since)
+        match self.inputs[si] {
+            Some(n) => (self.streak_input[si] == n).then(|| seen.saturating_sub(self.first_claim(s, since))),
+            None => (self.streak_start[si] == seen).then_some(seen - since),
+        }
     }
 }
 
@@ -344,6 +427,96 @@ mod tests {
         begin(&mut r, &sim, 5);
         begin(&mut r, &sim, 6); // 1 holds fire on 5
         assert_eq!(shoot(&mut r, 6, 1, 4), Some(5), "from rest after a break");
+    }
+
+    /// An input: its claim, then its shot at `e` if any.
+    fn act(r: &mut Reaction, seen: u32, s: PlayerId, e: Option<PlayerId>) -> Option<u32> {
+        r.input(s, seen);
+        let e = e?;
+        r.fired(seen, s);
+        r.engage(s, e, seen)
+    }
+
+    /// Three enemies in the open from tick 1; snapshot 3 never reached 1.
+    fn three_in_sight(r: &mut Reaction) {
+        let mut sim = Sim::new();
+        sim.spawn(1, Vec2::ZERO);
+        sim.spawn(2, Vec2::new(10.0, 0.0));
+        sim.spawn(3, Vec2::new(0.0, 20.0));
+        for t in 1..=4 {
+            begin(r, &sim, t);
+        }
+    }
+
+    /// C6.10, edge: with inputs reported, a run counts inputs. Snapshot 3
+    /// lost, 1 fires on 1, 2, 4 without a break, so the switch to 3 on 4 is
+    /// not timed. Counted in ticks (no inputs reported) the claim gap
+    /// breaks the run and the switch reads as a 3-tick reaction.
+    #[test]
+    fn with_inputs_a_lost_snapshot_breaks_no_run() {
+        let mut r = Reaction::default();
+        three_in_sight(&mut r);
+        assert_eq!(act(&mut r, 1, 1, Some(2)), Some(0));
+        assert_eq!(act(&mut r, 2, 1, Some(2)), None);
+        assert_eq!(act(&mut r, 4, 1, Some(3)), None, "busy, not slow");
+
+        let mut r = Reaction::default();
+        three_in_sight(&mut r);
+        shoot(&mut r, 1, 1, 2);
+        shoot(&mut r, 2, 1, 2);
+        assert_eq!(shoot(&mut r, 4, 1, 3), Some(3), "ticks: the old reading");
+    }
+
+    /// C6.10, edge: an input that does not fire ends the run, even on a
+    /// snapshot held from the input before.
+    #[test]
+    fn with_inputs_a_held_trigger_ends_the_run() {
+        let mut r = Reaction::default();
+        three_in_sight(&mut r);
+        assert_eq!(act(&mut r, 1, 1, Some(2)), Some(0));
+        act(&mut r, 2, 1, None);
+        assert_eq!(act(&mut r, 2, 1, Some(3)), Some(1), "a new run, from rest");
+    }
+
+    /// C6.10, edge: timed from the first snapshot the client claimed showing
+    /// the enemy. 2 comes into sight on 4; snapshot 4 never reached 1, which
+    /// claimed 3 and then fired on 5: 0, not 1. Had it claimed 4 and held
+    /// fire, the shot on 5 is 1.
+    #[test]
+    fn a_reaction_starts_at_the_first_claim_showing_the_enemy() {
+        let run = |claims: &[u32]| {
+            let mut sim = hidden_pair();
+            let mut r = Reaction::default();
+            for t in 1..=5 {
+                if t == 4 {
+                    sim.apply_move(2, UP);
+                }
+                begin(&mut r, &sim, t);
+            }
+            claims.iter().for_each(|&c| r.input(1, c));
+            act(&mut r, 5, 1, Some(2))
+        };
+        assert_eq!(run(&[2, 3]), Some(0));
+        assert_eq!(run(&[2, 3, 4]), Some(1));
+    }
+
+    /// Edge: the claims kept reach back `CLAIMS` distinct ticks. A sight
+    /// interval older than all of them is timed from its start, as without
+    /// claims; one inside them, from its first claim.
+    #[test]
+    fn claims_older_than_the_memory_fall_back_to_the_interval() {
+        let mut r = Reaction::default();
+        (100..100 + CLAIMS as u32).for_each(|c| r.input(1, c));
+        assert_eq!(r.first_claim(1, 50), 50, "before every claim kept");
+        assert_eq!(r.first_claim(1, 101), 101);
+        let mut r = Reaction::default();
+        r.input(1, 100);
+        r.input(1, 100);
+        r.input(1, 107);
+        assert_eq!((r.claimed[1], r.first_claim(1, 101)), (2, 107), "a held claim is kept once");
+        let mut r = Reaction::default();
+        r.input(1, 105);
+        assert_eq!(r.first_claim(1, 101), 101, "nothing claimed before: no evidence of a skip");
     }
 
     /// Edge: timed from the snapshot the shooter acted on, not from when its

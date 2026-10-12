@@ -481,6 +481,11 @@ impl Server {
         if self.vis_stale {
             self.ev.begin_tick(tick, &self.sim);
         }
+        // Every input's claim, firing or not: runs of fire count inputs, and
+        // reactions start from what each client provably had.
+        for &(p, input) in &pending {
+            self.ev.input(p, input.tick);
+        }
         for &(p, input) in &pending {
             if !input.shoot {
                 continue;

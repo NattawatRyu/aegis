@@ -29,6 +29,23 @@ if (s.HasAim) monitor.Shot(tick, shooter, hit, s);
 while (monitor.Poll(out var alert)) Review(alert);   // evidence for a human, not a ban
 ```
 
+On the client, each frame, drawing a little behind the newest snapshot
+(optional; `client.Interpolate(2)` once, `client.Predict(walls)` to predict
+its own position against an `aegis-server` arena):
+
+```csharp
+if (client.TryView(dtTicks, out var view))
+{
+    for (int i = 0; i < view.Players; i++) Draw(client.ViewPlayer(i));
+    int n = client.InputDrawn(moveX, moveY, aimX, aimY, shoot, buf);   // claims the frame drawn
+    socket.Send(buf, n);
+}
+```
+
+`InputDrawn` claims the frame's tick and how far before it the frame sat, so
+the server judges the shot in the picture on screen; the offset is the
+frame's own, never the caller's.
+
 The `seen` tick must be proven: a MAC'd per-snapshot proof the client
 echoes, at most 16 ticks old, never going back. Otherwise a client picks the
 picture it is judged in.

@@ -83,6 +83,10 @@ static class Program
         Struct<Received>("AegisReceived");
         Struct<Player>("AegisPlayer");
         Struct<ShotEvidence>("AegisShotEvidence");
+        Struct<View>("AegisView");
+        Struct<Pace>("AegisPace");
+        Struct<Wall>("AegisWall");
+        Struct<PredictStats>("AegisPredictStats");
         Const("AEGIS_ABI_VERSION", AegisMonitor.AbiVersion);
         foreach (Status s in Enum.GetValues(typeof(Status)))
             Const(s == Status.Ok ? "AEGIS_OK" : "AEGIS_ERR_" + Snake(s.ToString()).ToUpperInvariant(), (int)s);
@@ -201,6 +205,76 @@ static class Program
         var sealedClient = new AegisClient("riw", new byte[AegisClient.KeysLen]);
         Expect(sealedClient.Receive(new byte[64], 64, out _) == Status.BadSeal, "garbage does not open");
         sealedClient.Dispose();
+        Drawn();
+    }
+
+    // The server's messages as the wire has them (bincode: a u32 variant,
+    // little-endian fixed-size fields, a u64 vector length), unsealed.
+    static byte[] JoinedMsg(byte id, ulong token, uint tick)
+    {
+        var w = new System.IO.BinaryWriter(new System.IO.MemoryStream());
+        w.Write(0u);
+        w.Write(id);
+        w.Write(token);
+        w.Write(tick);
+        return ((System.IO.MemoryStream)w.BaseStream).ToArray();
+    }
+
+    // Snapshot t: player 4 (this client) at x = t, player 2 at x = -t.
+    static byte[] SnapshotMsg(uint t)
+    {
+        var w = new System.IO.BinaryWriter(new System.IO.MemoryStream());
+        w.Write(1u);
+        w.Write(t);
+        w.Write(t * 7 + 1);
+        w.Write(0u);
+        w.Write(2UL);
+        foreach (var (id, x) in new[] { ((byte)4, (float)t), ((byte)2, -(float)t) })
+        {
+            w.Write(id);
+            w.Write(x);
+            w.Write(0f);
+            w.Write((byte)100);
+            w.Write((byte)1);
+        }
+        return ((System.IO.MemoryStream)w.BaseStream).ToArray();
+    }
+
+    // ---- drawing behind and predicting, without a socket ----
+
+    static void Drawn()
+    {
+        using var c = new AegisClient("riw");
+        var buf = new byte[AegisClient.SendMax];
+        Expect(!c.TryView(1, out _), "not interpolating: no frame");
+        Expect(Throws(() => c.InputDrawn(1, 0, 1, 0, true, buf)) == Status.NotReady, "no frame to claim");
+        Expect(Throws(() => _ = c.Pace) == Status.NotReady, "no pace unless interpolating");
+        Expect(Throws(() => c.Interpolate(double.NaN)) == Status.Arg, "a NaN delay");
+        c.Interpolate(1);
+        c.Predict(new[] { new Wall(20, -5, 22, 5) });
+        Expect(Throws(() => c.Predict(new[] { new Wall(1, 0, 0, 1) })) == Status.Arg, "min > max");
+        Expect(!c.TryView(1, out _), "nothing landed");
+        Expect(!c.TryPredicted(out _, out _), "nothing showed it");
+
+        var j = JoinedMsg(4, 7, 1);
+        Expect(c.Receive(j, j.Length, out var rx) == Status.Ok && rx.Kind == Rx.Joined, "joined");
+        foreach (uint t in new uint[] { 2, 3, 4 })
+        {
+            var s = SnapshotMsg(t);
+            Expect(c.Receive(s, s.Length, out rx) == Status.Ok && rx.Tick == t, $"snapshot {t}");
+        }
+        Expect(Throws(() => c.TryView(-1, out _)) == Status.Arg, "a negative dt");
+        Expect(c.TryView(0, out var v) && v.At == 3 && v.Claim == 3 && v.Offset == 0 && v.Players == 2,
+            $"one behind the newest: {v.At} {v.Claim} {v.Offset}");
+        Expect(c.TryView(0.5, out v) && v.At > 3 && v.At < 4 && v.Claim == 4 && v.Offset < 0,
+            $"between snapshots: {v.At} {v.Claim} {v.Offset}");
+        var me = c.ViewPlayer(0);
+        Expect(me.Id == 4 && me.X > 3 && me.X < 4, $"blended: {me.X}");
+        Expect(Throws(() => c.ViewPlayer(2)) == Status.Arg, "past the count");
+        Expect(c.InputDrawn(1, 0, 1, 0, true, buf) > 0, "an input on the frame");
+        Expect(c.TryPredicted(out float px, out float py) && px == 9 && py == 0, $"one step east of 4: {px} {py}");
+        Expect(c.Pace.Frames == 1, "one frame judged");
+        Expect(c.PredictionStats.Checked == 0, "nothing acked yet");
     }
 
     // ---- a callback calling back in; a callback that throws ----

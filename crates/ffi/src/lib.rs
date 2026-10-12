@@ -40,7 +40,7 @@ use aegis_detector::{Alert, Config, FlagReason, Monitor, PlayerStats};
 use aegis_telemetry::{Outcome, Record};
 
 pub mod client;
-pub use client::{AegisClient, AegisPlayer, AegisReceived};
+pub use client::{AegisClient, AegisPace, AegisPlayer, AegisPredictStats, AegisReceived, AegisView, AegisWall};
 
 pub mod evidence;
 pub use evidence::{AegisEvidence, AegisSeesFn, AegisShotEvidence, AEGIS_ERR_BUSY};
@@ -48,8 +48,9 @@ pub use evidence::{AegisEvidence, AegisSeesFn, AegisShotEvidence, AEGIS_ERR_BUSY
 #[cfg(feature = "noise")]
 pub mod noise;
 
-/// Bumped whenever a signature or a struct in `aegis.h` changes.
-pub const AEGIS_ABI_VERSION: u32 = 2;
+/// Bumped whenever a signature or a struct in `aegis.h` changes. 3: the
+/// client draws behind the newest snapshot and predicts itself (B5).
+pub const AEGIS_ABI_VERSION: u32 = 3;
 
 pub const AEGIS_OK: i32 = 0;
 /// A required pointer was null.

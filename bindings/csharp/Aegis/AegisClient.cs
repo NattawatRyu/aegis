@@ -81,6 +81,78 @@ namespace Aegis
             return p;
         }
 
+        /// <summary>
+        /// Draw delay ticks behind the newest snapshot from now on (clamped to
+        /// 0..6). Each frame: TryView, draw ViewPlayer(0..Players), send what
+        /// was chosen on it with InputDrawn. Called again, starts over.
+        /// </summary>
+        public void Interpolate(double delay) => AegisException.Check(Native.aegis_client_interpolate(_h, delay));
+
+        /// <summary>
+        /// dt ticks have passed since the last frame (>= 0): the frame to draw.
+        /// false until interpolating and a snapshot has landed.
+        /// </summary>
+        public bool TryView(double dt, out View view)
+        {
+            int s = Native.aegis_client_view(_h, dt, out view);
+            if (s == (int)Status.NotReady) return false;
+            AegisException.Check(s);
+            return true;
+        }
+
+        /// <summary>Player i of the last frame, placed at its moment.</summary>
+        public Player ViewPlayer(int i)
+        {
+            if (i < 0) throw new ArgumentOutOfRangeException(nameof(i));
+            AegisException.Check(Native.aegis_client_view_player(_h, (uint)i, out var p));
+            return p;
+        }
+
+        /// <summary>
+        /// Writes an input chosen on the last frame into buf; returns its
+        /// length. It claims the frame's tick and its offset, so the server
+        /// judges the shot in the picture on screen.
+        /// </summary>
+        public int InputDrawn(float moveX, float moveY, float aimX, float aimY, bool shoot, byte[] buf) =>
+            AegisException.Check(Native.aegis_client_input_drawn(_h, moveX, moveY, aimX, aimY, shoot, buf, Cap(buf)));
+
+        /// <summary>How steadily the frames drawn so far advanced; throws unless interpolating.</summary>
+        public Pace Pace
+        {
+            get
+            {
+                AegisException.Check(Native.aegis_client_pace(_h, out var p));
+                return p;
+            }
+        }
+
+        /// <summary>
+        /// Predict this player's position from now on, in an arena with walls
+        /// (null: none) — the server's own. Exact against aegis-server's
+        /// movement; an engine with its own physics predicts with that.
+        /// </summary>
+        public void Predict(Wall[] walls) =>
+            AegisException.Check(Native.aegis_client_predict(_h, walls, (UIntPtr)(walls?.Length ?? 0)));
+
+        /// <summary>false until predicting and a snapshot has shown this player.</summary>
+        public bool TryPredicted(out float x, out float y)
+        {
+            int s = Native.aegis_client_predicted(_h, out x, out y);
+            if (s == (int)Status.NotReady) return false;
+            AegisException.Check(s);
+            return true;
+        }
+
+        /// <summary>How the predictions compared with the server; throws unless predicting.</summary>
+        public PredictStats PredictionStats
+        {
+            get
+            {
+                AegisException.Check(Native.aegis_client_prediction_stats(_h, out var s));
+                return s;
+            }
+        }
+
         public void Dispose() => _h.Dispose();
 
         private static UIntPtr Cap(byte[] buf) =>

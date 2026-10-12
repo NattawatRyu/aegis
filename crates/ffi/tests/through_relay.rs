@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use aegis_ffi::client::*;
 use aegis_ffi::AEGIS_OK;
+use aegis_protocol::movement::Wall;
 use aegis_protocol::{mint_connect, EdgeKey, LinkKey, Vec2, EDGE_DOWN_MAX, MAX_DATAGRAM};
 use aegis_relay::{Clock, Relay};
 use aegis_server::{NetServer, Server};
@@ -107,6 +108,84 @@ fn a_c_client_joins_through_a_relay_and_every_input_is_accepted() {
     // The backend's part, over HTTPS in a real deployment.
     let keys = mint_connect(&edge, u64::MAX).to_bytes();
     joins_and_every_input_is_accepted(&mut net, &relay, &relay_socket(&relay), &keys);
+}
+
+/// A C client that draws behind the newest snapshot and predicts itself,
+/// against a real origin with a wall in its path: two frames a tick, each
+/// half a tick, so most land between snapshots. Every input is accepted
+/// (claims and offsets the server takes), some carry an offset, and every
+/// prediction checked is the server's to the bit — the wall crossed the ABI.
+#[test]
+fn an_interpolating_c_client_claims_what_it_draws_and_predicts_exactly() {
+    let edge = EdgeKey::random();
+    let wall = Wall::new(Vec2::new(20.0, -5.0), Vec2::new(22.0, 5.0));
+    let mut net = NetServer::bind((Ipv4Addr::LOCALHOST, 0), Server::with_walls(vec![Vec2::ZERO], &[wall])).unwrap();
+    let link = LinkKey::random();
+    let relay = Relay::spawn_with(
+        (Ipv4Addr::LOCALHOST, 0),
+        (Ipv4Addr::LOCALHOST, 0),
+        net.local_addr().unwrap(),
+        link,
+        edge,
+        Clock::lockstep(),
+    )
+    .unwrap();
+    net.behind_relay(relay.upstream_addr(), link);
+    let sock = relay_socket(&relay);
+    let keys = mint_connect(&edge, u64::MAX).to_bytes();
+
+    let mut c = null_mut();
+    assert_eq!(aegis_client_new(c"riw".as_ptr(), keys.as_ptr(), &mut c), AEGIS_OK);
+    assert_eq!(aegis_client_interpolate(c, 1.0), AEGIS_OK);
+    let w = AegisWall { min_x: wall.min.x, min_y: wall.min.y, max_x: wall.max.x, max_y: wall.max.y };
+    assert_eq!(aegis_client_predict(c, &w, 1), AEGIS_OK);
+    let mut buf = [0u8; AEGIS_SEND_MAX];
+    let mut send_join = |c| {
+        let n = aegis_client_join(c, buf.as_mut_ptr(), buf.len());
+        sock.send(&buf[..n as usize]).unwrap();
+    };
+    send_join(c);
+    until(c, &sock, AEGIS_RX_CHALLENGE);
+    send_join(c);
+    assert!(net.recv_one(WAIT).unwrap());
+    let joined = until(c, &sock, AEGIS_RX_JOINED);
+
+    // Walking east at 5 a tick, it reaches the wall at x 20 by tick 4.
+    const TICKS: u32 = 12;
+    let mut offsets = Vec::new();
+    for _ in 0..TICKS {
+        net.begin_tick().unwrap();
+        relay.next_window();
+        until(c, &sock, AEGIS_RX_SNAPSHOT);
+        let mut v = AegisView::default();
+        for _ in 0..2 {
+            assert_eq!(aegis_client_view(c, 0.5, &mut v), AEGIS_OK);
+        }
+        offsets.push(v.offset);
+        let mut buf = [0u8; AEGIS_SEND_MAX];
+        let n = aegis_client_input_drawn(c, 1.0, 0.0, 1.0, 0.0, false, buf.as_mut_ptr(), buf.len());
+        assert!(n > 0, "{n}");
+        sock.send(&buf[..n as usize]).unwrap();
+        assert!(net.recv_one(WAIT).unwrap());
+        net.end_tick();
+    }
+
+    let records = net.server().telemetry().records();
+    let mine = |o: fn(&Outcome) -> bool| records.iter().filter(|r| r.player == joined.player && o(&r.outcome)).count();
+    assert_eq!(mine(|o| matches!(o, Outcome::Accepted { .. })), TICKS as usize);
+    assert_eq!(mine(|o| matches!(o, Outcome::Rejected { .. })), 0, "{records:?}");
+    assert!(offsets.iter().any(|&o| o < 0), "some frames sat between snapshots: {offsets:?}");
+
+    let mut st = AegisPredictStats::default();
+    assert_eq!(aegis_client_prediction_stats(c, &mut st), AEGIS_OK);
+    assert!(st.checked >= TICKS - 2 && st.exact == st.checked, "{st:?}");
+    let (mut x, mut y) = (0f32, 0f32);
+    assert_eq!(aegis_client_predicted(c, &mut x, &mut y), AEGIS_OK);
+    assert!(x < wall.min.x, "stopped by the wall: {x}");
+    let mut pace = AegisPace::default();
+    assert_eq!(aegis_client_pace(c, &mut pace), AEGIS_OK);
+    assert_eq!(pace.frames, 2 * TICKS - 1);
+    aegis_client_free(c);
 }
 
 /// No backend: the C client knows only the relay's public key, is

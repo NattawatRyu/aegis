@@ -98,6 +98,31 @@ namespace Aegis
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int aegis_client_player(ClientHandle c, uint i, out Player p);
 
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int aegis_client_interpolate(ClientHandle c, double delay);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int aegis_client_view(ClientHandle c, double dt, out View v);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int aegis_client_view_player(ClientHandle c, uint i, out Player p);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int aegis_client_input_drawn(ClientHandle c, float moveX, float moveY,
+            float aimX, float aimY, [MarshalAs(UnmanagedType.U1)] bool shoot, byte[] buf, UIntPtr cap);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int aegis_client_pace(ClientHandle c, out Pace p);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int aegis_client_predict(ClientHandle c, Wall[] walls, UIntPtr n);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int aegis_client_predicted(ClientHandle c, out float x, out float y);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int aegis_client_prediction_stats(ClientHandle c, out PredictStats s);
+
         // ---- Evidence ----
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]

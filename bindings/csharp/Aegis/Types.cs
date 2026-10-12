@@ -31,6 +31,8 @@ namespace Aegis
         Malformed = -11,
         /// <summary>Called from inside a sees callback on the same handle.</summary>
         Busy = -12,
+        /// <summary>Not interpolating or predicting, or nothing has landed yet.</summary>
+        NotReady = -13,
     }
 
     /// <summary>Why a player was flagged. Never renumbered.</summary>
@@ -202,6 +204,69 @@ namespace Aegis
             Health = health;
             AliveByte = alive ? (byte)1 : (byte)0;
         }
+    }
+
+    /// <summary>
+    /// One frame to draw (AegisClient.TryView): the moment At, in ticks; the
+    /// tick an input chosen on it claims; how many players it holds
+    /// (AegisClient.ViewPlayer); and Offset, how long before Claim the moment
+    /// sat, in 1/64 ticks (0 down to -128), which AegisClient.InputDrawn sends.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct View
+    {
+        public double At;
+        public uint Claim;
+        public uint Players;
+        public sbyte Offset;
+    }
+
+    /// <summary>How steadily the frames drawn so far advanced.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Pace
+    {
+        /// <summary>Every frame after the first.</summary>
+        public uint Frames;
+        /// <summary>Advanced by the time passed, within 10%.</summary>
+        public uint Steady;
+        /// <summary>Advanced by less: waiting for a snapshot.</summary>
+        public uint Held;
+        /// <summary>Advanced by more: a jump.</summary>
+        public uint Jumped;
+        /// <summary>Drawn across a lost or late snapshot.</summary>
+        public uint Bridged;
+        /// <summary>Sum over the frames of ticks behind the newest snapshot.</summary>
+        public double Behind;
+    }
+
+    /// <summary>A box nothing walks through, as the server's arena has them.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Wall
+    {
+        public float MinX;
+        public float MinY;
+        public float MaxX;
+        public float MaxY;
+
+        public Wall(float minX, float minY, float maxX, float maxY)
+        {
+            MinX = minX;
+            MinY = minY;
+            MaxX = maxX;
+            MaxY = maxY;
+        }
+    }
+
+    /// <summary>How the predictions compared with the server.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PredictStats
+    {
+        /// <summary>Acked inputs compared with the server.</summary>
+        public uint Checked;
+        /// <summary>Of those, predicted to the bit.</summary>
+        public uint Exact;
+        public float MaxErr;
+        public double SumErr;
     }
 
     /// <summary>

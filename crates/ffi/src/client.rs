@@ -7,7 +7,9 @@
 use std::ffi::{c_char, CStr};
 
 use aegis_client_sdk::conn::{ConnError, Connection, Received};
-use aegis_protocol::{ClientKeys, EventKind, Vec2, CLIENT_KEYS_LEN};
+use aegis_client_sdk::interp::View;
+use aegis_protocol::movement::Wall;
+use aegis_protocol::{ClientKeys, EventKind, PlayerState, Vec2, CLIENT_KEYS_LEN};
 
 use crate::{boundary, AEGIS_ERR_ARG, AEGIS_ERR_NULL, AEGIS_ERR_PANIC, AEGIS_OK};
 
@@ -23,6 +25,9 @@ pub const AEGIS_ERR_TICK_REGRESSED: i32 = -9;
 pub const AEGIS_ERR_BAD_SEAL: i32 = -10;
 /// A datagram that is not a server message.
 pub const AEGIS_ERR_MALFORMED: i32 = -11;
+/// Nothing to read yet: not interpolating or predicting, or no snapshot
+/// has landed since it began. (-12 is the evidence's AEGIS_ERR_BUSY.)
+pub const AEGIS_ERR_NOT_READY: i32 = -13;
 
 /// Bytes of the keys the game's backend hands a client.
 pub const AEGIS_CLIENT_KEYS_LEN: usize = CLIENT_KEYS_LEN;
@@ -93,9 +98,73 @@ pub struct AegisPlayer {
     pub alive: u8,
 }
 
+impl From<&PlayerState> for AegisPlayer {
+    fn from(p: &PlayerState) -> Self {
+        Self { x: p.pos.x, y: p.pos.y, id: p.id, health: p.health, alive: p.alive as u8 }
+    }
+}
+
+/// One frame to draw (`aegis_client_view`): the moment `at`, in ticks; the
+/// tick an input chosen on it claims; how many players it holds
+/// (`aegis_client_view_player`); and `offset`, how long before `claim` the
+/// moment sat in 1/64 ticks (0 down to -128), which
+/// `aegis_client_input_drawn` sends.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct AegisView {
+    pub at: f64,
+    pub claim: u32,
+    pub players: u32,
+    pub offset: i8,
+}
+
+/// How steadily the frames drawn so far advanced (`aegis_client_pace`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct AegisPace {
+    /// Frames judged: every one after the first.
+    pub frames: u32,
+    /// Advanced by the time that passed, within 10%.
+    pub steady: u32,
+    /// Advanced by less: waiting for a snapshot.
+    pub held: u32,
+    /// Advanced by more: a jump.
+    pub jumped: u32,
+    /// Drawn across a lost or late snapshot.
+    pub bridged: u32,
+    /// Sum over the frames of ticks behind the newest snapshot.
+    pub behind: f64,
+}
+
+/// A box nothing walks through, as the server's arena has them.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct AegisWall {
+    pub min_x: f32,
+    pub min_y: f32,
+    pub max_x: f32,
+    pub max_y: f32,
+}
+
+/// How the predictions compared with the server
+/// (`aegis_client_prediction_stats`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct AegisPredictStats {
+    /// Acked inputs checked.
+    pub checked: u32,
+    /// Of those, predicted to the bit.
+    pub exact: u32,
+    /// Largest distance between prediction and server.
+    pub max_err: f32,
+    pub sum_err: f64,
+}
+
 /// Opaque to C.
 pub struct AegisClient {
     conn: Connection,
+    /// The frame `aegis_client_view` drew last.
+    view: Option<View>,
     poisoned: bool,
 }
 
@@ -154,7 +223,7 @@ pub extern "C" fn aegis_client_new(name: *const c_char, keys: *const u8, out: *m
         // SAFETY: the caller says `keys`, when not null, holds
         // AEGIS_CLIENT_KEYS_LEN bytes.
         let keys = unsafe { keys.cast::<[u8; CLIENT_KEYS_LEN]>().as_ref() }.map(ClientKeys::from_bytes);
-        let c = Box::new(AegisClient { conn: Connection::new(name, keys), poisoned: false });
+        let c = Box::new(AegisClient { conn: Connection::new(name, keys), view: None, poisoned: false });
         // SAFETY: null checked above.
         unsafe { *out = Box::into_raw(c) };
         AEGIS_OK
@@ -251,12 +320,186 @@ pub extern "C" fn aegis_client_player(c: *mut AegisClient, i: u32, out: *mut Aeg
     }
     with_client(c, |c| match c.conn.players().get(i as usize) {
         Some(p) => {
-            let p = AegisPlayer { x: p.pos.x, y: p.pos.y, id: p.id, health: p.health, alive: p.alive as u8 };
             // SAFETY: null checked above.
-            unsafe { *out = p };
+            unsafe { *out = p.into() };
             AEGIS_OK
         }
         None => AEGIS_ERR_ARG,
+    })
+}
+
+/// Draw `delay` ticks behind the newest snapshot from now on (clamped to
+/// 0..=6; not a finite number: AEGIS_ERR_ARG). Called again, starts over.
+#[no_mangle]
+pub extern "C" fn aegis_client_interpolate(c: *mut AegisClient, delay: f64) -> i32 {
+    with_client(c, |c| {
+        if !delay.is_finite() {
+            return AEGIS_ERR_ARG;
+        }
+        c.conn.interpolate(delay);
+        c.view = None;
+        AEGIS_OK
+    })
+}
+
+/// `dt` ticks have passed since the last frame (>= 0, finite, else
+/// AEGIS_ERR_ARG): the frame to draw now into `*out`. AEGIS_ERR_NOT_READY
+/// until interpolating and a snapshot has landed. The frame is kept for
+/// `aegis_client_view_player` and `aegis_client_input_drawn`.
+#[no_mangle]
+pub extern "C" fn aegis_client_view(c: *mut AegisClient, dt: f64, out: *mut AegisView) -> i32 {
+    if out.is_null() {
+        return AEGIS_ERR_NULL;
+    }
+    with_client(c, |c| {
+        if !dt.is_finite() || dt < 0.0 {
+            return AEGIS_ERR_ARG;
+        }
+        let Some(v) = c.conn.view(dt) else { return AEGIS_ERR_NOT_READY };
+        let view = AegisView { at: v.at, claim: v.claim, players: v.players.len() as u32, offset: v.offset };
+        c.view = Some(v);
+        // SAFETY: null checked above.
+        unsafe { *out = view };
+        AEGIS_OK
+    })
+}
+
+/// Player `i` of the last frame drawn, placed at its moment; AEGIS_ERR_ARG
+/// past its count, AEGIS_ERR_NOT_READY before a frame.
+#[no_mangle]
+pub extern "C" fn aegis_client_view_player(c: *mut AegisClient, i: u32, out: *mut AegisPlayer) -> i32 {
+    if out.is_null() {
+        return AEGIS_ERR_NULL;
+    }
+    with_client(c, |c| {
+        let Some(v) = &c.view else { return AEGIS_ERR_NOT_READY };
+        match v.players.get(i as usize) {
+            Some(p) => {
+                // SAFETY: null checked above.
+                unsafe { *out = p.into() };
+                AEGIS_OK
+            }
+            None => AEGIS_ERR_ARG,
+        }
+    })
+}
+
+/// Write an input chosen on the last frame drawn into `buf`: it claims the
+/// frame's tick and its offset, so the server judges the shot in the
+/// picture on screen. Its length, or a negative status;
+/// AEGIS_ERR_NOT_READY before a frame. The offset is the frame's own: the
+/// caller cannot set one.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn aegis_client_input_drawn(
+    c: *mut AegisClient,
+    move_x: f32,
+    move_y: f32,
+    aim_x: f32,
+    aim_y: f32,
+    shoot: bool,
+    buf: *mut u8,
+    cap: usize,
+) -> i32 {
+    if buf.is_null() {
+        return AEGIS_ERR_NULL;
+    }
+    with_client(c, |c| {
+        let Some(view) = &c.view else { return AEGIS_ERR_NOT_READY };
+        match c.conn.input_drawn(view, Vec2::new(move_x, move_y), Vec2::new(aim_x, aim_y), shoot) {
+            Ok(d) => emit(&d, buf, cap),
+            Err(e) => status(e),
+        }
+    })
+}
+
+/// How steadily the frames drawn so far advanced; AEGIS_ERR_NOT_READY
+/// unless interpolating.
+#[no_mangle]
+pub extern "C" fn aegis_client_pace(c: *mut AegisClient, out: *mut AegisPace) -> i32 {
+    if out.is_null() {
+        return AEGIS_ERR_NULL;
+    }
+    with_client(c, |c| {
+        let Some(p) = c.conn.pace() else { return AEGIS_ERR_NOT_READY };
+        let p = AegisPace {
+            frames: p.frames,
+            steady: p.steady,
+            held: p.held,
+            jumped: p.jumped,
+            bridged: p.bridged,
+            behind: p.behind,
+        };
+        // SAFETY: null checked above.
+        unsafe { *out = p };
+        AEGIS_OK
+    })
+}
+
+/// Predict this player's position from now on, in an arena with the `n`
+/// boxes at `walls` (NULL when `n` is 0) — the server's own. Only a server
+/// that moves players with Aegis's movement (`aegis-server`) is predicted
+/// to the bit; an engine with its own physics predicts with it. A box not
+/// finite or with min > max: AEGIS_ERR_ARG. Called again, starts over.
+#[no_mangle]
+pub extern "C" fn aegis_client_predict(c: *mut AegisClient, walls: *const AegisWall, n: usize) -> i32 {
+    if walls.is_null() && n > 0 {
+        return AEGIS_ERR_NULL;
+    }
+    with_client(c, |c| {
+        let walls = if n == 0 {
+            &[][..]
+        } else {
+            // SAFETY: the caller says `walls` holds `n` boxes; not null.
+            unsafe { std::slice::from_raw_parts(walls, n) }
+        };
+        let ok = |w: &AegisWall| {
+            [w.min_x, w.min_y, w.max_x, w.max_y].iter().all(|v| v.is_finite())
+                && w.min_x <= w.max_x
+                && w.min_y <= w.max_y
+        };
+        if !walls.iter().all(ok) {
+            return AEGIS_ERR_ARG;
+        }
+        let walls: Vec<Wall> =
+            walls.iter().map(|w| Wall::new(Vec2::new(w.min_x, w.min_y), Vec2::new(w.max_x, w.max_y))).collect();
+        c.conn.predict_in(&walls);
+        AEGIS_OK
+    })
+}
+
+/// Where this player is once every input sent so far is folded, into
+/// `*x`, `*y`; AEGIS_ERR_NOT_READY unless predicting and a snapshot has
+/// shown it.
+#[no_mangle]
+pub extern "C" fn aegis_client_predicted(c: *mut AegisClient, x: *mut f32, y: *mut f32) -> i32 {
+    if x.is_null() || y.is_null() {
+        return AEGIS_ERR_NULL;
+    }
+    with_client(c, |c| {
+        let Some(p) = c.conn.predicted() else { return AEGIS_ERR_NOT_READY };
+        // SAFETY: null checked above.
+        unsafe {
+            *x = p.x;
+            *y = p.y;
+        }
+        AEGIS_OK
+    })
+}
+
+/// How the predictions compared with the server so far;
+/// AEGIS_ERR_NOT_READY unless predicting.
+#[no_mangle]
+pub extern "C" fn aegis_client_prediction_stats(c: *mut AegisClient, out: *mut AegisPredictStats) -> i32 {
+    if out.is_null() {
+        return AEGIS_ERR_NULL;
+    }
+    with_client(c, |c| {
+        let Some(s) = c.conn.prediction_stats() else { return AEGIS_ERR_NOT_READY };
+        let s = AegisPredictStats { checked: s.checked, exact: s.exact, max_err: s.max_err, sum_err: s.sum_err };
+        // SAFETY: null checked above.
+        unsafe { *out = s };
+        AEGIS_OK
     })
 }
 
@@ -333,6 +576,124 @@ mod tests {
             AEGIS_ERR_BAD_SEAL,
             "unsealed to a sealed client"
         );
+        aegis_client_free(c);
+    }
+
+    fn recv(c: *mut AegisClient, m: &ServerMsg) -> i32 {
+        let d = encode(m);
+        let mut rx = AegisReceived::default();
+        aegis_client_receive(c, d.as_ptr(), d.len(), &mut rx)
+    }
+
+    /// Snapshot `t`: this client (4) at x = t, player 2 at x = -t.
+    fn snap(t: u32) -> ServerMsg {
+        let p = |id, x| PlayerState { id, pos: Vec2::new(x, 0.0), health: 100, alive: true };
+        ServerMsg::Snapshot { tick: t, proof: t * 7 + 1, ack: 0, players: vec![p(4, t as f32), p(2, -(t as f32))] }
+    }
+
+    /// Every new call at its edges: nothing to read before it is switched
+    /// on and before a snapshot lands; arguments out of range refused
+    /// without touching the clock.
+    #[test]
+    fn view_pace_and_prediction_are_not_ready_until_they_are() {
+        let c = client(b"riw\0", None).unwrap();
+        let (mut v, mut p, mut pace, mut st) =
+            (AegisView::default(), AegisPlayer::default(), AegisPace::default(), AegisPredictStats::default());
+        let (mut x, mut y) = (0f32, 0f32);
+        let mut buf = [0u8; AEGIS_SEND_MAX];
+        let drawn =
+            |c, buf: &mut [u8]| aegis_client_input_drawn(c, 1.0, 0.0, 1.0, 0.0, true, buf.as_mut_ptr(), buf.len());
+
+        // Not switched on.
+        assert_eq!(aegis_client_view(c, 1.0, &mut v), AEGIS_ERR_NOT_READY);
+        assert_eq!(aegis_client_view_player(c, 0, &mut p), AEGIS_ERR_NOT_READY);
+        assert_eq!(drawn(c, &mut buf), AEGIS_ERR_NOT_READY);
+        assert_eq!(aegis_client_pace(c, &mut pace), AEGIS_ERR_NOT_READY);
+        assert_eq!(aegis_client_predicted(c, &mut x, &mut y), AEGIS_ERR_NOT_READY);
+        assert_eq!(aegis_client_prediction_stats(c, &mut st), AEGIS_ERR_NOT_READY);
+
+        // Switched on, nothing landed.
+        assert_eq!(aegis_client_interpolate(c, f64::NAN), AEGIS_ERR_ARG);
+        assert_eq!(aegis_client_interpolate(c, f64::INFINITY), AEGIS_ERR_ARG);
+        assert_eq!(aegis_client_interpolate(c, 1.0), AEGIS_OK);
+        assert_eq!(aegis_client_predict(c, std::ptr::null(), 0), AEGIS_OK, "an open arena");
+        assert_eq!(aegis_client_predict(c, std::ptr::null(), 1), AEGIS_ERR_NULL);
+        let bad = [
+            AegisWall { min_x: 1.0, min_y: 0.0, max_x: 0.0, max_y: 1.0 },
+            AegisWall { min_x: 0.0, min_y: 0.0, max_x: f32::NAN, max_y: 1.0 },
+        ];
+        for w in &bad {
+            assert_eq!(aegis_client_predict(c, w, 1), AEGIS_ERR_ARG, "{w:?}");
+        }
+        let point = AegisWall { min_x: 9.0, min_y: 9.0, max_x: 9.0, max_y: 9.0 };
+        assert_eq!(aegis_client_predict(c, &point, 1), AEGIS_OK, "min == max is a box");
+        assert_eq!(aegis_client_view(c, 1.0, &mut v), AEGIS_ERR_NOT_READY);
+        assert_eq!(aegis_client_pace(c, &mut pace), AEGIS_OK);
+        assert_eq!(pace, AegisPace::default());
+        assert_eq!(aegis_client_predicted(c, &mut x, &mut y), AEGIS_ERR_NOT_READY, "no snapshot showed it");
+        assert_eq!(aegis_client_prediction_stats(c, &mut st), AEGIS_OK);
+
+        // Landed.
+        assert_eq!(recv(c, &ServerMsg::Joined { player_id: 4, token: 7, tick: 1 }), AEGIS_OK);
+        assert_eq!(drawn(c, &mut buf), AEGIS_ERR_NOT_READY, "joined, no frame yet");
+        for t in [2, 3, 4] {
+            recv(c, &snap(t));
+        }
+        for dt in [-1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(aegis_client_view(c, dt, &mut v), AEGIS_ERR_ARG, "{dt}");
+        }
+        assert_eq!(aegis_client_view(c, 0.0, &mut v), AEGIS_OK);
+        assert_eq!(v, AegisView { at: 3.0, claim: 3, players: 2, offset: 0 }, "one behind the newest");
+        assert_eq!(aegis_client_view(c, 0.5, &mut v), AEGIS_OK);
+        assert!(v.at > 3.0 && v.at < 4.0 && v.claim == 4 && v.offset < 0, "{v:?}");
+        assert_eq!(aegis_client_view_player(c, 0, &mut p), AEGIS_OK);
+        assert!(p.id == 4 && p.x > 3.0 && p.x < 4.0, "blended: {p:?}");
+        assert_eq!(aegis_client_view_player(c, 2, &mut p), AEGIS_ERR_ARG);
+        assert!(drawn(c, &mut buf) > 0);
+        assert_eq!(aegis_client_predicted(c, &mut x, &mut y), AEGIS_OK);
+        assert_eq!((x, y), (4.0 + 5.0, 0.0), "the newest showed it at 4, one step east since");
+        assert_eq!(aegis_client_pace(c, &mut pace), AEGIS_OK);
+        assert_eq!(pace.frames, 1);
+
+        // Switched on again: starts over, the frame is gone.
+        assert_eq!(aegis_client_interpolate(c, 2.0), AEGIS_OK);
+        assert_eq!(aegis_client_view_player(c, 0, &mut p), AEGIS_ERR_NOT_READY);
+        assert_eq!(drawn(c, &mut buf), AEGIS_ERR_NOT_READY);
+        aegis_client_free(c);
+    }
+
+    /// Driven alike, the C client and the Rust `Connection` it wraps send
+    /// the same bytes: the offset that crosses is the frame's own.
+    #[test]
+    fn an_input_drawn_is_the_rust_clients_to_the_byte() {
+        let c = client(b"riw\0", None).unwrap();
+        let mut rust = Connection::new("riw", None);
+        assert_eq!(aegis_client_interpolate(c, 1.5), AEGIS_OK);
+        rust.interpolate(1.5);
+        let both = |rust: &mut Connection, m: &ServerMsg| {
+            assert_eq!(recv(c, m), AEGIS_OK);
+            rust.receive(&mut encode(m)).unwrap();
+        };
+        both(&mut rust, &ServerMsg::Joined { player_id: 4, token: 7, tick: 1 });
+        let mut offsets = Vec::new();
+        for t in 2..20 {
+            if t % 5 != 0 {
+                both(&mut rust, &snap(t)); // every fifth lost
+            }
+            for (i, dt) in [0.3, 0.7].into_iter().enumerate() {
+                let mut v = AegisView::default();
+                assert_eq!(aegis_client_view(c, dt, &mut v), AEGIS_OK);
+                let r = rust.view(dt).unwrap();
+                assert_eq!((v.at, v.claim, v.offset), (r.at, r.claim, r.offset));
+                let shoot = i == 1;
+                let mut buf = [0u8; AEGIS_SEND_MAX];
+                let n = aegis_client_input_drawn(c, 1.0, 0.5, 0.0, 1.0, shoot, buf.as_mut_ptr(), buf.len());
+                let want = rust.input_drawn(&r, Vec2::new(1.0, 0.5), Vec2::new(0.0, 1.0), shoot).unwrap();
+                assert_eq!(&buf[..n as usize], &want[..], "tick {t} frame {i}");
+                offsets.push(v.offset);
+            }
+        }
+        assert!(offsets.iter().any(|&o| o < 0), "some frames sat between snapshots: {offsets:?}");
         aegis_client_free(c);
     }
 }

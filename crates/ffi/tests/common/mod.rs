@@ -68,6 +68,10 @@ pub fn client_layout_and_consts() -> Vec<String> {
     let mut want = Vec::new();
     layout!(want, AegisReceived, tick, kind, event, player, other, damage);
     layout!(want, AegisPlayer, x, y, id, health, alive);
+    layout!(want, AegisView, at, claim, players, offset);
+    layout!(want, AegisPace, frames, steady, held, jumped, bridged, behind);
+    layout!(want, AegisWall, min_x, min_y, max_x, max_y);
+    layout!(want, AegisPredictStats, checked, exact, max_err, sum_err);
     consts!(
         want,
         AEGIS_ABI_VERSION,
@@ -84,6 +88,7 @@ pub fn client_layout_and_consts() -> Vec<String> {
         AEGIS_ERR_BAD_SEAL,
         AEGIS_ERR_MALFORMED,
         AEGIS_ERR_BUSY,
+        AEGIS_ERR_NOT_READY,
         AEGIS_REASON_ACCURACY,
         AEGIS_REASON_AIM_EXACT,
         AEGIS_REASON_ANOMALY_RATE,

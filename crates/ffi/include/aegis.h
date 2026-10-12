@@ -25,7 +25,7 @@
 extern "C" {
 #endif
 
-#define AEGIS_ABI_VERSION 2u
+#define AEGIS_ABI_VERSION 3u
 
 #define AEGIS_OK 0
 #define AEGIS_ERR_NULL (-1)       /* a required pointer was null */
@@ -147,6 +147,7 @@ const char *aegis_reason_label(uint8_t reason);
 #define AEGIS_ERR_TICK_REGRESSED (-9) /* older tick than an earlier input */
 #define AEGIS_ERR_BAD_SEAL (-10)      /* did not open under this client's keys */
 #define AEGIS_ERR_MALFORMED (-11)     /* not a server message */
+#define AEGIS_ERR_NOT_READY (-13)     /* not interpolating/predicting, or nothing landed yet */
 
 #define AEGIS_CLIENT_KEYS_LEN 80
 #define AEGIS_NAME_MAX 32
@@ -200,6 +201,65 @@ int32_t aegis_client_player_id(AegisClient *c);
 /* The newest snapshot's players. */
 int32_t aegis_client_player_count(AegisClient *c);
 int32_t aegis_client_player(AegisClient *c, uint32_t i, AegisPlayer *out);
+
+/* Drawing behind the newest snapshot (optional). Each frame:
+ * aegis_client_view(dt), draw its players (aegis_client_view_player), and
+ * send what was chosen on it with aegis_client_input_drawn: it claims the
+ * frame's tick and says how long before it the frame sat (`offset`), so
+ * the server judges the shot in the picture on screen. */
+typedef struct AegisView {
+    double at;      /* the moment drawn, in ticks */
+    uint32_t claim; /* the tick an input chosen on it claims */
+    uint32_t players;
+    int8_t offset;  /* 1/64 ticks before claim: 0 down to -128 */
+} AegisView;
+
+typedef struct AegisPace {
+    uint32_t frames;  /* every one after the first */
+    uint32_t steady;  /* advanced by the time passed, within 10% */
+    uint32_t held;    /* advanced by less: waiting for a snapshot */
+    uint32_t jumped;  /* advanced by more */
+    uint32_t bridged; /* drawn across a lost or late snapshot */
+    double behind;    /* sum over frames of ticks behind the newest */
+} AegisPace;
+
+/* delay: ticks behind the newest, clamped to 0..6; not finite: AEGIS_ERR_ARG.
+ * Called again, starts over. */
+int32_t aegis_client_interpolate(AegisClient *c, double delay);
+/* dt: ticks since the last frame, finite and >= 0 (else AEGIS_ERR_ARG).
+ * AEGIS_ERR_NOT_READY until interpolating and a snapshot has landed. */
+int32_t aegis_client_view(AegisClient *c, double dt, AegisView *out);
+/* Player i of the last frame, placed at its moment. */
+int32_t aegis_client_view_player(AegisClient *c, uint32_t i, AegisPlayer *out);
+/* Like aegis_client_input, chosen on the last frame; the offset is the
+ * frame's own. */
+int32_t aegis_client_input_drawn(AegisClient *c, float move_x, float move_y, float aim_x, float aim_y, bool shoot,
+                                 uint8_t *buf, size_t cap);
+int32_t aegis_client_pace(AegisClient *c, AegisPace *out);
+
+/* Predicting this player's own position (optional), exact against a server
+ * that moves players with Aegis's movement (aegis-server) in the same
+ * walls; an engine with its own physics predicts with that instead. */
+typedef struct AegisWall {
+    float min_x;
+    float min_y;
+    float max_x;
+    float max_y;
+} AegisWall;
+
+typedef struct AegisPredictStats {
+    uint32_t checked; /* acked inputs compared with the server */
+    uint32_t exact;   /* of those, to the bit */
+    float max_err;
+    double sum_err;
+} AegisPredictStats;
+
+/* walls: n boxes (NULL when n is 0); not finite or min > max: AEGIS_ERR_ARG.
+ * Called again, starts over. */
+int32_t aegis_client_predict(AegisClient *c, const AegisWall *walls, size_t n);
+/* AEGIS_ERR_NOT_READY until predicting and a snapshot has shown this player. */
+int32_t aegis_client_predicted(AegisClient *c, float *x, float *y);
+int32_t aegis_client_prediction_stats(AegisClient *c, AegisPredictStats *out);
 
 /* ---- Evidence: what the Aegis server measures, over the engine's world ---
  *

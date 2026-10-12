@@ -30,6 +30,28 @@ static void layout(void) {
     OFF(AegisPlayer, id);
     OFF(AegisPlayer, health);
     OFF(AegisPlayer, alive);
+    SIZE(AegisView);
+    OFF(AegisView, at);
+    OFF(AegisView, claim);
+    OFF(AegisView, players);
+    OFF(AegisView, offset);
+    SIZE(AegisPace);
+    OFF(AegisPace, frames);
+    OFF(AegisPace, steady);
+    OFF(AegisPace, held);
+    OFF(AegisPace, jumped);
+    OFF(AegisPace, bridged);
+    OFF(AegisPace, behind);
+    SIZE(AegisWall);
+    OFF(AegisWall, min_x);
+    OFF(AegisWall, min_y);
+    OFF(AegisWall, max_x);
+    OFF(AegisWall, max_y);
+    SIZE(AegisPredictStats);
+    OFF(AegisPredictStats, checked);
+    OFF(AegisPredictStats, exact);
+    OFF(AegisPredictStats, max_err);
+    OFF(AegisPredictStats, sum_err);
     CONST(AEGIS_ABI_VERSION);
     CONST(AEGIS_OK);
     CONST(AEGIS_ERR_NULL);
@@ -44,6 +66,7 @@ static void layout(void) {
     CONST(AEGIS_ERR_BAD_SEAL);
     CONST(AEGIS_ERR_MALFORMED);
     CONST(AEGIS_ERR_BUSY);
+    CONST(AEGIS_ERR_NOT_READY);
     CONST(AEGIS_REASON_ACCURACY);
     CONST(AEGIS_REASON_AIM_EXACT);
     CONST(AEGIS_REASON_ANOMALY_RATE);
@@ -91,6 +114,24 @@ int main(int argc, char **argv) {
     CHECK(aegis_client_player_count(c), 0);
     AegisPlayer p;
     CHECK(aegis_client_player(c, 0, &p), AEGIS_ERR_ARG);
+
+    /* Drawing behind and predicting: nothing to read until switched on and
+     * a snapshot lands; arguments out of range refused. */
+    AegisView v;
+    AegisPace pace;
+    float x, y;
+    CHECK(aegis_client_view(c, 1.0, &v), AEGIS_ERR_NOT_READY);
+    CHECK(aegis_client_input_drawn(c, 1, 0, 1, 0, true, buf, sizeof buf), AEGIS_ERR_NOT_READY);
+    CHECK(aegis_client_pace(c, &pace), AEGIS_ERR_NOT_READY);
+    CHECK(aegis_client_interpolate(c, 2.0), AEGIS_OK);
+    CHECK(aegis_client_view(c, -1.0, &v), AEGIS_ERR_ARG);
+    CHECK(aegis_client_view(c, 1.0, &v), AEGIS_ERR_NOT_READY);
+    CHECK(aegis_client_pace(c, &pace), AEGIS_OK);
+    CHECK((int32_t)pace.frames, 0);
+    const AegisWall walls[] = {{-1, -1, 1, 1}, {3, 3, 2, 4}};
+    CHECK(aegis_client_predict(c, walls, 2), AEGIS_ERR_ARG);
+    CHECK(aegis_client_predict(c, walls, 1), AEGIS_OK);
+    CHECK(aegis_client_predicted(c, &x, &y), AEGIS_ERR_NOT_READY);
 
     AegisReceived rx;
     const uint8_t garbage[] = {0xff, 0xff, 0xff, 0xff, 1, 2, 3};

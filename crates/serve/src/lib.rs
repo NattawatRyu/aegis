@@ -92,6 +92,11 @@ impl Game {
     /// Bind, start the relay (unless `direct`) and the bots. Players join
     /// from the first [`Game::tick`] on.
     pub fn start(cfg: &Config) -> io::Result<Self> {
+        // Bots send from 127.0.0.x: an IPv6 listener they could never reach
+        // would leave them silently out of the game.
+        if cfg.listen.is_ipv6() && !cfg.bots.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "bots need an IPv4 listen address"));
+        }
         let server = Server::with_walls(spawns(), &ARENA_WALLS);
         let edge = EdgeKey::random();
         let (net, relay, relay_static) = if cfg.direct {
@@ -106,7 +111,7 @@ impl Game {
             relay.enable_noise(me.clone(), SESSION_TTL_SECS);
             (net, Some(relay), Some(me))
         };
-        let to = relay.as_ref().map_or(net.local_addr()?, Relay::public_addr);
+        let to = local(relay.as_ref().map_or(net.local_addr()?, Relay::public_addr));
         let mut game = Self {
             net,
             relay,
@@ -201,6 +206,16 @@ impl Game {
 
     pub fn server(&self) -> &Server {
         self.net.server()
+    }
+}
+
+/// Where this machine's own sockets reach `addr`: listening on every
+/// interface (0.0.0.0) is reached at loopback — Windows refuses to send to
+/// the unspecified address.
+fn local(addr: SocketAddr) -> SocketAddr {
+    match addr.ip() {
+        ip if ip.is_unspecified() => SocketAddr::new(Ipv4Addr::LOCALHOST.into(), addr.port()),
+        _ => addr,
     }
 }
 

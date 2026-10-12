@@ -44,6 +44,32 @@ fn it_prints_the_key_writes_it_out_and_tallies_every_bot() {
     }
 }
 
+/// Listening on every interface — how a server open to the network runs —
+/// its own bots still find it: they are told a loopback address, not the
+/// unspecified one, which Windows refuses to send to.
+#[test]
+fn bots_join_a_server_listening_on_every_interface() {
+    for direct in [false, true] {
+        let mut args = vec!["--listen", "0.0.0.0:0", "--ticks", "30", "--bots", "honest"];
+        if direct {
+            args.push("--direct");
+        }
+        let out = serve(&args);
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert!(out.status.success(), "{stdout}");
+        assert!(stdout.lines().any(|l| l.contains("honest")), "direct {direct}: the bot never joined\n{stdout}");
+    }
+}
+
+/// Bots send over IPv4: given an IPv6 address to listen on and bots to
+/// field, it refuses to start rather than run with none of them in it.
+#[test]
+fn bots_on_an_ipv6_listener_are_refused_not_dropped() {
+    let out = serve(&["--listen", "[::1]:0", "--ticks", "1", "--bots", "honest"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("IPv4"), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
 #[test]
 fn direct_says_it_is_unsealed() {
     let out = serve(&["--listen", "127.0.0.1:0", "--ticks", "30", "--bots", "honest", "--direct"]);

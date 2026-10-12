@@ -6,8 +6,26 @@ Open-source toolkit that helps game developers build multiplayer games that
 resist **cheating** and **DDoS** from day one — by fixing the *architecture*,
 not by chasing individual cheats.
 
-> Status: **pre-alpha.** Step 1 (Lab / Testbed) and Step 2 (detector v0,
-> offline rules) done; Step 3 (pillar D) in progress — the server runs over
+> Status: **pre-alpha — usable to try, not to ship.** All four pillars have
+> working code, the numbers below come from tests and measurements in this
+> repository, and CI runs them on
+> Linux, Windows and in a real Godot game. It has **not** run on a real
+> network with real players yet: read [Known limits](#known-limits) first.
+>
+> - **Pillar D (network):** an authoritative server behind a relay that
+>   hides its address, sealed traffic, stateless edge filtering, join
+>   cookies. Details below.
+> - **Pillar C (detection):** an online detector that flags players for
+>   human review: aim, reaction, accuracy against range, foresight.
+> - **Pillar B (netcode):** client prediction that matches the server
+>   bit-exactly, interpolation, and inputs that claim the frame they were
+>   chosen on.
+> - **Pillar A (lab):** a bot for every cheat class, run against the real
+>   guards, in-process, over UDP and through the relay.
+> - **Engines:** a C ABI and a C# binding, with a Godot demo.
+> - **Run it:** `aegis-serve` is a live server a client can join today.
+>
+> How pillar D was built, step by step — the server runs over
 > real UDP; every client datagram carries a session token checked before
 > decode, so a forged source address can neither act as a player nor spend
 > its rate budget. Sessions are capped per IP and end after 5 s idle, so one
@@ -142,7 +160,8 @@ joins and plays (`NoiseHandshake` + `AegisClient` from C#, `aegis_noise_*` +
 `aegis_client_*` from C). Every alert is printed as it is raised; `--log
 records.jsonl` keeps the telemetry, `--ticks N` stops and prints each
 player's tally. On a laptop the aimbot is flagged within 3 s, the honest
-bots never.
+bots never. It listens on loopback by default; `--listen 0.0.0.0:7777`
+takes players from the network (read [Known limits](#known-limits) first).
 
 Run the lab:
 
@@ -163,6 +182,46 @@ at the edge):
 cmp scenarios/out/standard.jsonl scenarios/out/standard.udp.jsonl
 cmp scenarios/out/standard.jsonl scenarios/out/standard.relay.jsonl
 ```
+
+## Known limits
+
+What is measured, it is measured on loopback and on bots. What has not been
+measured is listed here so nobody finds it the hard way. If you run Aegis
+on a real network, a `--log` jsonl or an issue about what you saw is the
+most useful contribution there is.
+
+- **Never run on a real network.** Jitter and loss have been simulated
+  in-process only. Untested: real paths, NATs, Wi-Fi, mobile networks.
+- **A NAT that changes a client's port mid-game drops it.** The session
+  token is bound to the client's address, so the relay drops everything from
+  the new port. The client gets no more snapshots and must join again;
+  `Connection` and `aegis_client_*` do not rejoin by themselves.
+- **At most 4 players behind one IP** (`MAX_PER_IP`). A café, a dorm or a
+  carrier-grade NAT can have more.
+- **Large snapshots exceed a typical MTU.** A datagram may be up to 2048
+  bytes (`MAX_DATAGRAM`). With very many players in sight a snapshot passes
+  1472 bytes and relies on IP fragmentation, which some networks drop.
+- **Detector lines are set from bots, not people.** Honest bots are never
+  flagged (1008 measured), but a strong human is not a bot: in the Godot
+  demo a fast honest "pro" bot was flagged by `far_aim` in 2 of 48 runs.
+  **Flags are evidence for a human reviewer. Do not ban on them
+  automatically.** A game can set every line itself (`Config`).
+- **`aegis-serve` runs the relay and the origin on one machine.** The
+  origin only listens on loopback, but a flood aimed at the relay's address
+  lands on the origin's machine all the same. To shield the origin, the
+  relay must run on another host (`aegis_relay::Relay` +
+  `NetServer::behind_relay`), and `aegis-serve` cannot split them yet. The
+  relay's Noise key is new on every start, so clients must read it again
+  after a restart.
+- **`--direct` is plaintext**: for debugging on your own machine only.
+- **macOS:** only 127.0.0.1 can be bound on loopback, so the harness and
+  `aegis-serve`'s bots (one loopback IP each) do not run there.
+- **No stable versions.** Every crate is 0.0.0 and not on crates.io; the
+  wire protocol and the C ABI (`AEGIS_ABI_VERSION`, now 3) change when they
+  need to.
+
+Security issues: see [SECURITY.md](SECURITY.md). Please do not open a
+public issue for them.
 
 ## License
 

@@ -98,6 +98,9 @@ fn main() -> io::Result<()> {
         let flags = if t.flags.is_empty() { "-".to_string() } else { t.flags.join(",") };
         println!("{id:<7} {who:<10} {:>8} {:>8} {:>5} {:>5}  {flags}", t.accepted, t.rejected, t.shots, t.hits);
     }
+    for (kind, _) in game.bots().filter(|(_, id)| id.is_none()) {
+        eprintln!("aegis-serve: a {} bot never joined", name(kind));
+    }
     Ok(())
 }
 

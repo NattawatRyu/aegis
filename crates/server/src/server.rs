@@ -554,6 +554,11 @@ impl Server {
         &self.tel
     }
 
+    /// The records written since the last drain ([`Telemetry::drain`]).
+    pub fn drain_telemetry(&mut self) -> Vec<aegis_telemetry::Record> {
+        self.tel.drain()
+    }
+
     pub fn net_stats(&self) -> &NetStats {
         &self.net
     }

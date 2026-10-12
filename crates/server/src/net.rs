@@ -264,6 +264,11 @@ impl NetServer {
         &self.server
     }
 
+    /// The records written since the last drain ([`Server::drain_telemetry`]).
+    pub fn drain_telemetry(&mut self) -> Vec<aegis_telemetry::Record> {
+        self.server.drain_telemetry()
+    }
+
     pub fn into_server(self) -> Server {
         self.server
     }

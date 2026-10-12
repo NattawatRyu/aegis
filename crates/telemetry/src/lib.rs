@@ -107,6 +107,12 @@ impl Telemetry {
         &self.records
     }
 
+    /// Hand over every record so far and keep none: a server that runs for
+    /// hours streams its records out instead of holding them all.
+    pub fn drain(&mut self) -> Vec<Record> {
+        std::mem::take(&mut self.records)
+    }
+
     pub fn len(&self) -> usize {
         self.records.len()
     }
@@ -178,6 +184,18 @@ mod tests {
         t.shot(3, 1, false, 0.1, None, 0.05);
         t.shot(3, 2, true, 0.0, None, 0.05);
         t
+    }
+
+    /// A drain hands over everything in order and keeps nothing; the next
+    /// drain holds only what came after.
+    #[test]
+    fn drain_hands_over_everything_once() {
+        let mut t = sample();
+        let all = t.records().to_vec();
+        assert_eq!(t.drain(), all);
+        assert!(t.is_empty() && t.drain().is_empty());
+        t.left(4, 1);
+        assert_eq!(t.drain(), vec![Record { tick: 4, player: 1, outcome: Outcome::Left }]);
     }
 
     #[test]

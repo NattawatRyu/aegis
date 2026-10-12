@@ -73,6 +73,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "aegis-serve"
+version = "0.0.0"
+dependencies = [
+ "aegis-client-sdk",
+ "aegis-detector",
+ "aegis-protocol",
+ "aegis-relay",
+ "aegis-server",
+ "aegis-telemetry",
+ "serde_json",
+]
+
+[[package]]
 name = "aegis-server"
 version = "0.0.0"
 dependencies = [

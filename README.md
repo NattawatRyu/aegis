@@ -92,6 +92,8 @@ crates/
   ffi/          C ABI (include/aegis.h): the detector, the client, and the
                 evidence over an engine's own world; C examples in examples/
   harness/      runs every bot against the real guards + sim, reports per bot
+  serve/        aegis-serve: a live game at 30 Hz behind a Noise relay, the
+                detector watching, bots to play against
 bindings/
   csharp/       C# over the C ABI (Unity, Godot, Stride, .NET); Aegis.Check
                 is run by aegis-ffi's tests
@@ -127,6 +129,20 @@ over a Noise NK handshake, answered with a Diffie-Hellman only after a
 cookie round trip. A C client does the handshake with `aegis_noise_*`
 (aegis-ffi built with feature `noise`) and hands the keys it gets to
 `aegis_client_*` like a backend's.
+
+Run a live game a client can join:
+
+```
+cargo run --release -p aegis-serve -- --bots honest:3,aimbot --key-out relay.key
+```
+
+It prints the relay's address and public key and writes the key to
+`relay.key`. A client that knows only those two runs the Noise handshake,
+joins and plays (`NoiseHandshake` + `AegisClient` from C#, `aegis_noise_*` +
+`aegis_client_*` from C). Every alert is printed as it is raised; `--log
+records.jsonl` keeps the telemetry, `--ticks N` stops and prints each
+player's tally. On a laptop the aimbot is flagged within 3 s, the honest
+bots never.
 
 Run the lab:
 

@@ -665,6 +665,23 @@ mod tests {
         assert_eq!(shoot(&mut r, 4, 255, 1), Some(0), "old streak carried to the new 255");
     }
 
+    /// Edge: an id that joins dead (a game that admits into a corpse) sees
+    /// no one and is seen by no one, though it stands in plain sight.
+    #[test]
+    fn a_dead_joiner_sees_and_is_seen_by_no_one() {
+        let mut sim = Sim::new();
+        sim.spawn(1, Vec2::ZERO);
+        sim.spawn(2, Vec2::new(10.0, 0.0));
+        let mut r = Reaction::default();
+        begin(&mut r, &sim, 1);
+        kill(&mut sim, 1, Vec2::new(1.0, 0.0));
+        assert!(!sim.player(2).unwrap().alive);
+        let v = Visibility::compute(&sim);
+        r.joined(1, &sim, &v, 2);
+        assert_eq!(r.row_of(2), [0; WORDS], "a dead joiner sees");
+        assert!(!has(&r.row_of(1), 2), "a dead joiner is seen");
+    }
+
     impl Reaction {
         fn row_of(&self, s: PlayerId) -> Row {
             self.seen[s as usize]

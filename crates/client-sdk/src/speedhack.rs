@@ -13,9 +13,6 @@ impl SpeedhackBot {
     pub fn new() -> Self {
         Self { seq: 0, mult: 10.0 }
     }
-    pub fn with_mult(mult: f32) -> Self {
-        Self { seq: 0, mult }
-    }
 }
 
 impl Default for SpeedhackBot {

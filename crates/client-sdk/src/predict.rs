@@ -200,4 +200,36 @@ mod tests {
         p.snapshot(5, 4, me(99.0, true));
         assert_eq!(p.position(), Some(Vec2::new(7.0, 20.0)), "overtaken: ignored");
     }
+
+    /// At MAX_PENDING unacked inputs every one is still folded; one more and
+    /// the oldest is gone, from the replay and from the score.
+    #[test]
+    fn past_max_pending_the_oldest_input_is_dropped() {
+        // East, west, east, ... — the arena's bounds never touched; any input
+        // lost shows as a step out of place.
+        let mut p = Predictor::new(&[]);
+        p.snapshot(1, 0, me(0.0, true));
+        let n = MAX_PENDING as u32;
+        for seq in 1..=n {
+            p.input(seq, Vec2::new(if seq % 2 == 1 { 1.0 } else { -1.0 }, 0.0), EAST);
+        }
+        assert_eq!(p.position(), Some(Vec2::new(0.0, 20.0)), "at the cap: all folded");
+        p.input(n + 1, Vec2::new(0.0, 0.0), EAST);
+        assert_eq!(p.position(), Some(Vec2::new(-MOVE_SPEED, 20.0)), "past it: input 1 (east) dropped");
+        p.snapshot(2, 1, me(MOVE_SPEED, true));
+        assert_eq!(p.stats().checked, 0, "input 1's prediction was dropped too");
+        p.snapshot(3, 2, me(0.0, true));
+        assert_eq!((p.stats().checked, p.stats().exact), (1, 1));
+    }
+
+    /// Pooled scores: counts add, the worst error is the worse one, the
+    /// mean is over every check; no checks is a mean of 0, not NaN.
+    #[test]
+    fn scores_pool_and_average() {
+        assert_eq!(PredictStats::default().mean_err(), 0.0);
+        let mut a = PredictStats { checked: 2, exact: 1, max_err: 1.0, sum_err: 1.0 };
+        a.add(&PredictStats { checked: 2, exact: 2, max_err: 0.5, sum_err: 1.0 });
+        assert_eq!(a, PredictStats { checked: 4, exact: 3, max_err: 1.0, sum_err: 2.0 });
+        assert_eq!(a.mean_err(), 0.5);
+    }
 }

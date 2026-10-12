@@ -37,7 +37,7 @@
 //!
 //! `aegis-harness cull [lobbies] [max_lag]` replays honest lobbies and prints,
 //! per culling margin, what it leaks and how late a lagging client sees an
-//! enemy — the measurement `MAX_MARGIN_TICKS` is set from.
+//! enemy — the measurement behind the server sending margin 0.
 //! `aegis-harness cull-scale [lobbies]` asks what that leak would be in a
 //! world where players move less per tick.
 //!

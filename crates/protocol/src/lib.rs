@@ -899,15 +899,24 @@ mod tests {
     /// (random) all fail.
     #[test]
     fn token_is_valid_only_for_its_address_and_key() {
-        let a: SocketAddr = "10.0.0.7:4000".parse().unwrap();
-        for nonce in [0, 1, 0xDEAD_BEEF, u32::MAX] {
-            let t = mint_token(&KEY, a, nonce);
-            assert!(token_valid(&KEY, a, t));
-            assert!(!token_valid(&KEY, "10.0.0.7:4001".parse().unwrap(), t));
-            assert!(!token_valid(&KEY, "10.0.0.8:4000".parse().unwrap(), t));
-            assert!(!token_valid(&other_key(), a, t));
-            for bit in 0..64 {
-                assert!(!token_valid(&KEY, a, t ^ (1 << bit)), "nonce {nonce:#x}, bit {bit} flipped still valid");
+        // v4, v6, and v6 written as the mapped v4 — a different address.
+        let cases = [
+            ("10.0.0.7:4000", "10.0.0.7:4001", "10.0.0.8:4000"),
+            ("[2001:db8::7]:4000", "[2001:db8::7]:4001", "[2001:db8::8]:4000"),
+            ("[::ffff:10.0.0.7]:4000", "10.0.0.7:4000", "[::ffff:10.0.0.8]:4000"),
+        ];
+        for (a, port, ip) in cases {
+            let (a, port, ip): (SocketAddr, SocketAddr, SocketAddr) =
+                (a.parse().unwrap(), port.parse().unwrap(), ip.parse().unwrap());
+            for nonce in [0, 1, 0xDEAD_BEEF, u32::MAX] {
+                let t = mint_token(&KEY, a, nonce);
+                assert!(token_valid(&KEY, a, t));
+                assert!(!token_valid(&KEY, port, t), "{a} vs {port}");
+                assert!(!token_valid(&KEY, ip, t), "{a} vs {ip}");
+                assert!(!token_valid(&other_key(), a, t));
+                for bit in 0..64 {
+                    assert!(!token_valid(&KEY, a, t ^ (1 << bit)), "nonce {nonce:#x}, bit {bit} flipped still valid");
+                }
             }
         }
     }
@@ -916,14 +925,22 @@ mod tests {
     /// token MAC of the same inputs (domain separation).
     #[test]
     fn edge_cookie_is_bound_to_address_bucket_and_key() {
-        let a: SocketAddr = "10.0.0.7:4000".parse().unwrap();
-        let c = edge_cookie(&KEY, a, 5);
-        assert_eq!(c, edge_cookie(&KEY, a, 5));
-        assert_ne!(c, edge_cookie(&KEY, "10.0.0.7:4001".parse().unwrap(), 5));
-        assert_ne!(c, edge_cookie(&KEY, "10.0.0.8:4000".parse().unwrap(), 5));
-        assert_ne!(c, edge_cookie(&KEY, a, 6));
-        assert_ne!(c, edge_cookie(&other_key(), a, 5));
-        assert_ne!(c as u32, token_mac(&KEY, a, 5));
+        let cases = [
+            ("10.0.0.7:4000", "10.0.0.7:4001", "10.0.0.8:4000"),
+            ("[2001:db8::7]:4000", "[2001:db8::7]:4001", "[2001:db8::8]:4000"),
+            ("[::ffff:10.0.0.7]:4000", "10.0.0.7:4000", "[::ffff:10.0.0.8]:4000"),
+        ];
+        for (a, port, ip) in cases {
+            let (a, port, ip): (SocketAddr, SocketAddr, SocketAddr) =
+                (a.parse().unwrap(), port.parse().unwrap(), ip.parse().unwrap());
+            let c = edge_cookie(&KEY, a, 5);
+            assert_eq!(c, edge_cookie(&KEY, a, 5));
+            assert_ne!(c, edge_cookie(&KEY, port, 5), "{a} vs {port}");
+            assert_ne!(c, edge_cookie(&KEY, ip, 5), "{a} vs {ip}");
+            assert_ne!(c, edge_cookie(&KEY, a, 6));
+            assert_ne!(c, edge_cookie(&other_key(), a, 5));
+            assert_ne!(c as u32, token_mac(&KEY, a, 5));
+        }
     }
 
     /// The subkeys are independent of each other and of the secret: a
@@ -1029,6 +1046,9 @@ mod tests {
         let down = seal_down(&EDGE, &keys.sid, b"");
         assert_eq!(open_down(&keys, &mut down[..EDGE_DOWN_MAX - 1].to_vec()), Err(EdgeError::Short));
         assert_eq!(open_down(&keys, &mut down.clone()), Ok(&[][..]));
+        // The shared opener holds the same edge on its own, whoever calls it.
+        assert_eq!(open_with(&keys.down, &keys.sid.0, &mut down[..NONCE_LEN + TAG_LEN - 1].to_vec()), None);
+        assert_eq!(open_with(&keys.down, &keys.sid.0, &mut down.clone()), Some(&[][..]));
     }
 
     /// What an on-path observer of the client's leg sees: the sid, and

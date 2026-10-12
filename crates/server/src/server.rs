@@ -44,7 +44,7 @@ use crate::guards::tick_proof::TickProof;
 use crate::guards::{input_rate, ip_sessions, joined, packet, version};
 use crate::history::Glimpse;
 use crate::inbox::Inbox;
-use crate::{ClientInput, GuardCtx, GuardVerdict, Pipeline, RejectReason, Sim, Visibility, Wall};
+use crate::{ClientInput, GuardCtx, GuardVerdict, Pipeline, RejectReason, Sim, Wall};
 
 /// [`NetStats`] label for a legal join refused because all 255 ids are taken.
 pub const SERVER_FULL: &str = "server_full";
@@ -268,11 +268,6 @@ impl Server {
     /// ([`crate::guards::tick_proof`]).
     pub fn tick_proof(&self, id: PlayerId, tick: u32) -> u32 {
         self.proofs.issue(id, self.tokens[id as usize], tick)
-    }
-
-    /// The tick's line of sight, for whoever else reads it.
-    pub fn visibility(&self) -> &Visibility {
-        self.ev.visibility()
     }
 
     /// Receive one datagram (a token-framed `ClientMsg`) from `from`. An input
@@ -888,6 +883,26 @@ mod tests {
         let other = hs(&mut s, 0, addr(9)).unwrap();
         assert_ne!(other.token, t1);
         assert_eq!(other.player_id, 3);
+    }
+
+    /// A joined player's repeated Join, under its token: the right version is
+    /// answered with the same session; a wrong one is refused on its record,
+    /// and the session it already holds is untouched.
+    #[test]
+    fn a_joined_players_join_is_version_checked_too() {
+        let (mut s, t1, _) = joined_pair();
+        let again = |protocol| frame(t1, &ClientMsg::Join { name: "t".into(), protocol, cookie: None });
+        assert_eq!(
+            s.receive(0, addr(1), &again(PROTOCOL_VERSION)),
+            Some(Reply::Joined(Session { player_id: 1, token: t1 }))
+        );
+        assert!(s.telemetry().is_empty());
+        assert_eq!(s.receive(0, addr(1), &again(PROTOCOL_VERSION + 1)), None);
+        let bad = RejectReason::BadVersion.label();
+        assert_eq!(s.telemetry().per_player(1).rejected.get(bad), Some(&1));
+        assert_eq!(s.player_id(addr(1)), Some(1), "still in");
+        s.receive(1, addr(1), &walk(&s, t1, 1));
+        assert_eq!(s.end_tick(1).steps, vec![(1, MOVE_SPEED)]);
     }
 
     /// The timeout edge: idle for exactly IDLE_TICKS is still in; one more and

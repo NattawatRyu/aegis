@@ -1129,5 +1129,12 @@ mod tests {
         let mut buf = [0u8; 256];
         assert!(client.recv(&mut buf).is_err(), "a refused hello was answered");
         assert!(origin.recv(&mut buf).is_err(), "a hello crossed to the origin");
+
+        // Every epoch retired: a proven hello has nothing to be minted
+        // under — counted, no handshake, no answer.
+        assert!(r.retire_edge(0) && r.retire_edge(4));
+        send(&hello(&me.public(), Some(cookie)).1);
+        assert_eq!(settle(&r, |s| s.retired == 2).welcomed, 1);
+        assert!(client.recv(&mut buf).is_err(), "welcomed with no edge key");
     }
 }

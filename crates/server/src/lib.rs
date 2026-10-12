@@ -11,7 +11,6 @@
 //! without owning a socket; [`net`] puts it behind a UDP socket. The
 //! in-process harness and the UDP loop drive the exact same code.
 
-pub mod cull;
 pub mod evidence;
 pub mod guards;
 pub mod history;
@@ -23,7 +22,6 @@ pub mod sim;
 pub mod visibility;
 pub mod world;
 
-pub use cull::{Cull, MAX_MARGIN_TICKS};
 pub use evidence::{Aim, Evidence, ShotEvidence};
 pub use guards::session::Session;
 pub use guards::{ClientInput, GuardCtx, GuardVerdict, Pipeline, RejectReason};

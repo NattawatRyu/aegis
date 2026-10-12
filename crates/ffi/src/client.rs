@@ -696,4 +696,101 @@ mod tests {
         assert!(offsets.iter().any(|&o| o < 0), "some frames sat between snapshots: {offsets:?}");
         aegis_client_free(c);
     }
+
+    /// Every pointer every call takes, null: AEGIS_ERR_NULL, nothing read
+    /// or written, and the client still works after.
+    #[test]
+    fn every_call_refuses_a_null() {
+        let nc: *mut AegisClient = null_mut();
+        let mut out = null_mut();
+        assert_eq!(aegis_client_new(null(), null(), &mut out), AEGIS_ERR_NULL);
+        assert_eq!(aegis_client_new(c"riw".as_ptr(), null(), null_mut()), AEGIS_ERR_NULL);
+        aegis_client_free(nc);
+
+        let (mut rx, mut p, mut v, mut pace, mut st) = (
+            AegisReceived::default(),
+            AegisPlayer::default(),
+            AegisView::default(),
+            AegisPace::default(),
+            AegisPredictStats::default(),
+        );
+        let (mut x, mut y) = (0f32, 0f32);
+        let mut buf = [0u8; AEGIS_SEND_MAX];
+        let (b, n) = (buf.as_mut_ptr(), buf.len());
+        let d = [0u8; 4];
+        let w = AegisWall::default();
+        let null_client = [
+            aegis_client_join(nc, b, n),
+            aegis_client_input(nc, AEGIS_TICK_NEWEST, 0.0, 0.0, 1.0, 0.0, false, b, n),
+            aegis_client_receive(nc, d.as_ptr(), d.len(), &mut rx),
+            aegis_client_player_id(nc),
+            aegis_client_player_count(nc),
+            aegis_client_player(nc, 0, &mut p),
+            aegis_client_interpolate(nc, 1.0),
+            aegis_client_view(nc, 1.0, &mut v),
+            aegis_client_view_player(nc, 0, &mut p),
+            aegis_client_input_drawn(nc, 0.0, 0.0, 1.0, 0.0, false, b, n),
+            aegis_client_pace(nc, &mut pace),
+            aegis_client_predict(nc, &w, 1),
+            aegis_client_predicted(nc, &mut x, &mut y),
+            aegis_client_prediction_stats(nc, &mut st),
+        ];
+        assert_eq!(null_client, [AEGIS_ERR_NULL; 14]);
+
+        let c = client(b"riw\0", None).unwrap();
+        assert_eq!(aegis_client_interpolate(c, 1.0), AEGIS_OK);
+        assert_eq!(aegis_client_predict(c, null(), 0), AEGIS_OK);
+        let null_arg = [
+            aegis_client_join(c, null_mut(), n),
+            aegis_client_input(c, AEGIS_TICK_NEWEST, 0.0, 0.0, 1.0, 0.0, false, null_mut(), n),
+            aegis_client_receive(c, null(), 0, &mut rx),
+            aegis_client_receive(c, d.as_ptr(), d.len(), null_mut()),
+            aegis_client_player(c, 0, null_mut()),
+            aegis_client_view(c, 1.0, null_mut()),
+            aegis_client_view_player(c, 0, null_mut()),
+            aegis_client_input_drawn(c, 0.0, 0.0, 1.0, 0.0, false, null_mut(), n),
+            aegis_client_pace(c, null_mut()),
+            aegis_client_predicted(c, null_mut(), &mut y),
+            aegis_client_predicted(c, &mut x, null_mut()),
+            aegis_client_prediction_stats(c, null_mut()),
+        ];
+        assert_eq!(null_arg, [AEGIS_ERR_NULL; 12]);
+        assert!(aegis_client_join(c, b, n) > 0, "still works");
+        aegis_client_free(c);
+    }
+
+    /// A panic inside a call is a status, and the client stays refused.
+    #[test]
+    fn a_panic_is_a_status_and_poisons_the_client() {
+        let c = client(b"riw\0", None).unwrap();
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let status = with_client(c, |_| panic!("inside"));
+        std::panic::set_hook(hook);
+        assert_eq!(status, AEGIS_ERR_PANIC);
+        let mut buf = [0u8; AEGIS_SEND_MAX];
+        assert_eq!(aegis_client_join(c, buf.as_mut_ptr(), buf.len()), AEGIS_ERR_PANIC);
+        assert_eq!(aegis_client_player_count(c), AEGIS_ERR_PANIC);
+        aegis_client_free(c);
+    }
+
+    /// Every event kind lands in the fields aegis.h names for it, and the
+    /// fields it does not name are 0.
+    #[test]
+    fn every_event_maps_to_its_fields() {
+        let c = client(b"riw\0", None).unwrap();
+        let cases = [
+            (EventKind::Hit { shooter: 4, target: 2, damage: 25 }, (AEGIS_EVENT_HIT, 4, 2, 25)),
+            (EventKind::Death { player: 2, by: 4 }, (AEGIS_EVENT_DEATH, 2, 4, 0)),
+            (EventKind::Join { player: 7 }, (AEGIS_EVENT_JOIN, 7, 0, 0)),
+            (EventKind::Leave { player: 9 }, (AEGIS_EVENT_LEAVE, 9, 0, 0)),
+        ];
+        for (kind, (event, player, other, damage)) in cases {
+            let d = encode(&ServerMsg::Event { tick: 5, kind });
+            let mut rx = AegisReceived::default();
+            assert_eq!(aegis_client_receive(c, d.as_ptr(), d.len(), &mut rx), AEGIS_OK);
+            assert_eq!(rx, AegisReceived { tick: 5, kind: AEGIS_RX_EVENT, event, player, other, damage });
+        }
+        aegis_client_free(c);
+    }
 }

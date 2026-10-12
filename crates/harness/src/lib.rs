@@ -529,13 +529,9 @@ impl Peak {
     }
 }
 
-/// Every player across `crowds` honest crowds (seeds 0..crowds) — the honest
-/// population the thresholds are measured against.
-pub fn honest_sweep(crowds: u32) -> Vec<HonestPlayer> {
-    honest_sweep_at(crowds, 0)
-}
-
-/// The same crowds, every player at round trip `rtt` ticks.
+/// Every player across `crowds` honest crowds (seeds 0..crowds), every one at
+/// round trip `rtt` ticks — the honest population the thresholds are
+/// measured against.
 pub fn honest_sweep_at(crowds: u32, rtt: u32) -> Vec<HonestPlayer> {
     (0..crowds)
         .flat_map(|seed| {
@@ -627,8 +623,16 @@ pub struct CullSweep {
 
 /// Replay `lobbies` honest lobbies (seeds 0..lobbies) and measure, for each
 /// margin 0..=`max_lag` ticks, what culling with it leaks and how late it
-/// shows an enemy to a client `lag` ticks behind. The measurement
-/// [`aegis_server::MAX_MARGIN_TICKS`] is set from.
+/// shows an enemy to a client `lag` ticks behind.
+///
+/// Over 250 honest lobbies in `ARENA_WALLS`: margin 0 leaks 0% of walled
+/// pairs and is late for 6.7% of visible pairs at lag 1 (17.0% at lag 3);
+/// margin 1 leaks 82.6%, margin 2 99.0%, margin 3 100%. At `MOVE_SPEED` 5 a
+/// tick both sides walk round any wall inside one tick, so the leak depends
+/// on reach (step x margin) alone ([`leak_by_step`]). DECIDED 2026-10-03: the
+/// server sends margin 0 ([`aegis_server::Sim::view`]): ESP gets nothing,
+/// honest players eat the pop-in. A game whose scale makes a margin cheap
+/// measures its own map with `cull-scale`.
 pub fn cull_sweep(lobbies: u32, max_lag: u32) -> CullSweep {
     let m = max_lag as usize;
     let mut s = CullSweep { visible: 0, walled: 0, leaked: vec![0; m + 1], late: vec![vec![0; m + 1]; m + 1] };
@@ -2152,7 +2156,7 @@ mod tests {
     /// as one would in a real game, where it gets no verdict either.
     #[test]
     fn honest_population_is_never_flagged() {
-        let players = honest_sweep(63);
+        let players = honest_sweep_at(63, 0);
         assert_eq!(players.len(), 1008);
         let suite = Suite::standard();
         for p in &players {

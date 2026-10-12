@@ -33,9 +33,9 @@ fn until(c: *mut AegisClient, sock: &UdpSocket, kind: u8) -> AegisReceived {
     }
 }
 
-/// An origin behind a lockstep relay under `edge`.
-fn origin_behind_relay(edge: EdgeKey) -> (NetServer, Relay) {
-    let mut net = NetServer::bind((Ipv4Addr::LOCALHOST, 0), Server::new(vec![Vec2::ZERO])).unwrap();
+/// An origin with `walls` behind a lockstep relay under `edge`.
+fn origin_behind_relay(edge: EdgeKey, walls: &[Wall]) -> (NetServer, Relay) {
+    let mut net = NetServer::bind((Ipv4Addr::LOCALHOST, 0), Server::with_walls(vec![Vec2::ZERO], walls)).unwrap();
     let link = LinkKey::random();
     let relay = Relay::spawn_with(
         (Ipv4Addr::LOCALHOST, 0),
@@ -57,24 +57,43 @@ fn relay_socket(relay: &Relay) -> UdpSocket {
     sock
 }
 
-/// A C client with `keys`, on `sock`: joins, plays TICKS ticks, and every
-/// input is accepted.
-fn joins_and_every_input_is_accepted(net: &mut NetServer, relay: &Relay, sock: &UdpSocket, keys: &[u8]) {
-    let mut c = null_mut();
-    assert_eq!(aegis_client_new(c"riw".as_ptr(), keys.as_ptr(), &mut c), AEGIS_OK);
+/// Client `c` on `sock` joins: challenged at the edge, comes back with the
+/// cookie, the Join crosses, it is admitted. Its player id.
+fn join(c: *mut AegisClient, net: &mut NetServer, sock: &UdpSocket) -> u8 {
     let mut buf = [0u8; AEGIS_SEND_MAX];
-    let mut send_join = |c| {
+    let mut send_join = || {
         let n = aegis_client_join(c, buf.as_mut_ptr(), buf.len());
         assert!(n > 0);
         sock.send(&buf[..n as usize]).unwrap();
     };
-
-    send_join(c);
+    send_join();
     until(c, sock, AEGIS_RX_CHALLENGE);
-    send_join(c);
+    send_join();
     assert!(net.recv_one(WAIT).unwrap(), "the answered Join crossed");
     let joined = until(c, sock, AEGIS_RX_JOINED);
     assert_eq!(aegis_client_player_id(c), i32::from(joined.player));
+    joined.player
+}
+
+/// Every one of `player`'s `ticks` inputs was accepted, none rejected.
+fn every_input_accepted(net: &NetServer, player: u8, ticks: u32) {
+    let records = net.server().telemetry().records();
+    let mine = |o: fn(&Outcome) -> bool| records.iter().filter(|r| r.player == player && o(&r.outcome)).count();
+    assert_eq!(mine(|o| matches!(o, Outcome::Accepted { .. })), ticks as usize);
+    assert_eq!(mine(|o| matches!(o, Outcome::Rejected { .. })), 0, "{records:?}");
+}
+
+fn client(keys: &[u8]) -> *mut AegisClient {
+    let mut c = null_mut();
+    assert_eq!(aegis_client_new(c"riw".as_ptr(), keys.as_ptr(), &mut c), AEGIS_OK);
+    c
+}
+
+/// A C client with `keys`, on `sock`: joins, plays TICKS ticks, and every
+/// input is accepted.
+fn joins_and_every_input_is_accepted(net: &mut NetServer, relay: &Relay, sock: &UdpSocket, keys: &[u8]) {
+    let c = client(keys);
+    let player = join(c, net, sock);
 
     const TICKS: u32 = 6;
     for _ in 0..TICKS {
@@ -91,10 +110,7 @@ fn joins_and_every_input_is_accepted(net: &mut NetServer, relay: &Relay, sock: &
         net.end_tick();
     }
 
-    let records = net.server().telemetry().records();
-    let mine = |o: fn(&Outcome) -> bool| records.iter().filter(|r| r.player == joined.player && o(&r.outcome)).count();
-    assert_eq!(mine(|o| matches!(o, Outcome::Accepted { .. })), TICKS as usize);
-    assert_eq!(mine(|o| matches!(o, Outcome::Rejected { .. })), 0, "{records:?}");
+    every_input_accepted(net, player, TICKS);
     let mut me = AegisPlayer::default();
     assert_eq!(aegis_client_player(c, 0, &mut me), AEGIS_OK);
     assert!(me.alive != 0 && me.x > 0.0, "it walked: {me:?}");
@@ -104,7 +120,7 @@ fn joins_and_every_input_is_accepted(net: &mut NetServer, relay: &Relay, sock: &
 #[test]
 fn a_c_client_joins_through_a_relay_and_every_input_is_accepted() {
     let edge = EdgeKey::random();
-    let (mut net, relay) = origin_behind_relay(edge);
+    let (mut net, relay) = origin_behind_relay(edge, &[]);
     // The backend's part, over HTTPS in a real deployment.
     let keys = mint_connect(&edge, u64::MAX).to_bytes();
     joins_and_every_input_is_accepted(&mut net, &relay, &relay_socket(&relay), &keys);
@@ -119,36 +135,13 @@ fn a_c_client_joins_through_a_relay_and_every_input_is_accepted() {
 fn an_interpolating_c_client_claims_what_it_draws_and_predicts_exactly() {
     let edge = EdgeKey::random();
     let wall = Wall::new(Vec2::new(20.0, -5.0), Vec2::new(22.0, 5.0));
-    let mut net = NetServer::bind((Ipv4Addr::LOCALHOST, 0), Server::with_walls(vec![Vec2::ZERO], &[wall])).unwrap();
-    let link = LinkKey::random();
-    let relay = Relay::spawn_with(
-        (Ipv4Addr::LOCALHOST, 0),
-        (Ipv4Addr::LOCALHOST, 0),
-        net.local_addr().unwrap(),
-        link,
-        edge,
-        Clock::lockstep(),
-    )
-    .unwrap();
-    net.behind_relay(relay.upstream_addr(), link);
+    let (mut net, relay) = origin_behind_relay(edge, &[wall]);
     let sock = relay_socket(&relay);
-    let keys = mint_connect(&edge, u64::MAX).to_bytes();
-
-    let mut c = null_mut();
-    assert_eq!(aegis_client_new(c"riw".as_ptr(), keys.as_ptr(), &mut c), AEGIS_OK);
+    let c = client(&mint_connect(&edge, u64::MAX).to_bytes());
     assert_eq!(aegis_client_interpolate(c, 1.0), AEGIS_OK);
     let w = AegisWall { min_x: wall.min.x, min_y: wall.min.y, max_x: wall.max.x, max_y: wall.max.y };
     assert_eq!(aegis_client_predict(c, &w, 1), AEGIS_OK);
-    let mut buf = [0u8; AEGIS_SEND_MAX];
-    let mut send_join = |c| {
-        let n = aegis_client_join(c, buf.as_mut_ptr(), buf.len());
-        sock.send(&buf[..n as usize]).unwrap();
-    };
-    send_join(c);
-    until(c, &sock, AEGIS_RX_CHALLENGE);
-    send_join(c);
-    assert!(net.recv_one(WAIT).unwrap());
-    let joined = until(c, &sock, AEGIS_RX_JOINED);
+    let player = join(c, &mut net, &sock);
 
     // Walking east at 5 a tick, it reaches the wall at x 20 by tick 4.
     const TICKS: u32 = 12;
@@ -170,10 +163,7 @@ fn an_interpolating_c_client_claims_what_it_draws_and_predicts_exactly() {
         net.end_tick();
     }
 
-    let records = net.server().telemetry().records();
-    let mine = |o: fn(&Outcome) -> bool| records.iter().filter(|r| r.player == joined.player && o(&r.outcome)).count();
-    assert_eq!(mine(|o| matches!(o, Outcome::Accepted { .. })), TICKS as usize);
-    assert_eq!(mine(|o| matches!(o, Outcome::Rejected { .. })), 0, "{records:?}");
+    every_input_accepted(&net, player, TICKS);
     assert!(offsets.iter().any(|&o| o < 0), "some frames sat between snapshots: {offsets:?}");
 
     let mut st = AegisPredictStats::default();
@@ -197,7 +187,7 @@ fn a_c_client_with_keys_from_a_noise_relay_joins_and_every_input_is_accepted() {
     use aegis_ffi::noise::*;
     use aegis_protocol::noise::RelayStatic;
 
-    let (mut net, relay) = origin_behind_relay(EdgeKey::with_epoch([1; 32], 1));
+    let (mut net, relay) = origin_behind_relay(EdgeKey::with_epoch([1; 32], 1), &[]);
     relay.add_edge(EdgeKey::with_epoch([6; 32], 6));
     let me = RelayStatic::generate();
     relay.enable_noise(me.clone(), 60);

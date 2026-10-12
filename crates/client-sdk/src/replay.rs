@@ -13,9 +13,6 @@ impl ReplayBot {
     pub fn new() -> Self {
         Self { fixed_seq: 1 }
     }
-    pub fn with_seq(fixed_seq: u32) -> Self {
-        Self { fixed_seq }
-    }
 }
 
 impl Default for ReplayBot {

@@ -107,6 +107,20 @@ mod tests {
         assert_eq!(j.verify(SocketAddr::from(([10, 0, 0, 2], 1)), 0, c), Err(RejectReason::BadCookie));
     }
 
+    /// The same binding over IPv6, and the v4-mapped form of an address is a
+    /// different address from the v4 one.
+    #[test]
+    fn bound_to_its_address_over_ipv6_too() {
+        let j = jar();
+        let v6: SocketAddr = "[2001:db8::1]:1".parse().unwrap();
+        let c = j.issue(v6, 0);
+        assert_eq!(j.verify(v6, 0, c), Ok(()));
+        assert_eq!(j.verify("[2001:db8::1]:2".parse().unwrap(), 0, c), Err(RejectReason::BadCookie));
+        assert_eq!(j.verify("[2001:db8::2]:1".parse().unwrap(), 0, c), Err(RejectReason::BadCookie));
+        let mapped: SocketAddr = "[::ffff:10.0.0.1]:1".parse().unwrap();
+        assert_eq!(j.verify(mapped, 0, j.issue(a(1), 0)), Err(RejectReason::BadCookie));
+    }
+
     #[test]
     fn any_flipped_bit_is_refused() {
         let j = jar();

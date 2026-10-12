@@ -36,7 +36,7 @@ mod tests {
     use aegis_protocol::Vec2;
 
     fn with_move(move_dir: Vec2) -> ClientInput {
-        ClientInput { seq: 1, tick: 1, move_dir, aim: Vec2::new(1.0, 0.0), shoot: false }
+        ClientInput { seq: 1, tick: 1, offset: 0, move_dir, aim: Vec2::new(1.0, 0.0), shoot: false }
     }
 
     #[test]

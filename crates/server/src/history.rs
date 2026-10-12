@@ -134,13 +134,36 @@ impl History {
     /// The third value is how big that enemy looked: its
     /// [`angular_radius`] at the point-blank radius.
     pub fn aim_evidence(&self, seen: u32, shooter: PlayerId, aim: Vec2) -> Option<(f32, PlayerId, f32)> {
+        self.aim_evidence_at(seen, 0.0, shooter, aim)
+    }
+
+    /// The picture a client drew `drawn` ticks before snapshot `seen` (v6
+    /// `offset`, 0 down to -[`MAX_BACK`]): who it showed and who was alive
+    /// are `seen`'s; each player is placed where it stood at that moment,
+    /// blended between the two ticks around it when alive on both. Never
+    /// after `seen` — no picture newer than the one proven. Clamped, 0 if
+    /// not a number; `seen`'s own position for a player not alive on the
+    /// ticks around the moment, or when they are no longer kept. `None` if
+    /// `seen` is gone.
+    fn picture(&self, seen: u32, drawn: f32) -> Option<Picture<'_>> {
         let f = self.frame(seen)?;
+        let back = if drawn.is_finite() { (-drawn).clamp(0.0, MAX_BACK) } else { 0.0 };
+        let whole = back.floor();
+        let at = |n: f32| seen.checked_sub(n as u32).and_then(|t| self.frame(t));
+        Some(Picture { f, hi: at(whole), lo: at(whole + 1.0), k: back - whole })
+    }
+
+    /// [`History::aim_evidence`] in the picture drawn `drawn` ticks before
+    /// `seen` — what a client that blends between snapshots aimed in.
+    pub fn aim_evidence_at(&self, seen: u32, drawn: f32, shooter: PlayerId, aim: Vec2) -> Option<(f32, PlayerId, f32)> {
+        let pic = self.picture(seen, drawn)?;
+        let f = pic.f;
         if !f.alive[shooter as usize] {
             return None;
         }
-        let me = f.pos[shooter as usize];
+        let me = pic.pos(shooter);
         let row = &f.rows[shooter as usize];
-        let d2 = |e: PlayerId| dist2(me, f.pos[e as usize]);
+        let d2 = |e: PlayerId| dist2(me, pic.pos(e));
         let e = f
             .order
             .iter()
@@ -150,7 +173,7 @@ impl History {
         if d2(e) <= self.point_blank * self.point_blank {
             return None;
         }
-        let to = f.pos[e as usize];
+        let to = pic.pos(e);
         bearing_error(aim, me, to).map(|err| (err, e, angular_radius(self.point_blank, me, to)))
     }
 
@@ -169,14 +192,23 @@ impl History {
     /// `None` too if the claimed frame is gone, the shooter was not alive in
     /// it, or the aim is degenerate.
     pub fn glimpse(&self, seen: u32, now: u32, shooter: PlayerId, aim: Vec2) -> Option<Glimpse> {
-        let f = self.frame(seen)?;
+        self.glimpse_at(seen, 0.0, now, shooter, aim)
+    }
+
+    /// [`History::glimpse`] with the claimed picture drawn `drawn` ticks
+    /// before `seen` ([`History::aim_evidence_at`]). Who counts as newly shown
+    /// — and where — is unchanged: blending moves only the players `seen`
+    /// showed.
+    pub fn glimpse_at(&self, seen: u32, drawn: f32, now: u32, shooter: PlayerId, aim: Vec2) -> Option<Glimpse> {
+        let pic = self.picture(seen, drawn)?;
+        let f = pic.f;
         if !f.alive[shooter as usize] || !is_usable_aim(aim) {
             return None;
         }
-        let me = f.pos[shooter as usize];
+        let me = pic.pos(shooter);
         let mut claimed = f32::INFINITY;
         for e in ids(&f.rows[shooter as usize]).filter(|&e| e != shooter) {
-            let to = f.pos[e as usize];
+            let to = pic.pos(e);
             // Point-blank, any aim might be at it: it explains everything.
             let err = if dist2(me, to) <= self.point_blank * self.point_blank {
                 Some(0.0)
@@ -213,6 +245,34 @@ impl History {
             }
         }
         ahead.is_finite().then_some(Glimpse { claimed, ahead })
+    }
+}
+
+/// Most a client may say it drew before the snapshot it claims, in ticks:
+/// `i8::MIN` / `OFFSET_UNIT`.
+pub const MAX_BACK: f32 = 2.0;
+
+/// A shown world as a client drew it: `f`'s players, at the moment `k` of
+/// the way back from tick `hi` to the tick before it, `lo`.
+struct Picture<'a> {
+    f: &'a Frame,
+    hi: Option<&'a Frame>,
+    lo: Option<&'a Frame>,
+    k: f32,
+}
+
+impl Picture<'_> {
+    fn pos(&self, id: PlayerId) -> Vec2 {
+        let i = id as usize;
+        let Some(hi) = self.hi.filter(|h| h.alive[i]) else { return self.f.pos[i] };
+        let a = hi.pos[i];
+        match self.lo.filter(|l| self.k > 0.0 && l.alive[i]) {
+            Some(lo) => {
+                let b = lo.pos[i];
+                Vec2::new(a.x + (b.x - a.x) * self.k, a.y + (b.y - a.y) * self.k)
+            }
+            None => a,
+        }
     }
 }
 
@@ -323,6 +383,34 @@ mod tests {
         }
         assert!(some > 1_000 && gone > 300 && dead_shooter > 50, "some {some}, gone {gone}, dead {dead_shooter}");
         assert!(open > 200 && near > 20, "open {open}, near {near}");
+    }
+
+    /// C6.11 (v6 `offset`): a picture drawn between ticks is judged where it
+    /// was drawn — blended back from `seen`, up to two ticks, never after it.
+    #[test]
+    fn a_shot_drawn_between_ticks_is_judged_where_it_was_drawn() {
+        use aegis_protocol::movement::MOVE_SPEED;
+        let mut sim = Sim::with_walls(&[]);
+        sim.spawn(1, Vec2::new(0.0, 0.0));
+        sim.spawn(2, Vec2::new(0.0, 10.0));
+        let (mut h, mut vis) = (History::default(), Visibility::default());
+        for t in 1..=4 {
+            vis.recompute(&sim);
+            h.record(t, &sim, &vis);
+            sim.apply_move(2, Vec2::new(1.0, 0.0)); // 2 walks east, one step a tick
+        }
+        // On tick 4, 2 stands at 3 steps east; 1.25 ticks before, at 1.75.
+        let at = |steps: f32| Vec2::new(steps * MOVE_SPEED, 10.0);
+        let err = |drawn: f32, steps: f32| h.aim_evidence_at(4, drawn, 1, at(steps)).map(|(e, id, _)| (e, id));
+        assert_eq!(err(-1.25, 1.75), Some((0.0, 2)), "aimed where it was drawn: dead on");
+        assert!(err(0.0, 1.75).unwrap().0 > 0.01, "judged in the whole tick it is off");
+        assert_eq!(err(-2.0, 1.0), Some((0.0, 2)), "two ticks back: tick 2");
+        assert_eq!(err(-9.0, 1.0), err(-2.0, 1.0), "clamped at two");
+        assert_eq!(err(0.5, 3.0), Some((0.0, 2)), "never after: tick 4 itself");
+        assert_eq!(err(f32::NAN, 3.0), Some((0.0, 2)));
+        assert_eq!(h.aim_evidence_at(4, 0.0, 1, at(3.0)), h.aim_evidence(4, 1, at(3.0)), "0 is the whole tick");
+        let g = h.glimpse_at(4, -1.25, 4, 1, at(1.75));
+        assert_eq!(g, None, "nobody new: no glimpse, blended or not");
     }
 
     /// The world of tick `t` rebuilt from its plain copy.

@@ -134,6 +134,7 @@ impl Bot for HonestBot {
             move_dir: self.walk,
             aim,
             shoot,
+            offset: 0,
             older: Vec::new(),
         }]
     }

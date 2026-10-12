@@ -22,6 +22,7 @@ pub mod flood;
 pub mod garbage;
 pub mod honest;
 pub mod humanized;
+pub mod interp;
 pub mod joinflood;
 pub mod nan;
 pub mod predict;
@@ -119,6 +120,22 @@ pub trait Bot {
     /// How well this bot predicted its own position, if it predicts at all
     /// ([`predict::Predictor`], run by [`redundant::Redundant`]).
     fn prediction(&self) -> Option<predict::PredictStats> {
+        None
+    }
+
+    /// A snapshot landed: its tick, proof and view. Called for every one,
+    /// in the order they land — an overtaken one too — before the bot acts.
+    /// Only a bot that keeps more than the newest ([`interp::Interpolator`],
+    /// run by [`redundant::Redundant`]) reads it.
+    fn landed(&mut self, _tick: u32, _proof: u32, _view: &[PlayerState]) {}
+
+    /// Draw `delay` ticks behind the newest snapshot from now on, and act on
+    /// what is drawn ([`interp::Interpolator`]). Only a bot that plays like
+    /// a client ([`redundant::Redundant`]) does; the rest ignore it.
+    fn interpolate(&mut self, _delay: f64) {}
+
+    /// How steadily what this bot acts on advanced, if it keeps score.
+    fn pace(&self) -> Option<interp::Pace> {
         None
     }
 }

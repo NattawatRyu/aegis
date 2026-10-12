@@ -57,6 +57,9 @@ pub struct GuardCtx {
 pub struct ClientInput {
     pub seq: u32,
     pub tick: u32,
+    /// Where between snapshots the client drew `tick`, in
+    /// 1/`OFFSET_UNIT` ticks (v6; within one tick, `guards::packet`).
+    pub offset: i8,
     pub move_dir: Vec2,
     pub aim: Vec2,
     pub shoot: bool,
@@ -188,7 +191,14 @@ mod tests {
     use super::*;
 
     fn input() -> ClientInput {
-        ClientInput { seq: 1, tick: 1, move_dir: Vec2::new(0.3, 0.4), aim: Vec2::new(1.0, 0.0), shoot: false }
+        ClientInput {
+            seq: 1,
+            tick: 1,
+            offset: 0,
+            move_dir: Vec2::new(0.3, 0.4),
+            aim: Vec2::new(1.0, 0.0),
+            shoot: false,
+        }
     }
 
     #[test]

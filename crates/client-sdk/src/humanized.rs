@@ -54,6 +54,7 @@ impl Bot for HumanizedAimbot {
             move_dir: Vec2::ZERO,
             aim,
             shoot,
+            offset: 0,
             older: Vec::new(),
         }]
     }

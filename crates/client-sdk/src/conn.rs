@@ -18,9 +18,15 @@
 //!      acknowledged (a snapshot's `ack`), so a lost datagram is resent
 //!      inside the next ones — no timer, no retransmit of its own.
 //!
+//! A client that draws behind what it has received (B4) asks a
+//! [`Connection::view`] for each frame and claims its `claim` tick
+//! with [`Connection::input_drawn`]: the picture on screen — between
+//! snapshots, if it blends — is the one the shot is judged in.
+//!
 //! Through a relay every datagram is sealed under the [`ClientKeys`] the
 //! game's backend issued; directly to an origin, nothing is.
 
+use crate::interp::{Interpolator, Pace, View};
 use crate::predict::{PredictStats, Predictor};
 use aegis_protocol::movement::Wall;
 use aegis_protocol::{
@@ -98,6 +104,9 @@ pub struct Connection {
     /// Predicts this player's position, once [`Connection::predict_in`]
     /// names the arena.
     predictor: Option<Predictor>,
+    /// Draws behind the newest snapshot, once [`Connection::interpolate`]
+    /// sets how far.
+    interp: Option<Interpolator>,
 }
 
 impl Connection {
@@ -117,6 +126,7 @@ impl Connection {
             unacked: Vec::new(),
             ack: 0,
             predictor: None,
+            interp: None,
         }
     }
 
@@ -137,6 +147,24 @@ impl Connection {
         self.predictor.as_ref().map(Predictor::stats)
     }
 
+    /// Draw `delay` ticks behind the newest snapshot from now on
+    /// ([`Interpolator`]; clamped to `interp::MAX_DELAY`).
+    pub fn interpolate(&mut self, delay: f64) {
+        self.interp = Some(Interpolator::new(delay));
+    }
+
+    /// `dt` ticks have passed since the last frame: what to draw now, and
+    /// the tick an input chosen on it claims. `None` unless interpolating
+    /// and a snapshot has landed.
+    pub fn view(&mut self, dt: f64) -> Option<View> {
+        self.interp.as_mut()?.advance(dt)
+    }
+
+    /// How steadily the frames drawn so far advanced, if interpolating.
+    pub fn pace(&self) -> Option<Pace> {
+        self.interp.as_ref().map(Interpolator::pace)
+    }
+
     fn wire(&self, framed: Vec<u8>) -> Vec<u8> {
         match &self.keys {
             Some(k) => seal_up(k, &framed),
@@ -153,6 +181,24 @@ impl Connection {
     /// An input chosen on the snapshot of `tick` (`None`: the newest
     /// received). Directions are the game's; the server clamps `move_dir`.
     pub fn input(&mut self, tick: Option<u32>, move_dir: Vec2, aim: Vec2, shoot: bool) -> Result<Vec<u8>, ConnError> {
+        self.send(tick, 0, move_dir, aim, shoot)
+    }
+
+    /// An input chosen on the frame `view` drew ([`Connection::view`]): it
+    /// claims the view's tick and says where between snapshots it was drawn,
+    /// so the server judges the shot in the picture on screen (v6).
+    pub fn input_drawn(&mut self, view: &View, move_dir: Vec2, aim: Vec2, shoot: bool) -> Result<Vec<u8>, ConnError> {
+        self.send(Some(view.claim), view.offset, move_dir, aim, shoot)
+    }
+
+    fn send(
+        &mut self,
+        tick: Option<u32>,
+        offset: i8,
+        move_dir: Vec2,
+        aim: Vec2,
+        shoot: bool,
+    ) -> Result<Vec<u8>, ConnError> {
         let (_, token) = self.joined.ok_or(ConnError::NotJoined)?;
         let tick = tick.or(self.newest).ok_or(ConnError::UnknownTick)?;
         let proof = self.proof(tick).ok_or(ConnError::UnknownTick)?;
@@ -161,7 +207,7 @@ impl Connection {
         }
         self.claimed = Some(tick);
         self.seq += 1;
-        let f = InputFrame { seq: self.seq, tick, proof, move_dir, aim, shoot };
+        let f = InputFrame { seq: self.seq, tick, proof, offset, move_dir, aim, shoot };
         let msg = ClientMsg::input_with(f, self.unacked.clone());
         if let Some(p) = &mut self.predictor {
             p.input(f.seq, move_dir, aim);
@@ -202,6 +248,9 @@ impl Connection {
                 self.unacked.retain(|f| f.seq > acked);
                 if let (Some(p), Some((id, _))) = (&mut self.predictor, self.joined) {
                     p.snapshot(tick, ack, players.iter().find(|s| s.id == id).copied());
+                }
+                if let Some(ip) = &mut self.interp {
+                    ip.snapshot(tick, proof, &players);
                 }
                 if self.newest.is_none_or(|n| tick > n) {
                     self.newest = Some(tick);
@@ -340,6 +389,31 @@ mod tests {
         let s = c.prediction_stats().unwrap();
         assert_eq!((s.checked, s.exact), (1, 1));
         assert!(Connection::new("x", None).prediction_stats().is_none(), "off unless asked");
+    }
+
+    /// Interpolating, a Connection draws behind the newest snapshot, and
+    /// the tick it draws is one an input can claim — even when a late
+    /// snapshot lands under it.
+    #[test]
+    fn a_connection_draws_behind_and_claims_what_it_draws() {
+        let mut c = Connection::new("riw", None);
+        c.receive(&mut encode(&ServerMsg::Joined { player_id: 1, token: 9, tick: 0 })).unwrap();
+        assert_eq!(c.view(1.0), None, "off unless asked");
+        c.interpolate(2.0);
+        assert_eq!(c.view(1.0), None, "no snapshot yet");
+        for t in [1, 2, 4, 3] {
+            c.receive(&mut snap(t)).unwrap();
+        }
+        let v = c.view(1.0).unwrap();
+        assert_eq!((v.at, v.claim, v.proof), (2.0, 2, 15));
+        let (_, m) = input_of(&c.input_drawn(&v, Vec2::ZERO, Vec2::ZERO, true).unwrap());
+        assert!(matches!(m, ClientMsg::Input { tick: 2, proof: 15, offset: 0, .. }));
+        assert_eq!(c.pace(), Some(Pace::default()), "the first frame is not judged");
+        // Between snapshots: 2.55 claims 3 and says it was drawn 0.45 before.
+        c.receive(&mut snap(5)).unwrap();
+        let v = c.view(0.5).unwrap();
+        let (_, m) = input_of(&c.input_drawn(&v, Vec2::ZERO, Vec2::ZERO, true).unwrap());
+        assert!(matches!(m, ClientMsg::Input { tick: 3, proof: 22, offset: -29, .. }), "{m:?}");
     }
 
     #[test]

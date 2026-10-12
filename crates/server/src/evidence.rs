@@ -108,13 +108,31 @@ impl Evidence {
     /// after — the evidence is measured in the shown worlds, not the world
     /// the shot hits in.
     pub fn shot(&mut self, tick: u32, seen: u32, shooter: PlayerId, alive: bool, aim: Vec2) -> ShotEvidence {
+        self.shot_at(tick, seen, 0.0, shooter, alive, aim)
+    }
+
+    /// [`Evidence::shot`], for a client that drew snapshot `seen`'s players
+    /// at a moment `drawn` ticks before it — between snapshots, if it blends
+    /// (v6 `offset`). Its aim is measured in the shown worlds blended to
+    /// that moment ([`History::aim_evidence_at`]). Clamped to 0 ..= -2
+    /// ticks, 0 if not a number: never after `seen`, which would judge it
+    /// in a picture newer than it proved it had.
+    pub fn shot_at(
+        &mut self,
+        tick: u32,
+        seen: u32,
+        drawn: f32,
+        shooter: PlayerId,
+        alive: bool,
+        aim: Vec2,
+    ) -> ShotEvidence {
         let live = alive && self.history.alive(seen, shooter);
         if !live {
             return ShotEvidence { live, aim: None, glimpse: None };
         }
         self.react.fired(seen, shooter);
-        let glimpse = self.history.glimpse(seen, tick, shooter, aim);
-        let aim = self.history.aim_evidence(seen, shooter, aim).map(|(err, enemy, size)| Aim {
+        let glimpse = self.history.glimpse_at(seen, drawn, tick, shooter, aim);
+        let aim = self.history.aim_evidence_at(seen, drawn, shooter, aim).map(|(err, enemy, size)| Aim {
             err,
             enemy,
             react: self.react.engage(shooter, enemy, seen),

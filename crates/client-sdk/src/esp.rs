@@ -60,6 +60,7 @@ impl Bot for EspBot {
             move_dir,
             aim,
             shoot,
+            offset: 0,
             older: Vec::new(),
         }]
     }

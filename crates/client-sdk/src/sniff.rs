@@ -78,6 +78,7 @@ impl Bot for SniffBot {
                 move_dir: Vec2::new(0.0, -1.0), // walk the victim where it chooses
                 aim: Vec2::new(1.0, 0.0),
                 shoot: false,
+                offset: 0,
                 older: Vec::new(),
             }],
             None => Vec::new(),
@@ -112,6 +113,7 @@ mod tests {
             move_dir: Vec2::ZERO,
             aim: Vec2::ZERO,
             shoot: true,
+            offset: 0,
             older: Vec::new(),
         };
         b.overheard(&frame(0x7070_7070, &victim));

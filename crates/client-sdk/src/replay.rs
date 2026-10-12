@@ -38,6 +38,7 @@ impl Bot for ReplayBot {
             move_dir: Vec2::new(1.0, 0.0),
             aim: Vec2::new(1.0, 0.0),
             shoot: false,
+            offset: 0,
             older: Vec::new(),
         }]
     }

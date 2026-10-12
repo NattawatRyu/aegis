@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 
 use aegis_protocol::{
-    split_frame, ClientMsg, InputFrame, LinkKey, PlayerId, PlayerState, ServerMsg, Vec2, NO_TOKEN, TICK_HZ,
+    split_frame, ClientMsg, InputFrame, LinkKey, PlayerId, PlayerState, ServerMsg, Vec2, NO_TOKEN, OFFSET_UNIT, TICK_HZ,
 };
 use aegis_telemetry::Telemetry;
 
@@ -429,7 +429,14 @@ impl Server {
         self.proofs.verify(player, s.token, f.tick, f.proof)?;
         let (below, above) = self.inbox.neighbours(player, f.seq);
         self.stale.check(player, tick, f.tick, below, above)?;
-        let mut input = ClientInput { seq: f.seq, tick: f.tick, move_dir: f.move_dir, aim: f.aim, shoot: f.shoot };
+        let mut input = ClientInput {
+            seq: f.seq,
+            tick: f.tick,
+            offset: f.offset,
+            move_dir: f.move_dir,
+            aim: f.aim,
+            shoot: f.shoot,
+        };
         let anomaly = match self.pipe.run(&GuardCtx { tick, player }, &mut input) {
             GuardVerdict::Ok { anomaly } => anomaly,
             GuardVerdict::Rejected(r) => return Err(r),
@@ -494,7 +501,10 @@ impl Server {
             // A dead player's trigger fires nothing, and starts no streak —
             // dead now, or dead in the picture it pulled it on.
             let alive = self.sim.player(p).is_some_and(|s| s.alive);
-            let ev = self.ev.shot(tick, seen, p, alive, input.aim);
+            // Judged at the moment the client drew (v6), between snapshots
+            // if it blends.
+            let drawn = f32::from(input.offset) / f32::from(OFFSET_UNIT);
+            let ev = self.ev.shot_at(tick, seen, drawn, p, alive, input.aim);
             if let Some(g) = ev.glimpse {
                 self.tel.glimpse(tick, p, g.claimed.is_finite().then_some(g.claimed), g.ahead);
                 out.glimpses.push((p, g));
@@ -612,7 +622,7 @@ mod tests {
         let tick = s.ev.history().latest().unwrap_or(0);
         let player = s.sessions.values().find(|x| x.token == token).map(|x| x.player_id);
         let proof = player.map_or(0, |p| s.tick_proof(p, tick));
-        frame(token, &ClientMsg::Input { seq, tick, proof, move_dir, aim, shoot, older: Vec::new() })
+        frame(token, &ClientMsg::Input { seq, tick, proof, move_dir, aim, shoot, offset: 0, older: Vec::new() })
     }
 
     fn walk(s: &Server, token: u64, seq: u32) -> Vec<u8> {
@@ -1026,6 +1036,7 @@ mod tests {
                 move_dir: Vec2::new(1.0, 0.0),
                 aim: Vec2::new(1.0, 0.0),
                 shoot: false,
+                offset: 0,
                 older: Vec::new(),
             };
             s.receive(arrive, addr(1), &frame(t1, &m));
@@ -1089,6 +1100,7 @@ mod tests {
             seq,
             tick,
             proof,
+            offset: 0,
             move_dir: Vec2::new(1.0, 0.0),
             aim: Vec2::new(1.0, 0.0),
             shoot: false,
@@ -1144,7 +1156,15 @@ mod tests {
         s.begin_tick(1);
         let tick = s.ev.history().latest().unwrap();
         let proof = s.tick_proof(1, tick);
-        let good = |seq| InputFrame { seq, tick, proof, move_dir: Vec2::ZERO, aim: Vec2::new(1.0, 0.0), shoot: false };
+        let good = |seq| InputFrame {
+            seq,
+            tick,
+            proof,
+            offset: 0,
+            move_dir: Vec2::ZERO,
+            aim: Vec2::new(1.0, 0.0),
+            shoot: false,
+        };
         let forged = InputFrame { proof: good(1).proof ^ 1, ..good(1) };
         s.receive(1, addr(1), &frame(t1, &ClientMsg::input(forged)));
         s.receive(1, addr(1), &frame(t1, &ClientMsg::input_with(good(2), vec![forged])));
@@ -1249,7 +1269,19 @@ mod tests {
     fn claim(s: &Server, token: u64, seq: u32, seen: u32, aim: Vec2, shoot: bool) -> Vec<u8> {
         let p = s.sessions.values().find(|x| x.token == token).expect("a live session").player_id;
         let proof = s.tick_proof(p, seen);
-        frame(token, &ClientMsg::Input { seq, tick: seen, proof, move_dir: Vec2::ZERO, aim, shoot, older: Vec::new() })
+        frame(
+            token,
+            &ClientMsg::Input {
+                seq,
+                tick: seen,
+                proof,
+                move_dir: Vec2::ZERO,
+                aim,
+                shoot,
+                offset: 0,
+                older: Vec::new(),
+            },
+        )
     }
 
     fn rejected(s: &Server, p: PlayerId, label: &str) -> u32 {

@@ -19,6 +19,11 @@
 //! every round trip 0..=max_rtt and prints, per kind of player, how its
 //! timed reactions read and how often the reaction detector flagged it.
 //!
+//! `aegis-harness interp [seeds] [rtt] [down‰]` runs lag_mix crowds over a
+//! grid of down jitter and interpolation delay (B4) and prints how steadily
+//! honest players' pictures advanced, how far behind they drew, and whether
+//! the detector still tells honest from cheat.
+//!
 //! `aegis-harness foresight [seeds] [max_rtt]` runs both mixes and prints,
 //! per kind of player, how many of its shots could be held against an enemy
 //! only a newer snapshot showed, and how many fit such an enemy under four
@@ -63,6 +68,12 @@ fn main() -> std::io::Result<()> {
         let seeds = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8);
         let down = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
         net(seeds, args.get(3).and_then(|s| s.parse().ok()).unwrap_or(4), down);
+        return Ok(());
+    }
+    if args.get(1).map(String::as_str) == Some("interp") {
+        let seeds = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8);
+        let down = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(50);
+        interp(seeds, args.get(3).and_then(|s| s.parse().ok()).unwrap_or(4), down);
         return Ok(());
     }
     if args.get(1).map(String::as_str) == Some("foresight") {
@@ -498,6 +509,72 @@ fn net(seeds: u32, rtt: u32, down: u32) {
                 format!("{flagged}/{honest}"),
                 format!("{caught}/{cheats}"),
                 why.join(", ")
+            );
+        }
+    }
+}
+
+/// What drawing behind the newest snapshot buys on a jittery, lossy
+/// downlink (B4): lag_mix crowds at round trip `rtt` with `down` per mille
+/// of snapshots lost, over a grid of down jitter and interpolation delay.
+fn interp(seeds: u32, rtt: u32, down: u32) {
+    use aegis_client_sdk::interp::Pace;
+
+    const CHEATS: [&str; 4] = ["aimbot", "humanized", "triggerbot", "burst"];
+
+    println!(
+        "lag_mix crowds: {seeds} per cell, rtt {rtt}, {down}‰ of snapshots lost, {} ticks",
+        aegis_harness::CROWD_TICKS
+    );
+    println!("jitter = up to that many extra ticks per snapshot on the way down");
+    println!("delay = ticks drawn behind the newest snapshot (-: act on the newest, no interpolation)");
+    println!("steady/held/jump = frames whose picture advanced one tick (within 10%), less, more; honest players");
+    println!("bridged = frames drawn across a missing snapshot; behind = mean ticks drawn behind the newest");
+    println!("hit = honest hits / shots; flagged = honest players any detector raised; caught = cheats raised\n");
+    println!(
+        "{:>6} {:>5} {:>8} {:>6} {:>6} {:>8} {:>7} {:>6} {:>8} {:>8}",
+        "jitter", "delay", "steady%", "held%", "jump%", "bridged%", "behind", "hit%", "flagged", "caught"
+    );
+    for jitter in 0..=3 {
+        for delay in [None, Some(1.0), Some(2.0), Some(3.0)] {
+            let mut pace = Pace::default();
+            let (mut shots, mut hits) = (0u32, 0u32);
+            let (mut flagged, mut honest, mut caught, mut cheats) = (0u32, 0u32, 0u32, 0u32);
+            for seed in 0..seeds {
+                let r = run(Scenario {
+                    down_loss: down,
+                    down_jitter: jitter,
+                    interp: delay,
+                    ..Scenario::lag_mix(seed, rtt)
+                });
+                for b in r.bots.iter().filter(|b| b.id.is_some()) {
+                    if CHEATS.contains(&b.name) {
+                        cheats += 1;
+                        caught += u32::from(!b.alerts.is_empty());
+                        continue;
+                    }
+                    honest += 1;
+                    flagged += u32::from(!b.alerts.is_empty());
+                    shots += b.shots;
+                    hits += b.hits;
+                    if let Some(p) = &b.pace {
+                        pace.add(p);
+                    }
+                }
+            }
+            let pct = |x: u32| 100.0 * x as f32 / pace.frames.max(1) as f32;
+            println!(
+                "{:>6} {:>5} {:>7.1}% {:>5.1}% {:>5.1}% {:>7.1}% {:>7.2} {:>5.1}% {:>8} {:>8}",
+                jitter,
+                delay.map_or("-".to_string(), |d| format!("{d}")),
+                pct(pace.steady),
+                pct(pace.held),
+                pct(pace.jumped),
+                pct(pace.bridged),
+                pace.mean_behind(),
+                100.0 * hits as f32 / shots.max(1) as f32,
+                format!("{flagged}/{honest}"),
+                format!("{caught}/{cheats}"),
             );
         }
     }

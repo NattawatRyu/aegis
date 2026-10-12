@@ -44,6 +44,7 @@ impl Bot for NanBot {
             move_dir,
             aim,
             shoot: true,
+            offset: 0,
             older: Vec::new(),
         }]
     }

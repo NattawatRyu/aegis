@@ -32,7 +32,7 @@ mod tests {
     use super::*;
 
     fn base() -> ClientInput {
-        ClientInput { seq: 1, tick: 1, move_dir: Vec2::ZERO, aim: Vec2::new(1.0, 0.0), shoot: false }
+        ClientInput { seq: 1, tick: 1, offset: 0, move_dir: Vec2::ZERO, aim: Vec2::new(1.0, 0.0), shoot: false }
     }
 
     #[test]

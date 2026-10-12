@@ -123,7 +123,7 @@ mod tests {
     use aegis_protocol::Vec2;
 
     fn input(seq: u32, tick: u32) -> ClientInput {
-        ClientInput { seq, tick, move_dir: Vec2::new(1.0, 0.0), aim: Vec2::new(1.0, 0.0), shoot: false }
+        ClientInput { seq, tick, offset: 0, move_dir: Vec2::new(1.0, 0.0), aim: Vec2::new(1.0, 0.0), shoot: false }
     }
 
     fn seqs(v: &[(PlayerId, ClientInput, u32)]) -> Vec<(PlayerId, u32)> {

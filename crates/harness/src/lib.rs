@@ -17,7 +17,7 @@
 //! All server behaviour lives in [`aegis_server`]; this crate only drives bots
 //! against it and keeps the lab's measurements (kills, largest step).
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
@@ -34,6 +34,7 @@ use aegis_client_sdk::{
     garbage::GarbageBot,
     honest::HonestBot,
     humanized::HumanizedAimbot,
+    interp::Pace,
     joinflood::JoinFloodBot,
     nan::NanBot,
     predict::PredictStats,
@@ -102,6 +103,14 @@ pub struct Scenario {
     /// whose snapshot is lost acts on the last one it got — an older tick,
     /// whose proof it still holds — as a real client would. In-process only.
     pub down_loss: u32,
+    /// On top of `rtt - rtt / 2`, each snapshot takes 0..=`down_jitter`
+    /// more ticks to land, drawn per snapshot; a bot acts on the newest that
+    /// has landed. In-process only.
+    pub down_jitter: u32,
+    /// Every bot that plays like a client draws this many ticks behind the
+    /// newest snapshot and acts on what it draws ([`Bot::interpolate`], B4).
+    /// `None`: it acts on the newest. In-process only.
+    pub interp: Option<f64>,
 }
 
 impl Scenario {
@@ -117,6 +126,8 @@ impl Scenario {
             jitter: 0,
             loss: 0,
             down_loss: 0,
+            down_jitter: 0,
+            interp: None,
             bots: vec![
                 real(HonestBot::new()),
                 Box::new(SpeedhackBot::new()),
@@ -169,6 +180,8 @@ impl Scenario {
             jitter: 0,
             loss: 0,
             down_loss: 0,
+            down_jitter: 0,
+            interp: None,
             bots: (0..LOBBY_SIZE)
                 .map(|k| real(HonestBot::with_seed(seed.wrapping_mul(LOBBY_SIZE).wrapping_add(k + 1))) as Box<dyn Bot>)
                 .collect(),
@@ -201,6 +214,8 @@ impl Scenario {
             jitter: 0,
             loss: 0,
             down_loss: 0,
+            down_jitter: 0,
+            interp: None,
             bots: (0..size)
                 .map(|k| {
                     let s = seed.wrapping_mul(size).wrapping_add(k + 1);
@@ -277,6 +292,8 @@ impl Scenario {
             jitter: 0,
             loss: 0,
             down_loss: 0,
+            down_jitter: 0,
+            interp: None,
         }
     }
 
@@ -294,6 +311,8 @@ impl Scenario {
             jitter: 0,
             loss: 0,
             down_loss: 0,
+            down_jitter: 0,
+            interp: None,
         }
     }
 
@@ -311,6 +330,8 @@ impl Scenario {
             jitter: 0,
             loss: 0,
             down_loss: 0,
+            down_jitter: 0,
+            interp: None,
         }
     }
 
@@ -368,6 +389,10 @@ pub struct BotReport {
     /// How well it predicted its own position: for a bot that plays like a
     /// real client ([`Redundant`]), `None` for one that attacks (B3).
     pub predict: Option<PredictStats>,
+    /// How steadily the picture it acted on advanced — drawn by its
+    /// interpolator ([`Scenario::interp`]) or, without one, the newest
+    /// snapshot. `None` for a bot that attacks (B4).
+    pub pace: Option<Pace>,
     /// What the online detector raised on this player, fed the run's telemetry
     /// one record at a time in stream order (what a live server would feed
     /// it), each with the tick it fired.
@@ -808,6 +833,7 @@ impl Lab {
                     lost: self.lost[i],
                     waited: self.waited[i],
                     predict: bot.prediction(),
+                    pace: bot.pace(),
                     alerts,
                 }
             })
@@ -853,17 +879,19 @@ pub fn run(mut sc: Scenario) -> Report {
     let mut wire: Vec<Vec<Vec<u8>>> = vec![Vec::new(); n];
     let mut cost = Vec::with_capacity(sc.ticks as usize);
     let (down, up) = (sc.rtt - sc.rtt / 2, sc.rtt / 2);
-    // The snapshots sent on the last `down + 1` ticks, oldest first (each
-    // bot's proof and view), and the datagrams on their way up: (tick it
-    // lands, bot, port, bytes).
-    let mut sent: VecDeque<Vec<(u32, u32, Vec<PlayerState>)>> = VecDeque::new();
-    // Keyed by landing tick; within one, in the order sent.
+    // The snapshots on their way down: (bot, tick, proof, ack, view); and
+    // the datagrams on their way up: (bot, port, bytes). Both keyed by the
+    // tick they land; within one, in the order sent.
+    type Falling = (usize, u32, u32, u32, Vec<PlayerState>);
+    let mut falling: BTreeMap<u32, Vec<Falling>> = BTreeMap::new();
     let mut inflight: BTreeMap<u32, Vec<(usize, u16, Vec<u8>)>> = BTreeMap::new();
     let lockstep = up == 0 && sc.jitter == 0 && sc.loss == 0;
-    // Each bot's last snapshot that landed (tick, proof, ack, view), when
-    // snapshots can be lost.
+    // Each bot's newest snapshot that landed (tick, proof, ack, view).
     type Held = (u32, u32, u32, Vec<PlayerState>);
     let mut held: Vec<Option<Held>> = vec![None; n];
+    if let Some(delay) = sc.interp {
+        sc.bots.iter_mut().for_each(|b| b.interpolate(delay));
+    }
     for tick in 1..=sc.ticks {
         let mut c = TickCost::default();
         let t = Instant::now();
@@ -895,17 +923,27 @@ pub fn run(mut sc: Scenario) -> Report {
         for (i, k, d) in inflight.remove(&tick).unwrap_or_default() {
             hand_over(&mut server, &mut lab, &mut retry, &mut c, tick, &route, i, k, &d);
         }
-        sent.push_back(views);
-        if sent.len() > down as usize + 1 {
-            sent.pop_front();
+        // Each snapshot lands `down` ticks on — later with down jitter,
+        // never if lost.
+        for (i, (proof, ack, view)) in views.into_iter().enumerate() {
+            let mut land = tick + down;
+            if sc.down_loss > 0 || sc.down_jitter > 0 {
+                let r = link_draw(land, i, DOWN_DRAW);
+                if r % 1000 < u64::from(sc.down_loss) {
+                    continue;
+                }
+                land += ((r >> 32) % (u64::from(sc.down_jitter) + 1)) as u32;
+            }
+            falling.entry(land).or_default().push((i, tick, proof, ack, view));
         }
-        // A bot acts on the snapshot sent `down` ticks ago; before the first
-        // one reaches it, it has nothing to act on.
-        let Some(views) = (sent.len() > down as usize).then(|| &sent[0]) else {
-            finish(&mut server, &mut lab, &mut cost, c, tick, retry);
-            continue;
-        };
-        let seen_tick = tick - down;
+        // What lands now, in the order sent: every one is handed over; the
+        // newest is what a bot acts on — or, before any has landed, nothing.
+        for (i, t, proof, ack, view) in falling.remove(&tick).unwrap_or_default() {
+            sc.bots[i].landed(t, proof, &view);
+            if held[i].as_ref().is_none_or(|h| t > h.0) {
+                held[i] = Some((t, proof, ack, view));
+            }
+        }
         // A tap has heard last tick's wire by now; this tick's is kept for
         // the next. (So a tap may act before the bot it listens to.)
         let heard = std::mem::replace(&mut wire, vec![Vec::new(); n]);
@@ -913,19 +951,7 @@ pub fn run(mut sc: Scenario) -> Report {
             if let Some(v) = taps[i] {
                 heard[v].iter().for_each(|w| bot.overheard(w));
             }
-            // A snapshot lost on the way down: act on the last one that
-            // landed — or, before any has, not at all.
-            let (seen_tick, proof, ack, seen) = if sc.down_loss == 0 {
-                (seen_tick, views[i].0, views[i].1, &views[i].2[..])
-            } else {
-                if link_draw(tick, i, DOWN_DRAW) % 1000 >= u64::from(sc.down_loss) {
-                    held[i] = Some((seen_tick, views[i].0, views[i].1, views[i].2.clone()));
-                }
-                match &held[i] {
-                    Some((t, p, a, v)) => (*t, *p, *a, &v[..]),
-                    None => continue,
-                }
-            };
+            let Some(&(seen_tick, proof, ack, ref seen)) = held[i].as_ref() else { continue };
             bot.acked(ack);
             if down == 0 {
                 lab.count_hidden(i, server.sim(), seen);
@@ -1036,7 +1062,12 @@ pub fn run_relay(sc: Scenario) -> io::Result<Report> {
 }
 
 fn run_net(mut sc: Scenario, relayed: bool) -> io::Result<Report> {
-    assert_eq!((sc.rtt, sc.jitter, sc.loss, sc.down_loss), (0, 0, 0, 0), "lag is simulated in-process only");
+    assert_eq!(
+        (sc.rtt, sc.jitter, sc.loss, sc.down_loss, sc.down_jitter),
+        (0, 0, 0, 0, 0),
+        "lag is simulated in-process only"
+    );
+    assert!(sc.interp.is_none(), "interpolation is simulated in-process only");
     let n = sc.bots.len();
     let mut net = NetServer::bind((Ipv4Addr::LOCALHOST, 0), Server::with_walls(spawns(n), &ARENA_WALLS))?;
     let origin = net.local_addr()?;
@@ -1876,6 +1907,80 @@ mod tests {
         }
     }
 
+    /// The honest players of a lag_mix crowd, pooled.
+    fn honest_pace(r: &Report) -> Pace {
+        let mut p = Pace::default();
+        for b in r.bots.iter().filter(|b| !["aimbot", "humanized", "triggerbot", "burst"].contains(&b.name)) {
+            p.add(&b.pace.unwrap_or_else(|| panic!("{} keeps no pace", b.name)));
+        }
+        p
+    }
+
+    /// B4's point: with snapshots jittering up to 3 ticks on the way down
+    /// and 5% lost, a client acting on the newest one advances a steady tick
+    /// at a time on under half its frames — it stalls, then jumps. Drawing 2
+    /// ticks behind, it is steady on 98%+ and never jumps, bridges what was
+    /// lost, and pays about 2 ticks for it. Prediction does not notice.
+    #[test]
+    fn interpolation_steadies_what_a_jittery_downlink_shakes() {
+        let link = || Scenario { down_jitter: 3, down_loss: 50, ..Scenario::lag_mix(0, 4) };
+        let base = honest_pace(&run(link()));
+        assert!(base.steady * 2 < base.frames && base.jumped > 0, "{base:?}");
+        assert_eq!((base.bridged, base.mean_behind()), (0, 0.0));
+        let r = run(Scenario { interp: Some(2.0), ..link() });
+        let p = honest_pace(&r);
+        assert!(p.steady * 100 >= p.frames * 98 && p.jumped == 0 && p.bridged > 0, "{p:?}");
+        assert!((1.5..2.5).contains(&p.mean_behind()), "{p:?}");
+        let pred = r.bot("honest").predict.unwrap();
+        assert!(pred.checked > 200 && pred.exact == pred.checked, "{pred:?}");
+    }
+
+    /// An honest player raised: (seed, kind, reasons).
+    type Raised = (u32, &'static str, Vec<FlagReason>);
+
+    /// lag_mix crowds `seeds` at rtt 4, each through `link`: the honest
+    /// players any detector raised, and how many of the cheats were raised.
+    /// Every honest input must be taken.
+    fn judged(seeds: u32, link: impl Fn(Scenario) -> Scenario) -> (Vec<Raised>, u32) {
+        let (mut raised, mut caught) = (Vec::new(), 0);
+        for seed in 0..seeds {
+            let r = run(link(Scenario::lag_mix(seed, 4)));
+            for b in r.bots.iter().filter(|b| b.id.is_some()) {
+                if ["aimbot", "humanized", "triggerbot", "burst"].contains(&b.name) {
+                    caught += u32::from(!b.alerts.is_empty());
+                    continue;
+                }
+                assert_eq!(b.totals.total_rejected(), 0, "seed {seed} {}: {:?}", b.name, b.totals.rejected);
+                if !b.alerts.is_empty() {
+                    raised.push((seed, b.name, flagged(b)));
+                }
+            }
+        }
+        (raised, caught)
+    }
+
+    /// An interpolating client claims the tick it draws, 2 ticks older than
+    /// the newest: the server takes every honest input and the detector
+    /// still tells honest from cheat. On a clean downlink every moment drawn
+    /// is a whole tick. Four crowds.
+    #[test]
+    fn interpolating_clients_are_judged_like_any_other() {
+        let (raised, caught) = judged(4, |sc| Scenario { interp: Some(2.0), ..sc });
+        assert!(raised.is_empty(), "{raised:?}");
+        assert!(caught >= 15, "caught {caught} of 16");
+    }
+
+    /// C6.11: with snapshots jittering a tick on the way down, a blending
+    /// client draws between ticks most of the time. Judged in the claimed
+    /// whole tick (the server ignoring `offset`), 28 of these 96 honest
+    /// players trip foresight; judged at the moment drawn (v6), none does.
+    #[test]
+    fn blending_clients_are_judged_at_the_moment_drawn() {
+        let (raised, caught) = judged(8, |sc| Scenario { down_jitter: 1, interp: Some(2.0), ..sc });
+        assert!(raised.is_empty(), "{raised:?}");
+        assert!(caught >= 30, "caught {caught} of 32");
+    }
+
     /// On a lockstep link the acked input is the one just sent: prediction
     /// is checked every tick and is exact, and an attacking bot does not
     /// predict at all.
@@ -2132,6 +2237,7 @@ mod tests {
             move_dir: Vec2::ZERO,
             aim: Vec2::ZERO,
             shoot: false,
+            offset: 0,
             older: Vec::new(),
         };
         assert_eq!(with_cookie(&frame(9, &input), 42), None);

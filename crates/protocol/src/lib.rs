@@ -38,7 +38,9 @@ pub mod noise;
 /// v5: every input carries up to two earlier unacknowledged ones, and every
 ///     snapshot acknowledges the last input taken — loss costs a frame only
 ///     when three datagrams in a row are lost.
-pub const PROTOCOL_VERSION: u16 = 5;
+/// v6: every input says where between snapshots the client drew the picture
+///     it chose on (`offset`), so a blending client is judged in what it saw.
+pub const PROTOCOL_VERSION: u16 = 6;
 
 /// Bytes of session token in front of every client datagram.
 pub const TOKEN_LEN: usize = 8;
@@ -117,8 +119,29 @@ pub enum ClientMsg {
     /// acknowledged yet ([`ServerMsg::Snapshot`] `ack`), oldest first, each
     /// with its own tick and proof — so one lost datagram costs nothing as
     /// long as one of the next two arrives. More is a malformed packet.
-    Input { seq: u32, tick: u32, proof: u32, move_dir: Vec2, aim: Vec2, shoot: bool, older: Vec<InputFrame> },
+    ///
+    /// `offset`: how long before `tick` the picture drawn sat, in
+    /// 1/[`OFFSET_UNIT`] ticks, 0 or negative — a client that blends
+    /// between snapshots draws moments between ticks, and claims the
+    /// snapshot at or after the moment drawn. Down to `i8::MIN`, two ticks
+    /// before. Never after: a positive offset would ask to be judged in a
+    /// picture newer than any the client can prove it had, so it is a
+    /// malformed packet. 0 for a client that draws whole snapshots.
+    Input {
+        seq: u32,
+        tick: u32,
+        proof: u32,
+        offset: i8,
+        move_dir: Vec2,
+        aim: Vec2,
+        shoot: bool,
+        older: Vec<InputFrame>,
+    },
 }
+
+/// [`ClientMsg::Input`] `offset` per tick: `-OFFSET_UNIT` is one whole tick
+/// before the claimed snapshot, `i8::MIN` two.
+pub const OFFSET_UNIT: i8 = 64;
 
 /// Most earlier inputs one [`ClientMsg::Input`] may carry: with its own,
 /// every input crosses in up to three datagrams.
@@ -130,9 +153,22 @@ pub struct InputFrame {
     pub seq: u32,
     pub tick: u32,
     pub proof: u32,
+    pub offset: i8,
     pub move_dir: Vec2,
     pub aim: Vec2,
     pub shoot: bool,
+}
+
+impl InputFrame {
+    /// Is `offset` at or before `tick` — never after it?
+    pub fn offset_ok(&self) -> bool {
+        self.offset <= 0
+    }
+
+    /// `offset` in ticks: 0 down to -2.
+    pub fn drawn(&self) -> f32 {
+        f32::from(self.offset) / f32::from(OFFSET_UNIT)
+    }
 }
 
 impl ClientMsg {
@@ -143,8 +179,8 @@ impl ClientMsg {
 
     /// An Input carrying `frame` and the earlier, unacknowledged `older`.
     pub fn input_with(frame: InputFrame, older: Vec<InputFrame>) -> ClientMsg {
-        let InputFrame { seq, tick, proof, move_dir, aim, shoot } = frame;
-        ClientMsg::Input { seq, tick, proof, move_dir, aim, shoot, older }
+        let InputFrame { seq, tick, proof, offset, move_dir, aim, shoot } = frame;
+        ClientMsg::Input { seq, tick, proof, offset, move_dir, aim, shoot, older }
     }
 
     /// Every input this message carries, oldest first: `older`, then its own.
@@ -152,9 +188,9 @@ impl ClientMsg {
     pub fn frames(&self) -> Vec<InputFrame> {
         match self {
             ClientMsg::Join { .. } => Vec::new(),
-            &ClientMsg::Input { seq, tick, proof, move_dir, aim, shoot, ref older } => {
+            &ClientMsg::Input { seq, tick, proof, offset, move_dir, aim, shoot, ref older } => {
                 let mut v = older.clone();
-                v.push(InputFrame { seq, tick, proof, move_dir, aim, shoot });
+                v.push(InputFrame { seq, tick, proof, offset, move_dir, aim, shoot });
                 v
             }
         }
@@ -1051,6 +1087,7 @@ mod tests {
             seq,
             tick: 100,
             proof: 0xDEAD_BEEF,
+            offset: -(seq as i8),
             move_dir: Vec2::new(0.3, -0.4),
             aim: Vec2::new(1.0, 0.0),
             shoot: true,
@@ -1059,7 +1096,25 @@ mod tests {
         let back: ClientMsg = decode(&encode(&m)).unwrap();
         assert_eq!(m, back);
         assert_eq!(back.frames().iter().map(|f| f.seq).collect::<Vec<_>>(), [5, 6, 7], "oldest first");
+        assert_eq!(back.frames().iter().map(|f| f.offset).collect::<Vec<_>>(), [-5, -6, -7], "each its own");
         assert!(matches!(ClientMsg::input(f(1)), ClientMsg::Input { seq: 1, ref older, .. } if older.is_empty()));
+    }
+
+    /// At or before the claimed tick, down to two ticks; never after it.
+    #[test]
+    fn an_offset_is_never_after_the_claim() {
+        let f = |offset| InputFrame {
+            seq: 1,
+            tick: 1,
+            proof: 0,
+            offset,
+            move_dir: Vec2::ZERO,
+            aim: Vec2::ZERO,
+            shoot: false,
+        };
+        assert!(f(0).offset_ok() && f(-OFFSET_UNIT).offset_ok() && f(i8::MIN).offset_ok());
+        assert!(!f(1).offset_ok() && !f(OFFSET_UNIT).offset_ok() && !f(i8::MAX).offset_ok());
+        assert_eq!((f(0).drawn(), f(-32).drawn(), f(i8::MIN).drawn()), (0.0, -0.5, -2.0));
     }
 
     #[test]

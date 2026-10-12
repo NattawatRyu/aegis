@@ -55,9 +55,11 @@ mod tests {
         let mut refused = 0;
         for seq in 1..=100 {
             match check(b.len(1)) {
-                Ok(()) => {
-                    b.push(1, ClientInput { seq, tick: 1, move_dir: Vec2::ZERO, aim: Vec2::ZERO, shoot: false }, 1)
-                }
+                Ok(()) => b.push(
+                    1,
+                    ClientInput { seq, tick: 1, offset: 0, move_dir: Vec2::ZERO, aim: Vec2::ZERO, shoot: false },
+                    1,
+                ),
                 Err(_) => refused += 1,
             }
         }

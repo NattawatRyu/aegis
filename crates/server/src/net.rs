@@ -406,7 +406,10 @@ mod tests {
     fn input(n: &NetServer, token: u64, seq: u32) -> Vec<u8> {
         let proof = n.server().tick_proof(1, seq);
         let (move_dir, aim) = (Vec2::new(1.0, 0.0), Vec2::new(1.0, 0.0));
-        frame(token, &ClientMsg::Input { seq, tick: seq, proof, move_dir, aim, shoot: false, older: Vec::new() })
+        frame(
+            token,
+            &ClientMsg::Input { seq, tick: seq, proof, move_dir, aim, shoot: false, offset: 0, older: Vec::new() },
+        )
     }
 
     fn read(c: &UdpSocket) -> ServerMsg {

@@ -43,7 +43,12 @@ jobs:
           test -s notes.md || { echo "no CHANGELOG entry for $version"; exit 1; }
           pre=""
           case "$version" in *-*) pre="--prerelease" ;; esac
-          gh release create "$GITHUB_REF_NAME" --draft $pre --title "Aegis $version" --notes-file notes.md
+          # A re-run (or a tag moved after a failed run) reuses the draft.
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --title "Aegis $version" --notes-file notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" --draft $pre --title "Aegis $version" --notes-file notes.md
+          fi
 
   build:
     needs: release
@@ -71,8 +76,9 @@ jobs:
           cargo build --release -p aegis-serve
       - name: package and upload
         run: |
-          archive=$(.github/scripts/package.sh ${{ matrix.platform }} | tail -n1)
-          gh release upload "$GITHUB_REF_NAME" "$archive" "$archive.sha256"
+          # Through bash: committed from Windows, the script has no exec bit.
+          archive=$(bash .github/scripts/package.sh ${{ matrix.platform }} | tail -n1)
+          gh release upload --clobber "$GITHUB_REF_NAME" "$archive" "$archive.sha256"
 
   publish:
     needs: build

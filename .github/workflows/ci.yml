@@ -1,8 +1,11 @@
 name: ci
 
 on:
+  # Branches only: a release tag runs this through release.yml instead.
   push:
+    branches: ['**']
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read

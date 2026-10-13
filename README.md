@@ -63,6 +63,50 @@ not by chasing individual cheats.
 > arenas — walkers, campers and rushers — with zero flagged.
 > Nothing here is production-ready.
 
+## Getting started
+
+**See it work (2 minutes).** Needs [rustup](https://rustup.rs); the toolchain
+is pinned in `rust-toolchain.toml` and installed on first build.
+
+```
+git clone https://github.com/NattawatRyu/aegis
+cd aegis
+cargo run --release -p aegis-serve -- --bots honest:3,aimbot --ticks 300
+```
+
+Three honest bots and an aimbot play for 10 seconds. The aimbot is flagged
+within about 3 seconds (`alert ... (aimbot) reason=aim_exact`), the honest
+bots never, and each player's tally is printed at the end.
+
+**Put it in your engine (C, C++, C#: Unity, Godot, Stride).** Download
+`aegis-<version>-<platform>` from
+[Releases](https://github.com/NattawatRyu/aegis/releases). It holds:
+
+| Path | What |
+|------|------|
+| `lib/` | the native library (`aegis_ffi.dll` + import lib, or `libaegis_ffi.so`), built with Noise |
+| `include/aegis.h` | the C header |
+| `examples/` | `engine.c` (the server's loop), `client.c`, `monitor.c`, `noise.c` |
+| `csharp/` | the C# binding source (`Aegis.csproj`, netstandard2.1); see its README |
+| `bin/` | `aegis-serve`, to test your client against |
+
+Built for Windows x64 and Linux x64. The Linux build needs the glibc of
+Ubuntu 24.04 or newer. Anywhere else (macOS, older Linux, ARM), build it:
+`cargo build --release -p aegis-ffi --features noise`. macOS is not
+tested.
+
+**Use it from Rust.** The crates are not on crates.io yet. Depend on a
+tag:
+
+```toml
+aegis-server = { git = "https://github.com/NattawatRyu/aegis", tag = "v0.1.0-alpha.1" }
+aegis-detector = { git = "https://github.com/NattawatRyu/aegis", tag = "v0.1.0-alpha.1" }
+```
+
+Before any real player joins, read [Known limits](#known-limits).
+Contributing: [CONTRIBUTING.md](CONTRIBUTING.md). What changed:
+[CHANGELOG.md](CHANGELOG.md).
+
 ## Why
 
 Most cheats and room-DDoS exist because the game trusts the player's machine or
@@ -220,9 +264,9 @@ most useful contribution there is.
 - **`--direct` is plaintext**: for debugging on your own machine only.
 - **macOS:** only 127.0.0.1 can be bound on loopback, so the harness and
   `aegis-serve`'s bots (one loopback IP each) do not run there.
-- **No stable versions.** Every crate is 0.0.0 and not on crates.io; the
-  wire protocol and the C ABI (`AEGIS_ABI_VERSION`, now 3) change when they
-  need to.
+- **No stable versions.** Every crate is 0.1.0-alpha.1 and not on
+  crates.io. The wire protocol and the C ABI (`AEGIS_ABI_VERSION`, now 4)
+  change when they need to. An alpha can break either one.
 
 Security issues: see [SECURITY.md](SECURITY.md). Please do not open a
 public issue for them.

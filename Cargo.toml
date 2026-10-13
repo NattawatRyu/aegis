@@ -3,6 +3,7 @@ resolver = "2"
 members = ["crates/protocol", "crates/server", "crates/telemetry", "crates/client-sdk", "crates/detector", "crates/harness", "crates/relay", "crates/ffi", "crates/serve"]
 
 [workspace.package]
+version = "0.1.0-alpha.1"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/NattawatRyu/aegis"

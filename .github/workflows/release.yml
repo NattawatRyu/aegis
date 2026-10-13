@@ -1,0 +1,86 @@
+name: release
+
+# Pushing a tag vX.Y.Z[-pre] whose version is the crates' runs the whole of
+# CI, then publishes a GitHub release with the native library, header,
+# examples, C# binding and aegis-serve for each platform. Notes come from
+# that version's CHANGELOG entry; a version with a "-" is a prerelease.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: ci
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: the tag is the crates' version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          test "$GITHUB_REF_NAME" = "v$version" || { echo "tag $GITHUB_REF_NAME, crates $version"; exit 1; }
+      - name: draft the release from the CHANGELOG entry
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          awk -v head="## [$version]" '
+            index($0, head) == 1 { on = 1; next }
+            on && /^## / { exit }
+            on && /^\[/ { next }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          test -s notes.md || { echo "no CHANGELOG entry for $version"; exit 1; }
+          pre=""
+          case "$version" in *-*) pre="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" --draft $pre --title "Aegis $version" --notes-file notes.md
+
+  build:
+    needs: release
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux-x64
+          - os: windows-latest
+            platform: windows-x64
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - name: build
+        run: |
+          cargo build --release -p aegis-ffi --features noise
+          cargo build --release -p aegis-serve
+      - name: package and upload
+        run: |
+          archive=$(.github/scripts/package.sh ${{ matrix.platform }} | tail -n1)
+          gh release upload "$GITHUB_REF_NAME" "$archive" "$archive.sha256"
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: publish the draft, every asset attached
+        run: gh release edit "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" --draft=false

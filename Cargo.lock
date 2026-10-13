@@ -14,21 +14,21 @@ dependencies = [
 
 [[package]]
 name = "aegis-client-sdk"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "aegis-protocol",
 ]
 
 [[package]]
 name = "aegis-detector"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "aegis-telemetry",
 ]
 
 [[package]]
 name = "aegis-ffi"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "aegis-client-sdk",
  "aegis-detector",
@@ -41,7 +41,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-harness"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "aegis-client-sdk",
  "aegis-detector",
@@ -53,7 +53,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-protocol"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "bincode",
  "chacha20poly1305",
@@ -67,14 +67,14 @@ dependencies = [
 
 [[package]]
 name = "aegis-relay"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "aegis-protocol",
 ]
 
 [[package]]
 name = "aegis-serve"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "aegis-client-sdk",
  "aegis-detector",
@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-server"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "aegis-protocol",
  "aegis-telemetry",
@@ -97,7 +97,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-telemetry"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "serde",
  "serde_json",

@@ -10,7 +10,8 @@ not by chasing individual cheats.
 > working code, the numbers below come from tests and measurements in this
 > repository, and CI runs them on
 > Linux, Windows and in a real Godot game. It has **not** run on a real
-> network with real players yet: read [Known limits](#known-limits) first.
+> network with real players, and this project does not plan to run it there:
+> read [Known limits](#known-limits) first.
 >
 > - **Pillar D (network):** an authoritative server behind a relay that
 >   hides its address, sealed traffic, stateless edge filtering, join
@@ -190,8 +191,9 @@ measured is listed here so nobody finds it the hard way. If you run Aegis
 on a real network, a `--log` jsonl or an issue about what you saw is the
 most useful contribution there is.
 
-- **Never run on a real network.** Jitter and loss have been simulated
-  in-process only. Untested: real paths, NATs, Wi-Fi, mobile networks.
+- **Never run on a real network, and no plan to.** Jitter and loss have been
+  simulated in-process only. Untested: real paths, NATs, Wi-Fi, mobile
+  networks. Testing on a real network is left to whoever deploys Aegis.
 - **A NAT that changes a client's port mid-game drops it.** The session
   token is bound to the client's address, so the relay drops everything from
   the new port. The client gets no more snapshots and must join again;

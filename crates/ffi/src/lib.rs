@@ -49,8 +49,9 @@ pub use evidence::{AegisEvidence, AegisSeesFn, AegisShotEvidence, AEGIS_ERR_BUSY
 pub mod noise;
 
 /// Bumped whenever a signature or a struct in `aegis.h` changes. 3: the
-/// client draws behind the newest snapshot and predicts itself (B5).
-pub const AEGIS_ABI_VERSION: u32 = 3;
+/// client draws behind the newest snapshot and predicts itself (B5). 4: an
+/// engine that draws on its own claims its moment (`aegis_client_input_at`).
+pub const AEGIS_ABI_VERSION: u32 = 4;
 
 pub const AEGIS_OK: i32 = 0;
 /// A required pointer was null.

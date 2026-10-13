@@ -25,7 +25,7 @@
 extern "C" {
 #endif
 
-#define AEGIS_ABI_VERSION 3u
+#define AEGIS_ABI_VERSION 4u
 
 #define AEGIS_OK 0
 #define AEGIS_ERR_NULL (-1)       /* a required pointer was null */
@@ -236,6 +236,13 @@ int32_t aegis_client_view_player(AegisClient *c, uint32_t i, AegisPlayer *out);
 int32_t aegis_client_input_drawn(AegisClient *c, float move_x, float move_y, float aim_x, float aim_y, bool shoot,
                                  uint8_t *buf, size_t cap);
 int32_t aegis_client_pace(AegisClient *c, AegisPace *out);
+/* An engine that interpolates on its own instead: like aegis_client_input,
+ * chosen on a frame drawn at the moment `at` (ticks). The claim and offset
+ * are worked out from the snapshots received, never the caller's. `at` not
+ * finite: AEGIS_ERR_ARG; past the newest snapshot or before the oldest of
+ * the last 16: AEGIS_ERR_UNKNOWN_TICK. */
+int32_t aegis_client_input_at(AegisClient *c, double at, float move_x, float move_y, float aim_x, float aim_y,
+                              bool shoot, uint8_t *buf, size_t cap);
 
 /* Predicting this player's own position (optional), exact against a server
  * that moves players with Aegis's movement (aegis-server) in the same

@@ -21,7 +21,9 @@
 //! A client that draws behind what it has received (B4) asks a
 //! [`Connection::view`] for each frame and claims its `claim` tick
 //! with [`Connection::input_drawn`]: the picture on screen — between
-//! snapshots, if it blends — is the one the shot is judged in.
+//! snapshots, if it blends — is the one the shot is judged in. An engine
+//! that blends on its own says only the moment it drew
+//! ([`Connection::input_at`]); the claim is still worked out here.
 //!
 //! Through a relay every datagram is sealed under the [`ClientKeys`] the
 //! game's backend issued; directly to an origin, nothing is.
@@ -31,7 +33,7 @@ use crate::predict::{PredictStats, Predictor};
 use aegis_protocol::movement::Wall;
 use aegis_protocol::{
     decode, frame, open_down, seal_up, ClientKeys, ClientMsg, EdgeError, EventKind, InputFrame, PlayerId, PlayerState,
-    ServerMsg, Vec2, MAX_OLDER, NO_TOKEN, PROTOCOL_VERSION,
+    ServerMsg, Vec2, MAX_OLDER, NO_TOKEN, OFFSET_UNIT, PROTOCOL_VERSION,
 };
 
 /// Snapshots whose proofs are kept: as many as the server judges against
@@ -191,6 +193,39 @@ impl Connection {
         self.send(Some(view.claim), view.offset, move_dir, aim, shoot)
     }
 
+    /// An input chosen on a frame the engine drew on its own, at the moment
+    /// `at` in ticks (fractional between snapshots): for an engine that
+    /// interpolates itself instead of asking [`Connection::view`]. Claim and
+    /// offset are worked out here from the proofs held, never taken from the
+    /// caller — the first snapshot received at or after `at` (or the tick
+    /// claimed before, if newer), and how long before it `at` sat, clamped
+    /// to two ticks. The same moment sends what [`Connection::input_drawn`]
+    /// sends for an [`Interpolator`] frame drawn there. Refused as
+    /// [`ConnError::UnknownTick`] when `at` is not finite, past the newest
+    /// snapshot (extrapolated: no snapshot proves it) or before the oldest
+    /// proof kept.
+    pub fn input_at(&mut self, at: f64, move_dir: Vec2, aim: Vec2, shoot: bool) -> Result<Vec<u8>, ConnError> {
+        self.joined.ok_or(ConnError::NotJoined)?;
+        let newest = self.newest.ok_or(ConnError::UnknownTick)?;
+        let kept = |t: u32| t + PROOFS as u32 > newest;
+        let after = self
+            .proofs
+            .iter()
+            .flatten()
+            .map(|&(t, _)| t)
+            .filter(|&t| kept(t) && f64::from(t) >= at)
+            .min()
+            .ok_or(ConnError::UnknownTick)?;
+        let oldest = self.proofs.iter().flatten().map(|&(t, _)| t).filter(|&t| kept(t)).min();
+        if !at.is_finite() || oldest.is_none_or(|o| at < f64::from(o)) {
+            return Err(ConnError::UnknownTick);
+        }
+        let claim = self.claimed.map_or(after, |c| c.max(after));
+        let back = (at - f64::from(claim)) * f64::from(OFFSET_UNIT);
+        let offset = back.round().clamp(f64::from(i8::MIN), 0.0) as i8;
+        self.send(Some(claim), offset, move_dir, aim, shoot)
+    }
+
     fn send(
         &mut self,
         tick: Option<u32>,
@@ -241,7 +276,12 @@ impl Connection {
                 Received::Challenge
             }
             ServerMsg::Snapshot { tick, proof, ack, players } => {
-                self.proofs[tick as usize % PROOFS] = Some((tick, proof));
+                // A snapshot PROOFS or more ticks late would evict a newer
+                // one's proof from the slot they share.
+                let slot = &mut self.proofs[tick as usize % PROOFS];
+                if slot.is_none_or(|(t, _)| t < tick) {
+                    *slot = Some((tick, proof));
+                }
                 // An older snapshot's ack is older too: never go back.
                 self.ack = self.ack.max(ack);
                 let acked = self.ack;
@@ -341,6 +381,21 @@ mod tests {
         ));
     }
 
+    /// A snapshot landing more than PROOFS ticks late shares its slot with
+    /// a newer one: it must not evict the newer proof.
+    #[test]
+    fn a_very_late_snapshot_does_not_evict_a_newer_proof() {
+        let mut c = Connection::new("riw", None);
+        c.receive(&mut encode(&ServerMsg::Joined { player_id: 1, token: 9, tick: 0 })).unwrap();
+        c.receive(&mut snap(20)).unwrap();
+        c.receive(&mut snap(20 - PROOFS as u32)).unwrap();
+        assert!(matches!(
+            input_of(&c.input(Some(20), Vec2::ZERO, Vec2::ZERO, false).unwrap()).1,
+            ClientMsg::Input { tick: 20, proof: 141, .. }
+        ));
+        assert_eq!(c.input(Some(4), Vec2::ZERO, Vec2::ZERO, false), Err(ConnError::UnknownTick), "too old to claim");
+    }
+
     fn seqs(wire: &[u8]) -> Vec<u32> {
         input_of(wire).1.frames().iter().map(|f| f.seq).collect()
     }
@@ -414,6 +469,89 @@ mod tests {
         let v = c.view(0.5).unwrap();
         let (_, m) = input_of(&c.input_drawn(&v, Vec2::ZERO, Vec2::ZERO, true).unwrap());
         assert!(matches!(m, ClientMsg::Input { tick: 3, proof: 22, offset: -29, .. }), "{m:?}");
+    }
+
+    /// The oracle for `input_at`: a client drawing with its own Interpolator
+    /// and one told only the moment drawn send the same bytes, frame after
+    /// frame, with snapshots lost, reordered and landing late.
+    #[test]
+    fn an_input_at_the_moment_drawn_is_the_interpolators_to_the_byte() {
+        let mut lcg = 0x2545_f491_u32;
+        let mut rand = move |n: u32| {
+            lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (lcg >> 8) % n
+        };
+        let mut frames = 0;
+        let mut offsets = Vec::new();
+        for delay in [0.0, 1.0, 2.5, 6.0] {
+            let joined = encode(&ServerMsg::Joined { player_id: 1, token: 9, tick: 0 });
+            let (mut drawn, mut told) = (Connection::new("a", None), Connection::new("b", None));
+            drawn.interpolate(delay);
+            drawn.receive(&mut joined.clone()).unwrap();
+            told.receive(&mut joined.clone()).unwrap();
+            let mut late = Vec::new();
+            for t in 1..=200u32 {
+                let mut landing = Vec::new();
+                match rand(10) {
+                    0 => {}                                    // lost
+                    1 | 2 => late.push((t + 1 + rand(20), t)), // late, maybe past PROOFS
+                    _ => landing.push(t),
+                }
+                late.retain(|&(due, s)| {
+                    let now = due <= t;
+                    if now {
+                        landing.push(s);
+                    }
+                    !now
+                });
+                for s in landing {
+                    drawn.receive(&mut snap(s)).unwrap();
+                    told.receive(&mut snap(s)).unwrap();
+                }
+                let dt = [1.0, 0.5, 0.25, 1.7, 0.0][rand(5) as usize];
+                let Some(v) = drawn.view(dt) else { continue };
+                let shoot = rand(2) == 0;
+                let want = drawn.input_drawn(&v, Vec2::new(1.0, 0.5), Vec2::new(0.0, 1.0), shoot);
+                let got = told.input_at(v.at, Vec2::new(1.0, 0.5), Vec2::new(0.0, 1.0), shoot);
+                assert_eq!(got, want, "delay {delay} tick {t} at {}", v.at);
+                frames += 1;
+                offsets.push(v.offset);
+            }
+        }
+        assert!(frames > 700, "{frames}");
+        assert!(offsets.iter().any(|&o| o < 0) && offsets.contains(&0), "blended and whole frames both ran");
+        assert!(offsets.contains(&i8::MIN), "some bridged a hole wider than two ticks");
+    }
+
+    /// `input_at` at its edges: who may send, which moments a proof covers,
+    /// and an offset that only ever looks back, at most two ticks.
+    #[test]
+    fn an_input_at_claims_only_what_a_proof_covers() {
+        let send = |c: &mut Connection, at: f64| c.input_at(at, Vec2::ZERO, Vec2::ZERO, true).map(|w| input_of(&w).1);
+        let claim = |m: ClientMsg| match m {
+            ClientMsg::Input { tick, offset, .. } => (tick, offset),
+            m => panic!("{m:?}"),
+        };
+        let mut c = Connection::new("riw", None);
+        c.receive(&mut snap(3)).unwrap();
+        assert_eq!(send(&mut c, 3.0), Err(ConnError::NotJoined));
+        let mut c = Connection::new("riw", None);
+        c.receive(&mut encode(&ServerMsg::Joined { player_id: 1, token: 9, tick: 0 })).unwrap();
+        assert_eq!(send(&mut c, 0.0), Err(ConnError::UnknownTick), "no snapshot yet");
+        for t in [10, 11, 15, 30] {
+            c.receive(&mut snap(t)).unwrap();
+        }
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 30.001, 14.999] {
+            assert_eq!(send(&mut c, bad), Err(ConnError::UnknownTick), "{bad}: 15 is the oldest kept, 30 the newest");
+        }
+        assert_eq!(claim(send(&mut c, 15.0).unwrap()), (15, 0), "the oldest kept, whole");
+        assert_eq!(claim(send(&mut c, 29.5).unwrap()), (30, -32), "half a tick before the next");
+        assert_eq!(claim(send(&mut c, 16.0).unwrap()), (30, i8::MIN), "never back: claim kept, offset clamped");
+        assert_eq!(claim(send(&mut c, 30.0).unwrap()), (30, 0), "the newest, whole");
+        c.receive(&mut snap(31)).unwrap();
+        c.receive(&mut snap(33)).unwrap();
+        assert_eq!(claim(send(&mut c, 31.25).unwrap()), (33, -112), "a hole bridged: 1.75 ticks back");
+        assert_eq!(claim(send(&mut c, 31.0).unwrap()), (33, i8::MIN), "2 back is the most");
     }
 
     #[test]

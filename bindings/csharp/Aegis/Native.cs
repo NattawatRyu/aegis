@@ -112,6 +112,10 @@ namespace Aegis
             float aimX, float aimY, [MarshalAs(UnmanagedType.U1)] bool shoot, byte[] buf, UIntPtr cap);
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int aegis_client_input_at(ClientHandle c, double at, float moveX, float moveY,
+            float aimX, float aimY, [MarshalAs(UnmanagedType.U1)] bool shoot, byte[] buf, UIntPtr cap);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int aegis_client_pace(ClientHandle c, out Pace p);
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]

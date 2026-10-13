@@ -11,7 +11,7 @@ namespace Aegis
     /// </summary>
     public sealed class AegisMonitor : IDisposable
     {
-        public const uint AbiVersion = 3;
+        public const uint AbiVersion = 4;
 
         private readonly MonitorHandle _h;
 

@@ -128,7 +128,9 @@ it to the online detector (`aegis_monitor_*`), whose every line is the
 game's to set (`AegisConfig`, `aegis_config_at_tick_rate`). Its clients
 speak to the relay through `aegis_client_*`, and may draw behind the
 newest snapshot (`aegis_client_view`, inputs claiming the frame drawn with
-`aegis_client_input_drawn`) and predict themselves (`aegis_client_predict`). `examples/engine.c` is the
+`aegis_client_input_drawn`, or `aegis_client_input_at` for an engine
+that interpolates on its own) and predict themselves
+(`aegis_client_predict`). `examples/engine.c` is the
 whole loop in one file; a test builds every example with the platform's C
 compiler and checks the header against the library. From C# (Unity, Godot,
 Stride, any .NET): `bindings/csharp`, a netstandard2.1 wrapper over the

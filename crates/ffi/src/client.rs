@@ -413,6 +413,40 @@ pub extern "C" fn aegis_client_input_drawn(
     })
 }
 
+/// Write an input chosen on a frame the engine drew on its own, at the
+/// moment `at` in ticks (fractional between snapshots), into `buf`: for an
+/// engine that interpolates itself. The claim and its offset are worked out
+/// from the snapshots received — the first at or after `at` — never taken
+/// from the caller. Its length, or a negative status: AEGIS_ERR_ARG if `at`
+/// is not finite, AEGIS_ERR_UNKNOWN_TICK if no snapshot kept covers it
+/// (past the newest, or before the oldest of the last 16).
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn aegis_client_input_at(
+    c: *mut AegisClient,
+    at: f64,
+    move_x: f32,
+    move_y: f32,
+    aim_x: f32,
+    aim_y: f32,
+    shoot: bool,
+    buf: *mut u8,
+    cap: usize,
+) -> i32 {
+    if buf.is_null() {
+        return AEGIS_ERR_NULL;
+    }
+    with_client(c, |c| {
+        if !at.is_finite() {
+            return AEGIS_ERR_ARG;
+        }
+        match c.conn.input_at(at, Vec2::new(move_x, move_y), Vec2::new(aim_x, aim_y), shoot) {
+            Ok(d) => emit(&d, buf, cap),
+            Err(e) => status(e),
+        }
+    })
+}
+
 /// How steadily the frames drawn so far advanced; AEGIS_ERR_NOT_READY
 /// unless interpolating.
 #[no_mangle]
@@ -697,6 +731,50 @@ mod tests {
         aegis_client_free(c);
     }
 
+    /// A C client told only the moment drawn sends what the Rust client
+    /// drawing with its own Interpolator sends; a moment no snapshot covers
+    /// is refused and counts nothing.
+    #[test]
+    fn an_input_at_is_the_interpolating_rust_clients_to_the_byte() {
+        let c = client(b"riw\0", None).unwrap();
+        let mut rust = Connection::new("riw", None);
+        rust.interpolate(1.5);
+        let mut buf = [0u8; AEGIS_SEND_MAX];
+        let at =
+            |c, at, buf: &mut [u8]| aegis_client_input_at(c, at, 1.0, 0.5, 0.0, 1.0, true, buf.as_mut_ptr(), buf.len());
+        assert_eq!(at(c, 1.0, &mut buf), AEGIS_ERR_NOT_JOINED);
+        let both = |rust: &mut Connection, m: &ServerMsg| {
+            assert_eq!(recv(c, m), AEGIS_OK);
+            rust.receive(&mut encode(m)).unwrap();
+        };
+        both(&mut rust, &ServerMsg::Joined { player_id: 4, token: 7, tick: 1 });
+        assert_eq!(at(c, 1.0, &mut buf), AEGIS_ERR_UNKNOWN_TICK, "no snapshot yet");
+        let mut offsets = Vec::new();
+        for t in 2..20 {
+            if t % 5 != 0 {
+                both(&mut rust, &snap(t)); // every fifth lost
+            }
+            for dt in [0.3, 0.7] {
+                let r = rust.view(dt).unwrap();
+                let want = rust.input_drawn(&r, Vec2::new(1.0, 0.5), Vec2::new(0.0, 1.0), true).unwrap();
+                let n = at(c, r.at, &mut buf);
+                assert_eq!(&buf[..n as usize], &want[..], "tick {t} at {}", r.at);
+                offsets.push(r.offset);
+            }
+        }
+        assert!(offsets.iter().any(|&o| o < 0), "some frames sat between snapshots: {offsets:?}");
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(at(c, bad, &mut buf), AEGIS_ERR_ARG, "{bad}");
+        }
+        assert_eq!(at(c, 19.01, &mut buf), AEGIS_ERR_UNKNOWN_TICK, "past the newest");
+        assert_eq!(at(c, 3.0, &mut buf), AEGIS_ERR_UNKNOWN_TICK, "older than the last 16");
+        // Refusals counted nothing: the next input is the Rust client's next.
+        let want = rust.input_at(19.0, Vec2::new(1.0, 0.5), Vec2::new(0.0, 1.0), true).unwrap();
+        let n = at(c, 19.0, &mut buf);
+        assert_eq!(&buf[..n as usize], &want[..]);
+        aegis_client_free(c);
+    }
+
     /// Every pointer every call takes, null: AEGIS_ERR_NULL, nothing read
     /// or written, and the client still works after.
     #[test]
@@ -730,12 +808,13 @@ mod tests {
             aegis_client_view(nc, 1.0, &mut v),
             aegis_client_view_player(nc, 0, &mut p),
             aegis_client_input_drawn(nc, 0.0, 0.0, 1.0, 0.0, false, b, n),
+            aegis_client_input_at(nc, 1.0, 0.0, 0.0, 1.0, 0.0, false, b, n),
             aegis_client_pace(nc, &mut pace),
             aegis_client_predict(nc, &w, 1),
             aegis_client_predicted(nc, &mut x, &mut y),
             aegis_client_prediction_stats(nc, &mut st),
         ];
-        assert_eq!(null_client, [AEGIS_ERR_NULL; 14]);
+        assert_eq!(null_client, [AEGIS_ERR_NULL; 15]);
 
         let c = client(b"riw\0", None).unwrap();
         assert_eq!(aegis_client_interpolate(c, 1.0), AEGIS_OK);
@@ -749,12 +828,13 @@ mod tests {
             aegis_client_view(c, 1.0, null_mut()),
             aegis_client_view_player(c, 0, null_mut()),
             aegis_client_input_drawn(c, 0.0, 0.0, 1.0, 0.0, false, null_mut(), n),
+            aegis_client_input_at(c, 1.0, 0.0, 0.0, 1.0, 0.0, false, null_mut(), n),
             aegis_client_pace(c, null_mut()),
             aegis_client_predicted(c, null_mut(), &mut y),
             aegis_client_predicted(c, &mut x, null_mut()),
             aegis_client_prediction_stats(c, null_mut()),
         ];
-        assert_eq!(null_arg, [AEGIS_ERR_NULL; 12]);
+        assert_eq!(null_arg, [AEGIS_ERR_NULL; 13]);
         assert!(aegis_client_join(c, b, n) > 0, "still works");
         aegis_client_free(c);
     }

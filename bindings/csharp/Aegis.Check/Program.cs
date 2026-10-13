@@ -275,6 +275,9 @@ static class Program
         Expect(c.TryPredicted(out float px, out float py) && px == 9 && py == 0, $"one step east of 4: {px} {py}");
         Expect(c.Pace.Frames == 1, "one frame judged");
         Expect(c.PredictionStats.Checked == 0, "nothing acked yet");
+        Expect(c.InputAt(v.At, 1, 0, 1, 0, true, buf) > 0, "an input at the moment drawn");
+        Expect(Throws(() => c.InputAt(double.NaN, 1, 0, 1, 0, true, buf)) == Status.Arg, "a NaN moment");
+        Expect(Throws(() => c.InputAt(4.5, 1, 0, 1, 0, true, buf)) == Status.UnknownTick, "past the newest");
     }
 
     // ---- a callback calling back in; a callback that throws ----

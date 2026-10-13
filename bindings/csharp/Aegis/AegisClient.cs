@@ -116,6 +116,15 @@ namespace Aegis
         public int InputDrawn(float moveX, float moveY, float aimX, float aimY, bool shoot, byte[] buf) =>
             AegisException.Check(Native.aegis_client_input_drawn(_h, moveX, moveY, aimX, aimY, shoot, buf, Cap(buf)));
 
+        /// <summary>
+        /// For an engine that interpolates on its own: writes an input chosen
+        /// on a frame drawn at the moment at (ticks) into buf; returns its
+        /// length. The claim and offset are worked out from the snapshots
+        /// received, never the caller's.
+        /// </summary>
+        public int InputAt(double at, float moveX, float moveY, float aimX, float aimY, bool shoot, byte[] buf) =>
+            AegisException.Check(Native.aegis_client_input_at(_h, at, moveX, moveY, aimX, aimY, shoot, buf, Cap(buf)));
+
         /// <summary>How steadily the frames drawn so far advanced; throws unless interpolating.</summary>
         public Pace Pace
         {

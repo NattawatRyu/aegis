@@ -46,6 +46,12 @@ if (client.TryView(dtTicks, out var view))
 the server judges the shot in the picture on screen; the offset is the
 frame's own, never the caller's.
 
+An engine that interpolates on its own passes only the moment it drew, in
+ticks: `client.InputAt(at, moveX, moveY, aimX, aimY, shoot, buf)`. The
+claim and offset are still worked out from the snapshots received — the
+same bytes `InputDrawn` sends for a frame drawn at that moment. A moment
+past the newest snapshot (extrapolated) throws `UnknownTick`.
+
 The `seen` tick must be proven: a MAC'd per-snapshot proof the client
 echoes, at most 16 ticks old, never going back. Otherwise a client picks the
 picture it is judged in.

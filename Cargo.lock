@@ -13,46 +13,46 @@ dependencies = [
 ]
 
 [[package]]
-name = "aegis-client-sdk"
+name = "aegis-harness"
 version = "0.1.0-alpha.1"
 dependencies = [
- "aegis-protocol",
+ "aegis-netguard-client-sdk",
+ "aegis-netguard-detector",
+ "aegis-netguard-protocol",
+ "aegis-netguard-relay",
+ "aegis-netguard-server",
+ "aegis-netguard-telemetry",
 ]
 
 [[package]]
-name = "aegis-detector"
+name = "aegis-netguard-client-sdk"
 version = "0.1.0-alpha.1"
 dependencies = [
- "aegis-telemetry",
+ "aegis-netguard-protocol",
 ]
 
 [[package]]
-name = "aegis-ffi"
+name = "aegis-netguard-detector"
 version = "0.1.0-alpha.1"
 dependencies = [
- "aegis-client-sdk",
- "aegis-detector",
- "aegis-protocol",
- "aegis-relay",
- "aegis-server",
- "aegis-telemetry",
+ "aegis-netguard-telemetry",
+]
+
+[[package]]
+name = "aegis-netguard-ffi"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "aegis-netguard-client-sdk",
+ "aegis-netguard-detector",
+ "aegis-netguard-protocol",
+ "aegis-netguard-relay",
+ "aegis-netguard-server",
+ "aegis-netguard-telemetry",
  "cc",
 ]
 
 [[package]]
-name = "aegis-harness"
-version = "0.1.0-alpha.1"
-dependencies = [
- "aegis-client-sdk",
- "aegis-detector",
- "aegis-protocol",
- "aegis-relay",
- "aegis-server",
- "aegis-telemetry",
-]
-
-[[package]]
-name = "aegis-protocol"
+name = "aegis-netguard-protocol"
 version = "0.1.0-alpha.1"
 dependencies = [
  "bincode",
@@ -66,37 +66,37 @@ dependencies = [
 ]
 
 [[package]]
-name = "aegis-relay"
+name = "aegis-netguard-relay"
 version = "0.1.0-alpha.1"
 dependencies = [
- "aegis-protocol",
+ "aegis-netguard-protocol",
 ]
 
 [[package]]
-name = "aegis-serve"
+name = "aegis-netguard-serve"
 version = "0.1.0-alpha.1"
 dependencies = [
- "aegis-client-sdk",
- "aegis-detector",
- "aegis-protocol",
- "aegis-relay",
- "aegis-server",
- "aegis-telemetry",
+ "aegis-netguard-client-sdk",
+ "aegis-netguard-detector",
+ "aegis-netguard-protocol",
+ "aegis-netguard-relay",
+ "aegis-netguard-server",
+ "aegis-netguard-telemetry",
  "serde_json",
 ]
 
 [[package]]
-name = "aegis-server"
+name = "aegis-netguard-server"
 version = "0.1.0-alpha.1"
 dependencies = [
- "aegis-protocol",
- "aegis-telemetry",
+ "aegis-netguard-protocol",
+ "aegis-netguard-telemetry",
  "getrandom 0.3.4",
  "siphasher",
 ]
 
 [[package]]
-name = "aegis-telemetry"
+name = "aegis-netguard-telemetry"
 version = "0.1.0-alpha.1"
 dependencies = [
  "serde",

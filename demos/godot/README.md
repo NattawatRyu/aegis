@@ -19,7 +19,7 @@ Free-for-all in a walled arena:
 A flagged player gets a red ring.
 
 ```
-cargo build -p aegis-ffi --release
+cargo build -p aegis-netguard-ffi --release
 mkdir demos/godot/native && cp target/release/aegis_ffi.dll demos/godot/native/   # .so / .dylib elsewhere
 # open demos/godot in the Godot .NET editor, Build, Play
 ```

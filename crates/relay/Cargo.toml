@@ -1,13 +1,16 @@
 [package]
-name = "aegis-relay"
+name = "aegis-netguard-relay"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Aegis relay: the only address clients ever see. Forwards to an origin whose address stays private."
 
+[lib]
+name = "aegis_relay"
+
 [dependencies]
-aegis-protocol = { path = "../protocol" }
+aegis-protocol.workspace = true
 
 [features]
 # Opt-in: answer Noise NK hellos and hand out sessions without a backend.

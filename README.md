@@ -71,7 +71,7 @@ is pinned in `rust-toolchain.toml` and installed on first build.
 ```
 git clone https://github.com/NattawatRyu/aegis
 cd aegis
-cargo run --release -p aegis-serve -- --bots honest:3,aimbot --ticks 300
+cargo run --release -p aegis-netguard-serve -- --bots honest:3,aimbot --ticks 300
 ```
 
 Three honest bots and an aimbot play for 10 seconds. The aimbot is flagged
@@ -92,16 +92,20 @@ bots never, and each player's tally is printed at the end.
 
 Built for Windows x64 and Linux x64. The Linux build needs the glibc of
 Ubuntu 24.04 or newer. Anywhere else (macOS, older Linux, ARM), build it:
-`cargo build --release -p aegis-ffi --features noise`. macOS is not
+`cargo build --release -p aegis-netguard-ffi --features noise`. macOS is not
 tested.
 
-**Use it from Rust.** The crates are not on crates.io yet. Depend on a
-tag:
+**Use it from Rust.** The crates are on crates.io under the
+`aegis-netguard-` prefix. Rename them back on import and the code reads
+`use aegis_server`, as in every example here:
 
 ```toml
-aegis-server = { git = "https://github.com/NattawatRyu/aegis", tag = "v0.1.0-alpha.1" }
-aegis-detector = { git = "https://github.com/NattawatRyu/aegis", tag = "v0.1.0-alpha.1" }
+aegis-server = { package = "aegis-netguard-server", version = "0.1.0-alpha.1" }
+aegis-detector = { package = "aegis-netguard-detector", version = "0.1.0-alpha.1" }
 ```
+
+The live server installs with `cargo install aegis-netguard-serve`
+(binary: `aegis-serve`).
 
 Before any real player joins, read [Known limits](#known-limits).
 Contributing: [CONTRIBUTING.md](CONTRIBUTING.md). What changed:
@@ -198,7 +202,7 @@ cookie round trip. A C client does the handshake with `aegis_noise_*`
 Run a live game a client can join:
 
 ```
-cargo run --release -p aegis-serve -- --bots honest:3,aimbot --key-out relay.key
+cargo run --release -p aegis-netguard-serve -- --bots honest:3,aimbot --key-out relay.key
 ```
 
 It prints the relay's address and public key and writes the key to

@@ -1,10 +1,13 @@
 [package]
-name = "aegis-protocol"
+name = "aegis-netguard-protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Aegis wire protocol — the intent-only contract every crate depends on."
+
+[lib]
+name = "aegis_protocol"
 
 [dependencies]
 serde.workspace = true

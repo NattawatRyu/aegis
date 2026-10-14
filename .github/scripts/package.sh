@@ -2,8 +2,8 @@
 # Packs a release build into dist/aegis-<version>-<platform>.{tar.gz,zip}
 # plus a .sha256, in the layout the README's "Getting started" describes.
 # Run from the repository root, after:
-#   cargo build --release -p aegis-ffi --features noise
-#   cargo build --release -p aegis-serve
+#   cargo build --release -p aegis-netguard-ffi --features noise
+#   cargo build --release -p aegis-netguard-serve
 # Usage: .github/scripts/package.sh linux-x64|windows-x64
 set -euo pipefail
 

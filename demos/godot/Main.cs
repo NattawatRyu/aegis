@@ -136,7 +136,7 @@ public partial class Main : Node2D
         }
         catch (DllNotFoundException)
         {
-            _hud.Text = "aegis_ffi not found: cargo build -p aegis-ffi --release, copy it to demos/godot/native/";
+            _hud.Text = "aegis_ffi not found: cargo build -p aegis-netguard-ffi --release, copy it to demos/godot/native/";
             GD.PushError(_hud.Text);
             SetPhysicsProcess(false);
             if (_stopAt > 0) GetTree().Quit(2);

@@ -4,8 +4,8 @@ A thin wrapper over the C ABI (`crates/ffi/include/aegis.h`), targeting
 netstandard2.1: Unity 2021.2+, Godot 4 (C#), Stride, and any .NET 5+.
 
 ```
-cargo build -p aegis-ffi --release                  # aegis_ffi.dll / libaegis_ffi.so / .dylib
-cargo build -p aegis-ffi --release --features noise # also NoiseHandshake
+cargo build -p aegis-netguard-ffi --release                  # aegis_ffi.dll / libaegis_ffi.so / .dylib
+cargo build -p aegis-netguard-ffi --release --features noise # also NoiseHandshake
 ```
 
 Put the native library next to the game's executable, or in Unity under

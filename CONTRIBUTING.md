@@ -15,7 +15,7 @@ Install [rustup](https://rustup.rs). The toolchain is pinned in
 
 ```
 cargo test --workspace                                        # everything; Noise on (aegis-serve unifies features)
-cargo test -p aegis-protocol -p aegis-relay -p aegis-ffi      # Noise off
+cargo test -p aegis-netguard-protocol -p aegis-netguard-relay -p aegis-netguard-ffi      # Noise off
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 ```

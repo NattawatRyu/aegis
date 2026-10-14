@@ -3,7 +3,7 @@
  * that fires 0 ticks after every enemy appears, and prints the alerts.
  *
  * Build (Linux), from the workspace root:
- *   cargo build -p aegis-ffi
+ *   cargo build -p aegis-netguard-ffi
  *   cc crates/ffi/examples/monitor.c -Icrates/ffi/include -Ltarget/debug -laegis_ffi -o monitor
  *   LD_LIBRARY_PATH=target/debug ./monitor
  *

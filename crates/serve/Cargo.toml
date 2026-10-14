@@ -1,16 +1,24 @@
 [package]
-name = "aegis-serve"
+name = "aegis-netguard-serve"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Aegis as a running game server: the authoritative server at 30 Hz behind a relay that hands out sessions over Noise, with the detector watching live."
 
+[lib]
+name = "aegis_serve"
+
+# `cargo install aegis-netguard-serve` still installs `aegis-serve`.
+[[bin]]
+name = "aegis-serve"
+path = "src/main.rs"
+
 [dependencies]
-aegis-protocol = { path = "../protocol", features = ["noise"] }
-aegis-server = { path = "../server" }
-aegis-telemetry = { path = "../telemetry" }
-aegis-detector = { path = "../detector" }
-aegis-client-sdk = { path = "../client-sdk" }
-aegis-relay = { path = "../relay", features = ["noise"] }
+aegis-protocol = { workspace = true, features = ["noise"] }
+aegis-server.workspace = true
+aegis-telemetry.workspace = true
+aegis-detector.workspace = true
+aegis-client-sdk.workspace = true
+aegis-relay = { workspace = true, features = ["noise"] }
 serde_json.workspace = true

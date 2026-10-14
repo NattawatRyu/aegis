@@ -1,10 +1,13 @@
 [package]
-name = "aegis-detector"
+name = "aegis-netguard-detector"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Aegis anomaly detector (pillar C): reads the telemetry stream and flags players whose behaviour no honest player produces."
 
+[lib]
+name = "aegis_detector"
+
 [dependencies]
-aegis-telemetry = { path = "../telemetry" }
+aegis-telemetry.workspace = true

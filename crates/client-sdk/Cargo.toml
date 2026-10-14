@@ -1,10 +1,13 @@
 [package]
-name = "aegis-client-sdk"
+name = "aegis-netguard-client-sdk"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Aegis programmable bots — one honest driver plus one cheat per file — for exercising the server's defenses against yourself."
 
+[lib]
+name = "aegis_client_sdk"
+
 [dependencies]
-aegis-protocol = { path = "../protocol" }
+aegis-protocol.workspace = true

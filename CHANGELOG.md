@@ -5,6 +5,14 @@ alpha can break the wire protocol or the C ABI; each entry says which ABI it
 ships. A test (`crates/ffi/tests/docs.rs`) fails if the entry for the
 current crate version is missing or names another ABI.
 
+## [Unreleased]
+
+- The crates are on crates.io as `aegis-netguard-*` (`aegis-server` and
+  `aegis-protocol` were taken there). Library names are unchanged
+  (`use aegis_server`), and so is the `aegis-serve` binary. In this
+  repository, `cargo -p` now takes the new names; `aegis-harness` is not
+  published.
+
 ## [0.1.0-alpha.1] - 2026-10-13
 
 The first release: usable to try, not to ship. Read the README's

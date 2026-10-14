@@ -54,7 +54,7 @@ jobs:
         run: |
           cargo clippy --workspace --all-targets -- -D warnings
           cargo clippy --workspace --all-targets --all-features -- -D warnings
-          cargo clippy -p aegis-protocol -p aegis-relay -p aegis-ffi --all-targets -- -D warnings
+          cargo clippy -p aegis-netguard-protocol -p aegis-netguard-relay -p aegis-netguard-ffi --all-targets -- -D warnings
       - name: test
         # Includes the network oracles: the UDP and relay runs must write
         # telemetry byte-identical to the in-process run. And aegis-ffi's C
@@ -62,10 +62,10 @@ jobs:
         run: cargo test --workspace
       - name: test, Noise off and opt-in Noise
         run: |
-          cargo test -p aegis-protocol -p aegis-relay -p aegis-ffi
-          cargo test -p aegis-protocol --features noise
-          cargo test -p aegis-relay --features noise
-          cargo test -p aegis-ffi --features noise
+          cargo test -p aegis-netguard-protocol -p aegis-netguard-relay -p aegis-netguard-ffi
+          cargo test -p aegis-netguard-protocol --features noise
+          cargo test -p aegis-netguard-relay --features noise
+          cargo test -p aegis-netguard-ffi --features noise
       - name: harness, three transports
         run: |
           cargo run -q -p aegis-harness
@@ -101,4 +101,4 @@ jobs:
           test -n "$exe" && chmod +x "$exe"
           echo "AEGIS_GODOT=$exe" >> "$GITHUB_ENV"
       - name: the Godot demo
-        run: cargo test -p aegis-ffi --test godot -- --nocapture
+        run: cargo test -p aegis-netguard-ffi --test godot -- --nocapture

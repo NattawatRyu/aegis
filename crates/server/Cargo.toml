@@ -1,13 +1,16 @@
 [package]
-name = "aegis-server"
+name = "aegis-netguard-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Aegis authoritative game server: the sim owns the truth; guards reject client-trust cheats at the edge."
 
+[lib]
+name = "aegis_server"
+
 [dependencies]
-aegis-protocol = { path = "../protocol" }
-aegis-telemetry = { path = "../telemetry" }
+aegis-protocol.workspace = true
+aegis-telemetry.workspace = true
 getrandom = "0.3"
 siphasher = "1"

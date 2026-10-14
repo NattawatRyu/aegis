@@ -32,6 +32,19 @@ fn the_changelog_has_an_entry_for_this_version_and_abi() {
 }
 
 #[test]
+fn every_workspace_dependency_asks_for_this_version() {
+    // A path dependency's `version` is what crates.io resolves; left behind
+    // on a bump, a published crate would pull its siblings' older release.
+    let manifest = doc("Cargo.toml");
+    let want = format!("version = \"{}\" }}", env!("CARGO_PKG_VERSION"));
+    let deps: Vec<&str> = manifest.lines().filter(|l| l.contains("package = \"aegis-netguard-")).collect();
+    assert_eq!(deps.len(), 6, "expected six aegis-netguard-* workspace dependencies");
+    for line in deps {
+        assert!(line.ends_with(&want), "Cargo.toml: {line} must end with {want}");
+    }
+}
+
+#[test]
 fn the_header_and_the_csharp_binding_name_the_same_abi_version() {
     let h = doc("crates/ffi/include/aegis.h");
     assert!(h.contains(&format!("#define AEGIS_ABI_VERSION {AEGIS_ABI_VERSION}u")), "aegis.h");

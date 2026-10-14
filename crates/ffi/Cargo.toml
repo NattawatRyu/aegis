@@ -27,3 +27,7 @@ noise = ["aegis-protocol/noise", "aegis-relay/noise"]
 # builds and runs the C example against the real library.
 cc = "1"
 aegis-relay.workspace = true
+
+[package.metadata.docs.rs]
+# Document the opt-in `noise` API too.
+all-features = true

@@ -296,7 +296,7 @@ impl NetServer {
 
     /// Wait up to `wait` for one datagram and feed it to the server. Returns
     /// whether a datagram was consumed. The wait is on the reader's channel,
-    /// never a socket timeout (see [`Reader`]).
+    /// never a socket timeout (see the private `Reader` in this module).
     pub fn recv_one(&mut self, wait: Duration) -> io::Result<bool> {
         let full = self.reader.full.swap(0, Ordering::Relaxed);
         self.server.count_drops(BACKLOG_FULL, full);

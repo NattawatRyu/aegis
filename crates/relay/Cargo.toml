@@ -15,3 +15,7 @@ aegis-protocol.workspace = true
 [features]
 # Opt-in: answer Noise NK hellos and hand out sessions without a backend.
 noise = ["aegis-protocol/noise"]
+
+[package.metadata.docs.rs]
+# Document the opt-in `noise` API too.
+all-features = true

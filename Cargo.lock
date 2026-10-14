@@ -14,7 +14,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-harness"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "aegis-netguard-client-sdk",
  "aegis-netguard-detector",
@@ -26,21 +26,21 @@ dependencies = [
 
 [[package]]
 name = "aegis-netguard-client-sdk"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "aegis-netguard-protocol",
 ]
 
 [[package]]
 name = "aegis-netguard-detector"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "aegis-netguard-telemetry",
 ]
 
 [[package]]
 name = "aegis-netguard-ffi"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "aegis-netguard-client-sdk",
  "aegis-netguard-detector",
@@ -53,7 +53,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-netguard-protocol"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "bincode",
  "chacha20poly1305",
@@ -67,14 +67,14 @@ dependencies = [
 
 [[package]]
 name = "aegis-netguard-relay"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "aegis-netguard-protocol",
 ]
 
 [[package]]
 name = "aegis-netguard-serve"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "aegis-netguard-client-sdk",
  "aegis-netguard-detector",
@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-netguard-server"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "aegis-netguard-protocol",
  "aegis-netguard-telemetry",
@@ -97,7 +97,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-netguard-telemetry"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "serde",
  "serde_json",

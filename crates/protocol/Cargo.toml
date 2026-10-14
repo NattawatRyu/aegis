@@ -23,3 +23,7 @@ snow = { version = "0.10", optional = true }
 # Opt-in: a relay that is its own backend, keys delivered over a Noise NK
 # handshake instead of by the game's backend over HTTPS (`noise`).
 noise = ["dep:snow"]
+
+[package.metadata.docs.rs]
+# Document the opt-in `noise` API too.
+all-features = true

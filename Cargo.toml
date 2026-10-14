@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/protocol", "crates/server", "crates/telemetry", "crates/client-sdk", "crates/detector", "crates/harness", "crates/relay", "crates/ffi", "crates/serve"]
 
 [workspace.package]
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/NattawatRyu/aegis"
@@ -17,9 +17,9 @@ bincode = "1.3"
 # `aegis-protocol` were taken). The dependency key and each `[lib] name`
 # keep the short form, so code still says `use aegis_server`.
 # `version` must follow `workspace.package.version` on every release.
-aegis-protocol = { package = "aegis-netguard-protocol", path = "crates/protocol", version = "0.1.0-alpha.1" }
-aegis-server = { package = "aegis-netguard-server", path = "crates/server", version = "0.1.0-alpha.1" }
-aegis-telemetry = { package = "aegis-netguard-telemetry", path = "crates/telemetry", version = "0.1.0-alpha.1" }
-aegis-client-sdk = { package = "aegis-netguard-client-sdk", path = "crates/client-sdk", version = "0.1.0-alpha.1" }
-aegis-detector = { package = "aegis-netguard-detector", path = "crates/detector", version = "0.1.0-alpha.1" }
-aegis-relay = { package = "aegis-netguard-relay", path = "crates/relay", version = "0.1.0-alpha.1" }
+aegis-protocol = { package = "aegis-netguard-protocol", path = "crates/protocol", version = "0.1.0-alpha.2" }
+aegis-server = { package = "aegis-netguard-server", path = "crates/server", version = "0.1.0-alpha.2" }
+aegis-telemetry = { package = "aegis-netguard-telemetry", path = "crates/telemetry", version = "0.1.0-alpha.2" }
+aegis-client-sdk = { package = "aegis-netguard-client-sdk", path = "crates/client-sdk", version = "0.1.0-alpha.2" }
+aegis-detector = { package = "aegis-netguard-detector", path = "crates/detector", version = "0.1.0-alpha.2" }
+aegis-relay = { package = "aegis-netguard-relay", path = "crates/relay", version = "0.1.0-alpha.2" }

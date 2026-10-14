@@ -72,7 +72,7 @@ pub struct TickOutcome {
     /// a shot at an enemy it says it could not see.
     pub hits: Vec<(PlayerId, bool)>,
     /// One entry per live shot whose aim can be held against an enemy only
-    /// a newer snapshot than the claimed one showed ([`History::glimpse`]).
+    /// a newer snapshot than the claimed one showed ([`crate::history::History::glimpse`]).
     pub glimpses: Vec<(PlayerId, Glimpse)>,
     /// One entry per input taken off a lane: whose, and the ticks it waited
     /// there ([`Inbox`]). 0 on a lockstep link.
@@ -254,7 +254,7 @@ impl Server {
     }
 
     /// What player `id` is sent this tick: [`Sim::view`], answered from the
-    /// tick's shared [`Visibility`]. Call between `begin_tick` and `end_tick`.
+    /// tick's shared [`Visibility`](crate::Visibility). Call between `begin_tick` and `end_tick`.
     pub fn view(&self, id: PlayerId) -> Vec<PlayerState> {
         let v = self.ev.visibility().view(&self.sim, id);
         // Oracle: the per-player ray-cast this replaced. Every debug run —

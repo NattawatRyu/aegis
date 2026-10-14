@@ -5,13 +5,20 @@ alpha can break the wire protocol or the C ABI; each entry says which ABI it
 ships. A test (`crates/ffi/tests/docs.rs`) fails if the entry for the
 current crate version is missing or names another ABI.
 
-## [Unreleased]
+## [0.1.0-alpha.2] - 2026-10-14
+
+Packaging and documentation only: no change to the code's behaviour, the
+wire protocol (v6) or the C ABI. Ships **ABI 4**.
 
 - The crates are on crates.io as `aegis-netguard-*` (`aegis-server` and
   `aegis-protocol` were taken there). Library names are unchanged
   (`use aegis_server`), and so is the `aegis-serve` binary. In this
   repository, `cargo -p` now takes the new names; `aegis-harness` is not
   published.
+- docs.rs documents the opt-in `noise` API (`aegis_protocol::noise`, the
+  relay's and the C ABI's Noise functions); alpha.1 left it out.
+- Three broken intra-doc links in `aegis-netguard-server` fixed. CI now
+  builds the docs with warnings as errors, with and without all features.
 
 ## [0.1.0-alpha.1] - 2026-10-13
 
@@ -73,4 +80,5 @@ Ships **ABI 4** and wire protocol v6.
   the newer snapshot sharing its slot. Inputs claiming that newer tick were
   refused as `UnknownTick`.
 
+[0.1.0-alpha.2]: https://github.com/NattawatRyu/aegis/releases/tag/v0.1.0-alpha.2
 [0.1.0-alpha.1]: https://github.com/NattawatRyu/aegis/releases/tag/v0.1.0-alpha.1

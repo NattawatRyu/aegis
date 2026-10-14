@@ -100,8 +100,8 @@ tested.
 `use aegis_server`, as in every example here:
 
 ```toml
-aegis-server = { package = "aegis-netguard-server", version = "0.1.0-alpha.1" }
-aegis-detector = { package = "aegis-netguard-detector", version = "0.1.0-alpha.1" }
+aegis-server = { package = "aegis-netguard-server", version = "0.1.0-alpha.2" }
+aegis-detector = { package = "aegis-netguard-detector", version = "0.1.0-alpha.2" }
 ```
 
 The live server installs with `cargo install aegis-netguard-serve`
@@ -268,8 +268,7 @@ most useful contribution there is.
 - **`--direct` is plaintext**: for debugging on your own machine only.
 - **macOS:** only 127.0.0.1 can be bound on loopback, so the harness and
   `aegis-serve`'s bots (one loopback IP each) do not run there.
-- **No stable versions.** Every crate is 0.1.0-alpha.1 and not on
-  crates.io. The wire protocol and the C ABI (`AEGIS_ABI_VERSION`, now 4)
+- **No stable versions.** Every crate is 0.1.0-alpha.2. The wire protocol and the C ABI (`AEGIS_ABI_VERSION`, now 4)
   change when they need to. An alpha can break either one.
 
 Security issues: see [SECURITY.md](SECURITY.md). Please do not open a

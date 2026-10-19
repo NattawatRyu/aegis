@@ -10,6 +10,7 @@
 
 use aegis_protocol::{frame, ClientMsg, PlayerId, PlayerState, Vec2, PROTOCOL_VERSION};
 
+pub mod aimassist;
 pub mod aimbot;
 pub mod aimtrigger;
 pub mod badversion;
@@ -36,6 +37,7 @@ pub mod spoof;
 pub mod staleliar;
 pub mod tickliar;
 pub mod triggerbot;
+pub mod wardogs;
 pub mod zeroflood;
 
 /// What a bot sees before deciding this tick — the same information a real

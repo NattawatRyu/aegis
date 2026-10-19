@@ -23,6 +23,7 @@ use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 use aegis_client_sdk::{
+    aimassist::AimAssistBot,
     aimbot::AimbotBot,
     aimtrigger::AimTrigger,
     badversion::BadVersionBot,
@@ -48,6 +49,7 @@ use aegis_client_sdk::{
     staleliar::StaleLiar,
     tickliar::TickLiar,
     triggerbot::TriggerBot,
+    wardogs::WardogsBot,
     zeroflood::ZeroFloodBot,
     Bot, BotCtx,
 };
@@ -263,6 +265,28 @@ impl Scenario {
             sc.bots.push(real(AimTrigger::with_seed(seed.wrapping_mul(4).wrapping_add(k).wrapping_mul(0x9E37_79B9))));
         }
         Self { name: "aim_mix", ticks: CROWD_TICKS, rtt, ..sc }
+    }
+
+    /// The same crowd with four [`WardogsBot`]s instead — ESP, a humanized
+    /// aimbot and a human reaction delay in one client, the package as a
+    /// cheat shop sells it.
+    pub fn wardogs_mix(seed: u32, rtt: u32) -> Self {
+        let mut sc = Self::honest_crowd_of(seed, CROWD_SIZE - 4);
+        for k in 1..=4 {
+            sc.bots.push(real(WardogsBot::with_seed(seed.wrapping_mul(4).wrapping_add(k).wrapping_mul(0x85EB_CA6B))));
+        }
+        Self { name: "wardogs_mix", ticks: CROWD_TICKS, rtt, ..sc }
+    }
+
+    /// The same crowd with four [`AimAssistBot`]s instead — the human aims
+    /// and fires, the cheat pulls the crosshair onto an enemy in its cone and
+    /// in its range.
+    pub fn aimassist_mix(seed: u32, rtt: u32) -> Self {
+        let mut sc = Self::honest_crowd_of(seed, CROWD_SIZE - 4);
+        for k in 1..=4 {
+            sc.bots.push(real(AimAssistBot::with_seed(seed.wrapping_mul(4).wrapping_add(k).wrapping_mul(0xC2B2_AE35))));
+        }
+        Self { name: "aimassist_mix", ticks: CROWD_TICKS, rtt, ..sc }
     }
 }
 
@@ -2022,6 +2046,105 @@ mod tests {
                 } else {
                     assert!(b.alerts.is_empty(), "rtt {rtt}: {} flagged {:?}", b.name, b.alerts);
                 }
+            }
+        }
+    }
+
+    /// The cheat-shop package (ESP + humanized aimbot + human reaction
+    /// delay, `WardogsBot`) in an honest crowd. Measured 2026-10-19, seeds
+    /// 0–3 at round trips 0 and 3: caught 1 of 32 (far_aim, rtt 3), nobody
+    /// honest flagged. It escapes because it plays like an honest rusher:
+    /// culling leaves its ESP nothing behind a wall, so it closes in on what
+    /// it can see and fights point-blank, where any aim hits (acc 0.94 vs a
+    /// rusher's 0.87) and almost no shot is far (1–5 of ~70; far_aim needs
+    /// 12). And the same thing is why escaping costs nothing: it wins no
+    /// more than an honest rusher (18.4 kills a match vs 19.8 at rtt 0, 8.4
+    /// vs 9.0 at rtt 3). This test pins both halves: the server leaks it
+    /// nothing, rejects nothing, flags nobody honest, and the cheat buys no
+    /// kills. In a game with long sightlines its aim would pay at range —
+    /// and land in far_aim's samples.
+    #[test]
+    fn wardogs_package_gets_nothing_from_its_esp_or_its_aim() {
+        for rtt in [0, 3] {
+            let (mut cheat, mut rush) = ((0u32, 0u32), (0u32, 0u32));
+            for seed in 0..4 {
+                let r = run(Scenario::wardogs_mix(seed, rtt));
+                for b in &r.bots {
+                    let at = format!("seed {seed} rtt {rtt}: {}", b.name);
+                    assert_eq!(b.hidden, 0, "{at} was sent {} players behind a wall", b.hidden);
+                    match b.name {
+                        "wardogs" => {
+                            assert_eq!(b.totals.total_rejected(), 0, "{at}");
+                            assert_eq!(b.totals.anomalies, 0, "{at}");
+                            cheat = (cheat.0 + b.kills, cheat.1 + 1);
+                        }
+                        name => {
+                            assert!(b.alerts.is_empty(), "{at} flagged {:?}", b.alerts);
+                            if name == "rusher" {
+                                rush = (rush.0 + b.kills, rush.1 + 1);
+                            }
+                        }
+                    }
+                }
+            }
+            let (c, h) = (cheat.0 as f32 / cheat.1 as f32, rush.0 as f32 / rush.1 as f32);
+            assert!(c <= h, "rtt {rtt}: wardogs averaged {c:.2} kills, an honest rusher {h:.2}");
+        }
+    }
+
+    /// Aim error under which a near shot counts as tight, in radians. An
+    /// honest hand (error uniform within 0.15) lands one in ~7.5 there.
+    const TIGHT_RAD: f32 = 0.02;
+
+    /// Per player, over the shots at a target that is not far
+    /// (`far_aim::FAR_RAD` or bigger): (shots, share within [`TIGHT_RAD`]).
+    fn near_aim(r: &Report) -> BTreeMap<u8, (u32, f32)> {
+        let mut by: BTreeMap<u8, (u32, u32)> = BTreeMap::new();
+        for rec in r.telemetry.records() {
+            if let aegis_telemetry::Outcome::Shot { aim_err, size, .. } = rec.outcome {
+                if !aegis_detector::detectors::far_aim::Config::DEFAULT.is_far(size) {
+                    let e = by.entry(rec.player).or_default();
+                    *e = (e.0 + 1, e.1 + u32::from(aim_err <= TIGHT_RAD));
+                }
+            }
+        }
+        by.into_iter().map(|(p, (n, tight))| (p, (n, tight as f32 / n as f32))).collect()
+    }
+
+    /// The aimbot as players describe it in use (`AimAssistBot`): the human
+    /// aims and fires, the cheat pulls the crosshair onto an enemy already in
+    /// its cone and in range. A known gap, pinned here so closing it is a
+    /// deliberate change: no detector flags it — every far shot is the
+    /// honest hand's, so far_aim sees a person, and the trigger is human, so
+    /// reaction does too — yet up close its aim is several times tighter
+    /// than any honest player's. That is the signal a near-range aim
+    /// detector would read. Measured 2026-10-19, seeds 0–3 at round trips 0
+    /// and 3: share of near shots within `TIGHT_RAD` — aimassist 0.43–0.96,
+    /// honest players (walker, camper, rusher) 0.07–0.27; it wins ~17% more
+    /// kills than an honest walker at rtt 0 (15.8 vs 13.5); flagged 0 of 32.
+    #[test]
+    fn aimassist_is_missed_but_its_near_aim_is_not_human() {
+        for rtt in [0, 3] {
+            for seed in 0..4 {
+                let r = run(Scenario::aimassist_mix(seed, rtt));
+                let near = near_aim(&r);
+                let (mut cheat, mut honest) = (f32::MAX, 0.0f32);
+                for b in &r.bots {
+                    let at = format!("seed {seed} rtt {rtt}: {}", b.name);
+                    let (n, tight) = near.get(&b.id.expect("joined")).copied().unwrap_or((0, 0.0));
+                    if b.name == "aimassist" {
+                        assert_eq!(b.totals.total_rejected(), 0, "{at}");
+                        assert_eq!(b.totals.anomalies, 0, "{at}");
+                        assert!(b.alerts.is_empty(), "{at} flagged {:?}: the gap closed, update this test", b.alerts);
+                        cheat = cheat.min(tight);
+                    } else {
+                        assert!(b.alerts.is_empty(), "{at} flagged {:?}", b.alerts);
+                        if n >= 10 {
+                            honest = honest.max(tight);
+                        }
+                    }
+                }
+                assert!(cheat > honest, "seed {seed} rtt {rtt}: tight share {cheat:.2} vs honest {honest:.2}");
             }
         }
     }
